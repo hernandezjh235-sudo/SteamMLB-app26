@@ -19,7 +19,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v10.8.1 ORIGINAL BASE + UNDERDOG LINE FIX"
+APP_VERSION = "v10.8.1 RAW DEBUG + HIT RATE DASHBOARD"
 
 try:
     import pytz
@@ -51,6 +51,7 @@ SIGNAL_TRACKING_FILE = os.path.join(STORAGE_DIR, "signal_tracking.json")
 LONG_BACKTEST_FILE = os.path.join(STORAGE_DIR, "long_backtest_rows.json")
 LINEUP_CACHE_FILE = os.path.join(STORAGE_DIR, "locked_lineup_cache.json")
 LINE_HISTORY_FILE = os.path.join(STORAGE_DIR, "line_history.json")
+RAW_PROP_DEBUG_FILE = os.path.join(STORAGE_DIR, "raw_prop_debug_rows.json")
 
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 MLB_LIVE = "https://statsapi.mlb.com/api/v1.1"
@@ -441,6 +442,163 @@ def first_value(d, keys):
         if isinstance(d, dict) and k in d and d[k] not in [None, ""]:
             return d[k]
     return None
+
+
+# =========================
+# v10.8.1 READ-ONLY RAW DEBUG TABLE
+# =========================
+def log_raw_prop_debug_row(row, source_hint=""):
+    """Read-only debug logger.
+
+    This does not modify lines, projections, picks, probabilities, or EV.
+    It only saves what the parser saw so wrong/missing lines can be inspected.
+    """
+    try:
+        if not isinstance(row, dict):
+            return
+        rows = load_json(RAW_PROP_DEBUG_FILE, [])
+        slim = {
+            "time": now_iso(),
+            "source_hint": source_hint,
+            "Source": row.get("Source") or row.get("Provider") or source_hint,
+            "Feed Name": row.get("Feed Name") or row.get("Matched Name") or row.get("Player") or row.get("Pitcher"),
+            "Matched Name": row.get("Matched Name"),
+            "Line": row.get("Line") or row.get("line"),
+            "Market": row.get("Market") or row.get("Stat") or row.get("stat_type"),
+            "Side": row.get("Side"),
+            "Parser Mode": row.get("Parser Mode"),
+            "Match Score": row.get("Match Score"),
+            "Line Evidence": row.get("Line Evidence"),
+            "Underdog Path": row.get("Underdog Path"),
+            "Board Match": row.get("Board Match"),
+        }
+        rows.append(slim)
+        save_json(RAW_PROP_DEBUG_FILE, rows[-1500:])
+    except Exception:
+        pass
+
+def log_raw_prop_debug_rows(rows, source_hint=""):
+    try:
+        if isinstance(rows, list):
+            for r in rows:
+                log_raw_prop_debug_row(r, source_hint=source_hint)
+    except Exception:
+        pass
+
+def render_raw_prop_debug_table():
+    rows = load_json(RAW_PROP_DEBUG_FILE, [])
+    if not rows:
+        st.info("No raw prop debug rows logged yet. Refresh the board first.")
+        return
+    df = pd.DataFrame(rows)
+    wanted_cols = [
+        "time", "source_hint", "Source", "Feed Name", "Matched Name", "Line",
+        "Market", "Side", "Parser Mode", "Match Score", "Line Evidence",
+        "Underdog Path", "Board Match"
+    ]
+    cols = [c for c in wanted_cols if c in df.columns]
+    st.dataframe(df[cols].tail(500).iloc[::-1], use_container_width=True, hide_index=True)
+
+
+
+
+# =========================
+# v10.8.1 READ-ONLY HIT-RATE DASHBOARD
+# =========================
+def build_hit_rate_dashboard_rows():
+    """Read-only dashboard from RESULT_LOG.
+
+    Does not grade, change, or save anything. It only summarizes already-logged results.
+    """
+    results = load_json(RESULT_LOG, [])
+    rows = []
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        actual = safe_float(r.get("actual"))
+        win = r.get("win")
+        if actual is None or win is None:
+            continue
+        score = safe_float(r.get("score"))
+        if score is None:
+            tier = "Unknown"
+        elif score >= 92:
+            tier = "Elite 92+"
+        elif score >= 88:
+            tier = "Strong 88-91"
+        elif score >= 82:
+            tier = "Watch 82-87"
+        else:
+            tier = "Low <82"
+
+        projection = safe_float(r.get("projection"))
+        rows.append({
+            "Date": r.get("date", ""),
+            "Pitcher": r.get("pitcher", r.get("player", "")),
+            "Side": str(r.get("side", r.get("Side", "Over"))).title(),
+            "Line": safe_float(r.get("line", r.get("Line"))),
+            "Projection": projection,
+            "Actual Ks": actual,
+            "Win": bool(win),
+            "Score": score,
+            "Tier": tier,
+            "EV": safe_float(r.get("ev", r.get("EV"))),
+            "Probability": safe_float(r.get("prob", r.get("over_prob", r.get("Probability")))),
+            "Error": None if projection is None else actual - projection,
+            "Abs Error": None if projection is None else abs(actual - projection),
+        })
+    return rows
+
+def summarize_hit_rate_group(df, group_col):
+    if df.empty or group_col not in df.columns:
+        return pd.DataFrame()
+    out = df.groupby(group_col).agg(
+        Picks=("Win", "count"),
+        Hit_Rate=("Win", "mean"),
+        Avg_Error=("Error", "mean"),
+        MAE=("Abs Error", "mean"),
+    ).reset_index()
+    out["Hit_Rate"] = (out["Hit_Rate"] * 100).round(1)
+    out["Avg_Error"] = out["Avg_Error"].round(2)
+    out["MAE"] = out["MAE"].round(2)
+    return out.sort_values(["Picks", "Hit_Rate"], ascending=[False, False])
+
+def render_hit_rate_dashboard():
+    rows = build_hit_rate_dashboard_rows()
+    if not rows:
+        st.info("No graded result rows found yet. Once picks are graded into RESULT_LOG, this dashboard will populate.")
+        return
+
+    df = pd.DataFrame(rows)
+    total = len(df)
+    hit_rate = df["Win"].mean() * 100 if total else 0
+    mae = df["Abs Error"].dropna().mean()
+    bias = df["Error"].dropna().mean()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Graded Picks", total)
+    c2.metric("Hit Rate", f"{hit_rate:.1f}%")
+    c3.metric("MAE", "—" if pd.isna(mae) else f"{mae:.2f} Ks")
+    c4.metric("Bias", "—" if pd.isna(bias) else f"{bias:+.2f} Ks")
+
+    st.markdown("#### By Confidence Tier")
+    tier_df = summarize_hit_rate_group(df, "Tier")
+    if not tier_df.empty:
+        st.dataframe(tier_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### By Side")
+    side_df = summarize_hit_rate_group(df, "Side")
+    if not side_df.empty:
+        st.dataframe(side_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### By Pitcher")
+    pitcher_df = summarize_hit_rate_group(df, "Pitcher")
+    if not pitcher_df.empty:
+        st.dataframe(pitcher_df.head(75), use_container_width=True, hide_index=True)
+
+    st.markdown("#### Recent Graded Picks")
+    st.dataframe(df.tail(150).iloc[::-1], use_container_width=True, hide_index=True)
+
 
 # =========================
 # BETTING MATH
@@ -1798,6 +1956,18 @@ def clean_real_prop_debug_rows(rows):
         cleaned.append(r)
 
     return cleaned
+
+
+# v10.8.1 read-only wrapper: logs debug rows but never changes them.
+try:
+    _original_clean_real_prop_debug_rows_for_debug = clean_real_prop_debug_rows
+    def clean_real_prop_debug_rows(rows):
+        cleaned = _original_clean_real_prop_debug_rows_for_debug(rows)
+        log_raw_prop_debug_rows(cleaned, source_hint="clean_real_prop_debug_rows")
+        return cleaned
+except NameError:
+    pass
+
 
 def is_half_point_line(line):
     """True for normal no-push prop lines like 4.5, 5.5, 6.5."""
@@ -3479,3 +3649,26 @@ with tab6:
             st.error("All logs cleared.")
 
 st.caption("Workflow: Refresh live board → inspect lines → save official before-game snapshot → after games, grade and learn.")
+
+
+# =========================
+# v10.8.1 RAW PROP DEBUG UI
+# =========================
+try:
+    with st.expander("🔎 Raw Prop Debug Table (Read-Only)", expanded=False):
+        st.caption("Read-only view of parsed prop rows. This does not change lines, projections, probabilities, EV, or picks.")
+        render_raw_prop_debug_table()
+except Exception as e:
+    st.warning(f"Raw prop debug table unavailable: {e}")
+
+
+
+# =========================
+# v10.8.1 HIT-RATE DASHBOARD UI
+# =========================
+try:
+    with st.expander("📊 Hit-Rate Dashboard (Read-Only)", expanded=False):
+        st.caption("Read-only summary of already-graded results. This does not change lines, projections, EV, or picks.")
+        render_hit_rate_dashboard()
+except Exception as e:
+    st.warning(f"Hit-rate dashboard unavailable: {e}")
