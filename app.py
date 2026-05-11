@@ -57,14 +57,9 @@ MLB_LIVE = "https://statsapi.mlb.com/api/v1.1"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 PRIZEPICKS_URL = "https://api.prizepicks.com/projections"
 UNDERDOG_URLS = [
-    # v11.2.2: v1 first because it has historically matched the normal Underdog board line.
-    # Beta endpoints can expose alternate ladders; those caused repeated 7.5 lines.
+    # v11.3: stable main Underdog board only.
+    # Beta endpoints can expose alternate ladders and caused wrong/repeated lines.
     "https://api.underdogfantasy.com/v1/over_under_lines",
-    "https://api.underdogfantasy.com/beta/v6/over_under_lines",
-    "https://api.underdogfantasy.com/beta/v5/over_under_lines",
-    "https://api.underdogfantasy.com/beta/v4/over_under_lines",
-    "https://api.underdogfantasy.com/beta/v3/over_under_lines",
-    "https://api.underdogfantasy.com/beta/v2/over_under_lines",
 ]
 SPORTSGAMEODDS_BASE = "https://api.sportsgameodds.com/v2"
 OPTICODDS_BASE = "https://api.opticodds.com/api/v3"
@@ -2115,10 +2110,9 @@ def get_underdog_k_data(player_name):
                 val = safe_float(a.get(k))
                 if is_valid_k_line(val, allow_integer=False) is not None:
                     return float(val), f"{k} half-line from Underdog object"
-        text_lines = extract_half_lines_from_text(" | ".join(text_from(o) for o in objs))
-        if text_lines:
-            return float(text_lines[0]), "half-line from Underdog text"
-        return None, "no valid Underdog half-line"
+        # v11.3: no text fallback for official Underdog board line.
+        # Text blobs can include alternate ladders or unrelated half-numbers.
+        return None, "no direct Underdog line field"
 
     def blob_from(*objs):
         return " | ".join([text_from(o) for o in objs if isinstance(o, dict)]).lower()
@@ -2257,37 +2251,9 @@ def get_underdog_k_data(player_name):
                 continue
             add_row(chosen_line, score, actual_player, evidence, line_note, f"line:{obj_id(line_obj)} -> over_under:{ou_id} -> appearance:{app_id} -> player:{player_id}", "relationship")
 
-        # Recursive fallback parser for new/changed Underdog JSON.
-        # This is intentionally looser than relationship mode, but still requires:
-        # target player name + strikeout market + sane K line + no bad sport/market words.
-        for obj in objects:
-            if not isinstance(obj, dict):
-                continue
-            blob_json = json.dumps(obj, default=str)
-            blob_low = blob_json.lower()
-            if is_bad_sport(blob_low):
-                continue
-            if not is_pitcher_k_blob(blob_low):
-                continue
-            # Try candidate fields and the full object blob so abbreviated Underdog names match daily.
-            cand = []
-            for k in ["player", "player_name", "participant", "participant_name", "name", "description", "display_name", "title", "short_name", "abbreviation", "abbr_name"]:
-                v = attrs(obj).get(k)
-                if isinstance(v, dict):
-                    v = v.get("name") or v.get("full_name") or v.get("display_name") or v.get("title") or v.get("short_name")
-                if v:
-                    cand.append(str(v))
-            matched = " ".join(cand) or player_name
-            score = max(underdog_player_score(matched, blob_json), name_score(player_name, matched))
-            if score < 0.82:
-                continue
-            line, line_note = line_from_obj(obj)
-            if line is None:
-                continue
-            if not active_status_ok(obj):
-                continue
-            add_row(line, score, matched, blob_json[:200], line_note, f"fallback:{obj_id(obj) or attrs(obj).get('id') or len(accepted_rows)}", "recursive fallback")
-
+        # Recursive fallback parser disabled in v11.3.
+        # Official lines now require the safe Underdog relationship path.
+        # This avoids wrong line matches from loose JSON text scans.
         if accepted_rows:
             break
 
@@ -3873,127 +3839,18 @@ def v112_render_model_dashboard():
 
 
 
-# ============================================================
-# v11.2.1 STRICT PROP LINE RESOLVER
-# Fixes repeated/default line bugs such as every pitcher showing 7.5.
-# ============================================================
-
-def v1121_extract_line_from_obj(obj):
-    """Extract a row-specific prop line from one object only.
-
-    Do not use global/default board values. This prevents one repeated line
-    from being copied across every player.
-    """
-    if not isinstance(obj, dict):
-        return None
-
-    # Highest confidence direct keys.
-    direct_keys = [
-        "line_score", "line", "stat_value", "value", "over_under", "total",
-        "points", "target", "threshold", "handicap", "spread"
-    ]
-    for k in direct_keys:
-        val = obj.get(k)
-        f = safe_float(val, None)
-        if f is not None and 0.5 <= f <= 20:
-            return float(f)
-
-    # Underdog/PrizePicks nested option/value containers.
-    nested_keys = ["attributes", "option", "over_under", "projection", "stat", "market", "line"]
-    for nk in nested_keys:
-        nested = obj.get(nk)
-        if isinstance(nested, dict):
-            got = v1121_extract_line_from_obj(nested)
-            if got is not None:
-                return got
-
-    # Some APIs include display text like "Over 5.5" or "Pitcher Strikeouts 6.5".
-    # Use this only on the same object, never globally.
-    text_keys = ["display_line", "display", "description", "title", "name", "label"]
-    for k in text_keys:
-        txt = obj.get(k)
-        if not txt:
-            continue
-        nums = re.findall(r'(?<!\d)(\d+(?:\.5|\.0)?)(?!\d)', str(txt))
-        candidates = []
-        for n in nums:
-            f = safe_float(n, None)
-            if f is not None and 0.5 <= f <= 20:
-                candidates.append(float(f))
-        if candidates:
-            # For K props, the last small decimal in the row text is usually the prop line.
-            return candidates[-1]
-
-    return None
-
-def v1121_is_bad_repeated_line(prop_rows):
-    """Detect impossible parser output where every player got the same line."""
-    if not prop_rows or len(prop_rows) < 6:
-        return False
-    lines = [safe_float(r.get("Line"), None) for r in prop_rows if isinstance(r, dict)]
-    names = [normalize_name(r.get("Player", r.get("Pitcher", ""))) for r in prop_rows if isinstance(r, dict)]
-    lines = [x for x in lines if x is not None]
-    names = [x for x in names if x]
-    if len(lines) < 6 or len(set(names)) < 6:
-        return False
-    most_common = max(set(lines), key=lines.count)
-    return lines.count(most_common) / max(len(lines), 1) >= 0.85
-
-def v1121_repair_repeated_lines_from_raw(prop_rows, raw_rows=None):
-    """Best-effort repair. If the output is clearly repeated, re-read row-specific lines."""
-    if not v1121_is_bad_repeated_line(prop_rows):
-        return prop_rows
-    repaired = []
-    for r in prop_rows:
-        rr = dict(r)
-        raw = rr.get("_raw") or rr.get("Raw") or rr.get("raw") or {}
-        fixed = v1121_extract_line_from_obj(raw)
-        if fixed is not None:
-            rr["Line"] = fixed
-            rr["line"] = fixed
-            rr["Line Repair"] = "v11.2.1 row-specific"
-        else:
-            rr["Line Repair"] = "Needs raw row review"
-        repaired.append(rr)
-    return repaired
-
-def v1121_clean_prop_rows(prop_rows):
-    """Final safety pass for prop rows before display/build."""
-    if not isinstance(prop_rows, list):
-        return prop_rows
-    rows = []
-    for r in prop_rows:
-        if not isinstance(r, dict):
-            continue
-        rr = dict(r)
-        raw = rr.get("_raw") or rr.get("Raw") or rr.get("raw") or {}
-        # If the line is missing or suspiciously copied, prefer row-specific raw value.
-        fixed = v1121_extract_line_from_obj(raw)
-        if fixed is not None:
-            current = safe_float(rr.get("Line", rr.get("line")), None)
-            if current is None:
-                rr["Line"] = fixed
-                rr["line"] = fixed
-        rows.append(rr)
-    rows = v1121_repair_repeated_lines_from_raw(rows)
-    return rows
-
-
-
-# v11.2.1 wrapper: preserve original cleaner, then repair repeated/default lines.
-try:
-    _v1121_original_clean_real_prop_debug_rows = clean_real_prop_debug_rows
-    def clean_real_prop_debug_rows(rows):
-        cleaned = _v1121_original_clean_real_prop_debug_rows(rows)
-        return v1121_clean_prop_rows(cleaned)
-except Exception:
-    pass
-
-
-
 # v11.2.2 Underdog note:
 # Live pitch-by-pitch does not set prop lines. Pregame/live prop lines are pulled from Underdog/PrizePicks.
 # Underdog v1 is prioritized for main board lines; beta endpoints are backup only.
+
+
+# ============================================================
+# v11.3 CLEAN LINE MODE
+# - Live pitch-by-pitch removed.
+# - Underdog uses stable v1 main-board endpoint only.
+# - Official Underdog lines require direct relationship line fields.
+# - Loose recursive fallback disabled for official line matching.
+# ============================================================
 
 # =========================
 # APP
@@ -4001,7 +3858,7 @@ except Exception:
 st.markdown("""
 <div class="hero-panel">
   <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v11.1 LIVE TRACKER + WHY CARDS</div>
-  <div class="sub-title">Strict Win Filter + all-feed parser + live pitch-by-pitch tracker + line-movement alerts + why-this-pick cards</div>
+  <div class="sub-title">Strict Win Filter + clean Underdog mainline parser + line-movement alerts + why-this-pick cards</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -4086,7 +3943,7 @@ if refresh_btn:
 
     st.session_state.loaded_picks = projections
     st.session_state.last_refresh_time = now_iso()
-    st.success(f"Refreshed {len(projections)} pitchers and scanned {len(st.session_state.get('all_live_prop_rows', []))} live feed K lines. Nothing officially saved yet.")
+    st.success(f"Refreshed {len(projections)} pitchers and scanned {len(st.session_state.get('all_live_prop_rows', []))} pregame feed K lines. Nothing officially saved yet.")
 
 if save_btn:
     if not st.session_state.get("loaded_picks"):
@@ -4166,50 +4023,6 @@ with tab2:
     else:
         st.info("No players loaded.")
 
-with tab3:
-    st.markdown('<div class="section-title-pro">Live Pitch-by-Pitch Tracker</div>', unsafe_allow_html=True)
-    st.caption("This is a live-game layer only. It does not overwrite your saved pregame projections, official snapshots, learning logs, or bettable gates.")
-    if not board:
-        st.info("Refresh/load the board first. Live tracking only works for games that are in progress or have live MLB feed data.")
-    else:
-        names = [f"{p.get('pitcher')} — {p.get('matchup')} — line {p.get('line')}" for p in board]
-        selected = st.selectbox("Select pitcher to track live", options=list(range(len(board))), format_func=lambda i: names[i])
-        pick = board[selected]
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric("Pregame Projection", pick.get("projection"))
-        with c2:
-            st.metric("Current Line", pick.get("line") if pick.get("line") is not None else "No Line")
-        with c3:
-            st.metric("Pregame Side", pick.get("pick_side"))
-        if st.button("🔴 Refresh Live Pitch Feed", use_container_width=True):
-            get_live_game_feed.clear()
-        feed = get_live_game_feed(pick.get("game_pk"))
-        live_state = extract_live_pitcher_state(feed, pick.get("pitcher_id"))
-        live_calc = calculate_live_projection_from_pick(pick, live_state)
-        if not live_state.get("available"):
-            st.warning(live_state.get("message", "Live feed unavailable"))
-        else:
-            a, b, c, d, e, f = st.columns(6)
-            a.metric("Game State", live_state.get("game_state"))
-            b.metric("Inning", f"{live_state.get('inning_half') or ''} {live_state.get('inning') or ''}".strip())
-            c.metric("Current Ks", live_state.get("current_ks"))
-            d.metric("Pitch Count", live_state.get("pitch_count"))
-            e.metric("Batters Faced", live_state.get("batters_faced"))
-            f.metric("Outs Recorded", live_state.get("outs_recorded"))
-            if live_calc:
-                g, h, i, j, k = st.columns(5)
-                g.metric("Live Projection", live_calc.get("live_projection"))
-                h.metric("Remaining BF", live_calc.get("remaining_bf"))
-                i.metric("Live Lean", live_calc.get("live_side"))
-                prob = live_calc.get("live_fair_probability")
-                j.metric("Live Fair Prob", "—" if prob is None else f"{prob*100:.1f}%")
-                k.metric("Live Edge", live_calc.get("live_edge_ks"))
-                st.info(live_calc.get("live_leash_note"))
-            st.caption(f"Last event: {live_state.get('last_event') or '—'}")
-            st.subheader("Why This Pick / Live Context")
-            for point in why_this_pick_points(pick):
-                st.write("• " + str(point))
 
 with tab4:
     st.markdown('<div class="section-title-pro">Real Prop Rows + All-Lines Debug</div>', unsafe_allow_html=True)
@@ -4397,9 +4210,3 @@ except Exception as e:
     st.warning(f"v11.2 tracking layer unavailable: {e}")
 
 
-try:
-    _v1121_board_for_warning = globals().get("real_prop_rows", globals().get("prop_rows", []))
-    if v1121_is_bad_repeated_line(_v1121_board_for_warning):
-        st.warning("Line parser warning: many rows still share the same line. Open Missing/Raw Prop Debug and send the raw rows for a deeper source-specific fix.")
-except Exception:
-    pass
