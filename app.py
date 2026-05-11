@@ -19,7 +19,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v10.9 ALL-LINES FALLBACK + DEBUG"
+APP_VERSION = "v11.0 TRUE ALL-LINES RELATIONSHIP PARSER"
 
 try:
     import pytz
@@ -2654,58 +2654,193 @@ def get_all_prizepicks_k_rows():
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_all_underdog_k_rows():
-    """Best-effort Underdog all-board extractor. It is display/debug only; projections still use strict player matching."""
+    """Return every MLB pitcher strikeout row visible in Underdog.
+
+    v11 fix: Underdog often stores the player name, appearance, market title, and
+    line value in separate related objects. The old scanner only read each flat
+    object by itself, so lines could exist but still be missed. This version builds
+    an object index and resolves relationships up to a few hops so names like
+    Paul Skenes / Eury Perez still surface when the line object points to a
+    player/appearance object instead of carrying the name directly.
+    """
     rows = []
-    name_keys = ["player_name", "full_name", "display_name", "title", "name", "description"]
-    line_keys = ["stat_value", "line_score", "over_under_line", "target_value"]
+    name_keys = [
+        "player_name", "full_name", "display_name", "title", "name", "description",
+        "first_name", "last_name", "player", "athlete", "appearance_name"
+    ]
+    line_keys = [
+        "stat_value", "line_score", "over_under_line", "target_value", "value",
+        "line", "points", "projection", "projected_value"
+    ]
+
+    def merged_obj(o):
+        if not isinstance(o, dict):
+            return {}
+        m = dict(o)
+        attrs = o.get("attributes")
+        if isinstance(attrs, dict):
+            m.update(attrs)
+        return m
+
+    def oid(o):
+        if not isinstance(o, dict):
+            return None
+        typ = str(o.get("type") or "").lower().replace("-", "_")
+        ident = o.get("id")
+        if typ and ident is not None:
+            return (typ, str(ident))
+        return None
+
+    def relationship_refs(o):
+        refs = []
+        if not isinstance(o, dict):
+            return refs
+        rel = o.get("relationships") or {}
+        if not isinstance(rel, dict):
+            return refs
+        for rv in rel.values():
+            data = rv.get("data") if isinstance(rv, dict) else rv
+            items = data if isinstance(data, list) else [data]
+            for it in items:
+                if isinstance(it, dict):
+                    typ = str(it.get("type") or "").lower().replace("-", "_")
+                    ident = it.get("id")
+                    if typ and ident is not None:
+                        refs.append((typ, str(ident)))
+        return refs
+
+    def collect_related(root, index, max_depth=3):
+        seen = set()
+        out = []
+        stack = [(root, 0)]
+        while stack:
+            cur, depth = stack.pop()
+            if not isinstance(cur, dict):
+                continue
+            key = oid(cur) or ("anon", str(id(cur)))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(cur)
+            if depth >= max_depth:
+                continue
+            for ref in relationship_refs(cur):
+                nxt = index.get(ref)
+                if nxt is not None:
+                    stack.append((nxt, depth + 1))
+        return out
+
+    def text_blob(objs):
+        parts = []
+        for o in objs:
+            m = merged_obj(o)
+            for k, v in m.items():
+                if isinstance(v, (str, int, float)) and k not in ["id"]:
+                    parts.append(str(v))
+        return " | ".join(parts)[:8000]
+
+    def find_line(objs, blob):
+        # Prefer exact line fields from the line/option object first.
+        for o in objs:
+            m = merged_obj(o)
+            for k in line_keys:
+                val = is_valid_k_line(m.get(k), allow_integer=False)
+                if val is not None:
+                    return float(val), k
+        vals = extract_half_lines_from_text(blob)
+        if vals:
+            return float(vals[0]), "text half-line"
+        return None, "no valid Underdog half-line"
+
+    def find_name(objs):
+        candidates = []
+        for o in objs:
+            m = merged_obj(o)
+            typ = str(o.get("type") or "").lower()
+            first = str(m.get("first_name") or "").strip()
+            last = str(m.get("last_name") or "").strip()
+            if first and last:
+                candidates.append(f"{first} {last}")
+            for k in name_keys:
+                v = m.get(k)
+                if isinstance(v, dict):
+                    v = v.get("name") or v.get("full_name") or v.get("display_name")
+                if isinstance(v, str) and v.strip():
+                    txt = v.strip()
+                    # Avoid market titles as player names unless no better option exists.
+                    if len(txt) <= 80 and not is_pitcher_k_text(txt):
+                        if "player" in typ or "appearance" in typ or k in ["player_name", "full_name", "display_name", "name"]:
+                            candidates.append(txt)
+        # Prefer real looking names: 2+ words, not market text, not team/sport labels.
+        clean = []
+        for c in candidates:
+            low = c.lower()
+            if is_bad_sport_text(low) or is_pitcher_k_text(low):
+                continue
+            if any(x in low for x in ["over", "under", "higher", "lower", "strikeout"]):
+                continue
+            if len(normalize_name(c).split()) >= 2:
+                clean.append(c)
+        if clean:
+            return clean[0]
+        return candidates[0] if candidates else ""
+
     for url in UNDERDOG_URLS:
         data = safe_get_json(url, timeout=18)
         if not data:
             continue
-        for obj in flatten_json(data):
-            if not isinstance(obj, dict):
-                continue
-            attrs = obj.get("attributes") if isinstance(obj.get("attributes"), dict) else {}
-            merged = dict(obj)
-            merged.update(attrs)
-            blob = json.dumps(merged, default=str)[:4000]
+        all_objs = [o for o in flatten_json(data) if isinstance(o, dict)]
+        index = {}
+        for o in all_objs:
+            key = oid(o)
+            if key:
+                index[key] = o
+
+        for obj in all_objs:
+            related = collect_related(obj, index, max_depth=3)
+            blob = text_blob(related)
             low = blob.lower()
-            if is_bad_sport_text(low) or is_bad_k_market_text(low):
+
+            # Hard sport contamination block, but don't require the word MLB if baseball appears.
+            if is_bad_sport_text(low):
                 continue
+            if "mlb" not in low and "baseball" not in low:
+                # Some Underdog rows omit league at this object level; keep only very obvious pitcher-K rows.
+                if not any(x in low for x in ["pitcher strikeout", "pitcher strikeouts", "pitcher k"]):
+                    continue
             if not any(x in low for x in ["pitcher strikeout", "pitcher strikeouts", "pitcher_k", "pitcher k", "strikeouts"]):
                 continue
-            line = None
-            note = ""
-            for k in line_keys:
-                val = is_valid_k_line(merged.get(k), allow_integer=False)
-                if val is not None:
-                    line, note = val, k
-                    break
-            if line is None:
-                vals = extract_half_lines_from_text(blob)
-                if vals:
-                    line, note = vals[0], "text half-line"
+            # Do not use broad bad-market filter here because it can reject a valid row when a related object
+            # contains unrelated text. Only block clearly wrong prop families.
+            if any(x in low for x in ["batter strikeout", "hitter strikeout", "team strikeouts", "fantasy points", "combo", "rival"]):
+                continue
+
+            line, note = find_line(related, blob)
             if line is None:
                 continue
-            candidates = []
-            for k in name_keys:
-                v = merged.get(k)
-                if isinstance(v, dict):
-                    v = v.get("name") or v.get("full_name") or v.get("display_name")
-                if v:
-                    candidates.append(str(v))
-            name = " | ".join(candidates[:3]).strip()
+            name = find_name(related)
             if not name:
                 continue
+
             rows.append({
-                "Source": "Underdog", "Provider": "Underdog", "Feed Name": name[:120], "Matched Name": name[:120],
-                "Market": "Pitcher Strikeouts", "Line": float(line), "Side": "OVER/UNDER", "Price": None,
-                "Line Evidence": note, "Underdog Path": url.split("/")[-1],
-                "Board Match": "UNMATCHED UNTIL PROJECTION MATCHES", "Reject Reason": ""
+                "Source": "Underdog",
+                "Provider": "Underdog",
+                "Feed Name": name[:120],
+                "Matched Name": name[:120],
+                "Market": "Pitcher Strikeouts",
+                "Line": float(line),
+                "Side": "OVER/UNDER",
+                "Price": None,
+                "Line Evidence": note,
+                "Underdog Path": url.split("/")[-1],
+                "Board Match": "UNMATCHED UNTIL PROJECTION MATCHES",
+                "Reject Reason": "",
+                "Parser Mode": "relationship-resolved all-board"
             })
+
     dedup = {}
     for r in rows:
-        key = (normalize_name(r.get("Feed Name")), r.get("Source"), r.get("Line"))
+        key = (normalize_name(r.get("Feed Name")), r.get("Source"), safe_float(r.get("Line")))
         dedup[key] = r
     return list(dedup.values())
 
@@ -3034,6 +3169,7 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "underdog_message": ud_data.get("message"),
         "line_delta": line_delta,
         "true_line_delta": true_line_delta,
+        "line_movement_alert": line_movement_alert_text({"true_line_delta": true_line_delta, "line_delta": line_delta, "pick_side": pick_side})[0],
         "consensus_count": consensus.get("count"),
         "consensus_quality": consensus.get("quality"),
         "consensus_spread": consensus.get("spread"),
@@ -3189,6 +3325,156 @@ def build_signal_tracking():
     save_json(SIGNAL_TRACKING_FILE, rows)
     return df
 
+
+# =========================
+# LIVE PITCH-BY-PITCH TRACKER v11.1
+# =========================
+@st.cache_data(ttl=8, show_spinner=False)
+def get_live_game_feed(game_pk):
+    """Pull MLB live game feed. TTL is short so live tab updates without hurting pregame cache."""
+    if not game_pk:
+        return {}
+    return safe_get_json(f"{MLB_LIVE}/game/{game_pk}/feed/live", timeout=10) or {}
+
+
+def extract_live_pitcher_state(feed, pitcher_id):
+    """Extract current pitcher state from MLB live feed without changing pregame model values."""
+    state = {
+        "available": False, "game_state": "Unknown", "inning": None, "inning_half": None,
+        "current_ks": 0, "pitch_count": 0, "batters_faced": 0, "outs_recorded": 0,
+        "last_event": "", "message": "Live feed unavailable",
+    }
+    if not feed or not pitcher_id:
+        return state
+    try:
+        live = feed.get("liveData", {}) or {}
+        linescore = live.get("linescore", {}) or {}
+        status = (feed.get("gameData", {}) or {}).get("status", {}) or {}
+        state["game_state"] = status.get("abstractGameState") or status.get("detailedState") or "Unknown"
+        state["inning"] = linescore.get("currentInning")
+        state["inning_half"] = linescore.get("inningHalf")
+        plays = (live.get("plays", {}) or {}).get("allPlays", []) or []
+        pid = str(pitcher_id)
+        ks = pitch_count = bf = outs = 0
+        last_event = ""
+        for play in plays:
+            matchup = play.get("matchup", {}) or {}
+            pitcher = matchup.get("pitcher", {}) or {}
+            if str(pitcher.get("id")) != pid:
+                continue
+            events = play.get("playEvents", []) or []
+            pitch_count += sum(1 for e in events if e.get("isPitch"))
+            result = play.get("result", {}) or {}
+            event = str(result.get("event", ""))
+            event_type = str(result.get("eventType", ""))
+            if event:
+                last_event = event
+            bf += 1
+            if "strikeout" in event.lower() or "strikeout" in event_type.lower():
+                ks += 1
+        box_players = ((live.get("boxscore", {}) or {}).get("teams", {}) or {})
+        for side in ["home", "away"]:
+            players = (box_players.get(side, {}) or {}).get("players", {}) or {}
+            for pdata in players.values():
+                person = pdata.get("person", {}) or {}
+                if str(person.get("id")) == pid:
+                    pitching = (pdata.get("stats", {}) or {}).get("pitching", {}) or {}
+                    ks = safe_int(pitching.get("strikeOuts"), ks) or ks
+                    pitch_count = safe_int(pitching.get("numberOfPitches"), pitch_count) or pitch_count
+                    bf = safe_int(pitching.get("battersFaced"), bf) or bf
+                    ip = baseball_ip_to_float(pitching.get("inningsPitched"))
+                    if ip is not None:
+                        outs = int(round(ip * 3))
+        state.update({"available": True, "current_ks": int(ks), "pitch_count": int(pitch_count), "batters_faced": int(bf), "outs_recorded": int(outs), "last_event": last_event, "message": "Live MLB feed loaded"})
+        return state
+    except Exception as e:
+        state["message"] = f"Live parse error: {e}"
+        return state
+
+
+def live_leash_multiplier(pitch_count, inning=None, batters_faced=None):
+    pc = safe_int(pitch_count, 0) or 0
+    bf = safe_int(batters_faced, 0) or 0
+    mult = 1.0
+    note = "Normal live leash"
+    if pc >= 95:
+        mult, note = 0.25, "Very high pitch count — likely near exit"
+    elif pc >= 88:
+        mult, note = 0.40, "High pitch count — strong exit risk"
+    elif pc >= 80:
+        mult, note = 0.60, "Elevated pitch count — leash reduced"
+    elif pc >= 70:
+        mult, note = 0.78, "Pitch count watch — mild leash reduction"
+    if bf >= 24 and pc >= 75:
+        mult = min(mult, 0.55)
+        note += "; lineup third-time-through risk"
+    return float(mult), note
+
+
+def calculate_live_projection_from_pick(pick, live_state):
+    if not pick or not live_state or not live_state.get("available"):
+        return None
+    base_bf = safe_float(pick.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
+    current_bf = safe_float(live_state.get("batters_faced"), 0) or 0
+    current_ks = safe_float(live_state.get("current_ks"), 0) or 0
+    pitcher_k = safe_float(pick.get("pitcher_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    opp_k = safe_float(pick.get("opp_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    live_k_rate = calculate_log5_k_rate(pitcher_k, opp_k, LEAGUE_AVG_K)
+    leash_mult, leash_note = live_leash_multiplier(live_state.get("pitch_count"), live_state.get("inning"), current_bf)
+    remaining_bf = max(base_bf - current_bf, 0) * leash_mult
+    live_proj = current_ks + remaining_bf * live_k_rate
+    line = safe_float(pick.get("line"))
+    over_prob = poisson_over_probability(live_proj, line) if line is not None else None
+    fair_prob = None
+    live_side = "NO LINE"
+    if line is not None and over_prob is not None:
+        live_side = "OVER" if live_proj > line else "UNDER"
+        fair_prob = over_prob if live_side == "OVER" else (1 - over_prob)
+    return {"live_projection": round(float(live_proj), 2), "remaining_bf": round(float(remaining_bf), 1), "live_k_rate": round(float(live_k_rate), 3), "live_side": live_side, "live_fair_probability": None if fair_prob is None else round(float(fair_prob), 4), "live_over_probability": None if over_prob is None else round(float(over_prob), 4), "live_edge_ks": None if line is None else round(float(live_proj - line), 2), "live_leash_note": leash_note}
+
+
+def line_movement_alert_text(pick):
+    delta = safe_float(pick.get("true_line_delta"), None)
+    if delta is None:
+        delta = safe_float(pick.get("line_delta"), None)
+    if delta is None:
+        return "No line movement tracked yet", "neutral"
+    if abs(delta) < 0.25:
+        return "Line stable", "neutral"
+    side = str(pick.get("pick_side", ""))
+    if (side == "OVER" and delta < 0) or (side == "UNDER" and delta > 0):
+        return f"Positive CLV movement: {delta:+.1f} Ks", "good"
+    if (side == "OVER" and delta > 0) or (side == "UNDER" and delta < 0):
+        return f"Value may be worse now: {delta:+.1f} Ks", "warn"
+    return f"Line moved {delta:+.1f} Ks", "neutral"
+
+
+def why_this_pick_points(pick):
+    points = []
+    if not pick:
+        return points
+    if pick.get("line") is not None:
+        points.append(f"Model projection {pick.get('projection')} vs line {pick.get('line')} = edge {pick.get('edge_ks')} Ks")
+    else:
+        points.append("No real line found, so this remains a projection-only row")
+    if pick.get("fair_probability") is not None:
+        points.append(f"Fair probability {round((pick.get('fair_probability') or 0)*100, 1)}% with EV {round((pick.get('ev') or 0)*100, 2)}%")
+    points.append(f"Data score {pick.get('data_score')}/100; lineup locked: {pick.get('lineup_locked')}; pitcher confirmed: {pick.get('pitcher_confirmed')}")
+    points.append(f"Pitcher K rate {pick.get('pitcher_k')} vs opponent K rate {pick.get('opp_k')}; expected BF {pick.get('expected_bf')}")
+    if pick.get("statcast_available"):
+        points.append(f"Statcast loaded: CSW {pick.get('statcast_csw')}%, whiff {pick.get('statcast_whiff')}%")
+    else:
+        points.append("Statcast not loaded for this pitcher or unavailable")
+    if pick.get("pitch_type_matchup_available"):
+        points.append(f"Pitch-type matchup active with factor {pick.get('pitch_type_factor')}")
+    if pick.get("leash_risk"):
+        points.append(f"Leash risk: {pick.get('leash_risk')} | recent IP {pick.get('recent_ip')} | PPB {pick.get('ppb')}")
+    movement, _ = line_movement_alert_text(pick)
+    points.append(movement)
+    if pick.get("no_bet_reasons"):
+        points.append("No-bet gate: " + "; ".join([str(x) for x in pick.get("no_bet_reasons", [])[:5]]))
+    return points
+
 # =========================
 # RENDERING
 # =========================
@@ -3292,6 +3578,12 @@ def render_pick_card(p):
       <div class="small-muted">Statcast: {p.get('statcast_note')} | Pitch Type: {p.get('pitch_type_note')} | Calibration: {p.get('calibration_note')}</div>
       <div class="small-muted">Weather: {p.get('weather_note')} | Umpire: {p.get('umpire_note')}</div>
       <div class="small-muted">Advanced Sim: {p.get('bayesian_markov_note')} | XGBoost: {p.get('xgboost_note')}</div>
+      <div class="hr-soft"></div>
+      <div style="font-size:16px;font-weight:950;color:#fff;margin-bottom:6px;">Why This Pick / Alert</div>
+      <div class="small-muted">{line_movement_alert_text(p)[0]}</div>
+      <ul style="margin-top:8px;margin-bottom:0;color:#d7d7d7;font-size:13px;">
+        {''.join([f'<li>{x}</li>' for x in why_this_pick_points(p)[:7]])}
+      </ul>
     </div>
     """, unsafe_allow_html=True)
 
@@ -3300,8 +3592,8 @@ def render_pick_card(p):
 # =========================
 st.markdown("""
 <div class="hero-panel">
-  <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v10.9 ALL-LINES FALLBACK + DEBUG</div>
-  <div class="sub-title">Strict Win Filter + MLB-only line lock + all-feed missing-line debug → Refresh → Save → Grade</div>
+  <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v11.1 LIVE TRACKER + WHY CARDS</div>
+  <div class="sub-title">Strict Win Filter + all-feed parser + live pitch-by-pitch tracker + line-movement alerts + why-this-pick cards</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -3424,9 +3716,10 @@ def display_clean_real_prop_rows(rows, **kwargs):
     else:
         st.info("No rejected/NBA debug rows shown. Only valid MLB pitcher strikeout lines will appear here.")
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "TOP PLAYS",
     "ALL PLAYERS",
+    "LIVE PITCH TRACKER",
     "REAL PROP BOARD",
     "STATCAST",
     "AFTER GAMES / LEARNING",
@@ -3466,6 +3759,51 @@ with tab2:
         st.info("No players loaded.")
 
 with tab3:
+    st.markdown('<div class="section-title-pro">Live Pitch-by-Pitch Tracker</div>', unsafe_allow_html=True)
+    st.caption("This is a live-game layer only. It does not overwrite your saved pregame projections, official snapshots, learning logs, or bettable gates.")
+    if not board:
+        st.info("Refresh/load the board first. Live tracking only works for games that are in progress or have live MLB feed data.")
+    else:
+        names = [f"{p.get('pitcher')} — {p.get('matchup')} — line {p.get('line')}" for p in board]
+        selected = st.selectbox("Select pitcher to track live", options=list(range(len(board))), format_func=lambda i: names[i])
+        pick = board[selected]
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Pregame Projection", pick.get("projection"))
+        with c2:
+            st.metric("Current Line", pick.get("line") if pick.get("line") is not None else "No Line")
+        with c3:
+            st.metric("Pregame Side", pick.get("pick_side"))
+        if st.button("🔴 Refresh Live Pitch Feed", use_container_width=True):
+            get_live_game_feed.clear()
+        feed = get_live_game_feed(pick.get("game_pk"))
+        live_state = extract_live_pitcher_state(feed, pick.get("pitcher_id"))
+        live_calc = calculate_live_projection_from_pick(pick, live_state)
+        if not live_state.get("available"):
+            st.warning(live_state.get("message", "Live feed unavailable"))
+        else:
+            a, b, c, d, e, f = st.columns(6)
+            a.metric("Game State", live_state.get("game_state"))
+            b.metric("Inning", f"{live_state.get('inning_half') or ''} {live_state.get('inning') or ''}".strip())
+            c.metric("Current Ks", live_state.get("current_ks"))
+            d.metric("Pitch Count", live_state.get("pitch_count"))
+            e.metric("Batters Faced", live_state.get("batters_faced"))
+            f.metric("Outs Recorded", live_state.get("outs_recorded"))
+            if live_calc:
+                g, h, i, j, k = st.columns(5)
+                g.metric("Live Projection", live_calc.get("live_projection"))
+                h.metric("Remaining BF", live_calc.get("remaining_bf"))
+                i.metric("Live Lean", live_calc.get("live_side"))
+                prob = live_calc.get("live_fair_probability")
+                j.metric("Live Fair Prob", "—" if prob is None else f"{prob*100:.1f}%")
+                k.metric("Live Edge", live_calc.get("live_edge_ks"))
+                st.info(live_calc.get("live_leash_note"))
+            st.caption(f"Last event: {live_state.get('last_event') or '—'}")
+            st.subheader("Why This Pick / Live Context")
+            for point in why_this_pick_points(pick):
+                st.write("• " + str(point))
+
+with tab4:
     st.markdown('<div class="section-title-pro">Real Prop Rows + All-Lines Debug</div>', unsafe_allow_html=True)
     rows = []
     for p in board:
@@ -3496,7 +3834,7 @@ with tab3:
     else:
         st.warning("No valid MLB pitcher strikeout prop rows found. Rejected NBA/basketball rows are hidden.")
 
-with tab4:
+with tab5:
     st.markdown('<div class="section-title-pro">Statcast + Pitch-Type</div>', unsafe_allow_html=True)
     if board:
         stat_rows = []
@@ -3543,7 +3881,7 @@ with tab4:
     else:
         st.info("Load the board first.")
 
-with tab5:
+with tab6:
     st.markdown('<div class="section-title-pro">After Games — Grade + Learn</div>', unsafe_allow_html=True)
     if st.button("✅ AFTER GAMES — Grade Results + Update Learning", use_container_width=True):
         graded = grade_finished_games()
@@ -3575,7 +3913,7 @@ with tab5:
     else:
         st.info("No graded history yet. Save official snapshots before games, then grade after games finish.")
 
-with tab6:
+with tab7:
     st.markdown('<div class="section-title-pro">Settings / Saved Files</div>', unsafe_allow_html=True)
     st.code(STORAGE_DIR)
     st.write("Pick Log:")
