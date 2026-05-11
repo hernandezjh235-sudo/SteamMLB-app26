@@ -19,7 +19,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v10.8 WEATHER + UMPIRE CAPS"
+APP_VERSION = "v10.8.2 LINE LOCK + TRUE PROJECTION BOOST"
 
 try:
     import pytz
@@ -51,18 +51,21 @@ SIGNAL_TRACKING_FILE = os.path.join(STORAGE_DIR, "signal_tracking.json")
 LONG_BACKTEST_FILE = os.path.join(STORAGE_DIR, "long_backtest_rows.json")
 LINEUP_CACHE_FILE = os.path.join(STORAGE_DIR, "locked_lineup_cache.json")
 LINE_HISTORY_FILE = os.path.join(STORAGE_DIR, "line_history.json")
+MAIN_LINE_LOCK_FILE = os.path.join(STORAGE_DIR, "main_line_lock.json")
+RAW_UNDERDOG_DEBUG_FILE = os.path.join(STORAGE_DIR, "raw_underdog_debug.json")
 
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 MLB_LIVE = "https://statsapi.mlb.com/api/v1.1"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 PRIZEPICKS_URL = "https://api.prizepicks.com/projections"
 UNDERDOG_URLS = [
+    # v10.8.1: stable v1 first. Beta endpoints are backups only because they can expose alternate ladders.
+    "https://api.underdogfantasy.com/v1/over_under_lines",
     "https://api.underdogfantasy.com/beta/v6/over_under_lines",
     "https://api.underdogfantasy.com/beta/v5/over_under_lines",
     "https://api.underdogfantasy.com/beta/v4/over_under_lines",
     "https://api.underdogfantasy.com/beta/v3/over_under_lines",
     "https://api.underdogfantasy.com/beta/v2/over_under_lines",
-    "https://api.underdogfantasy.com/v1/over_under_lines",
 ]
 SPORTSGAMEODDS_BASE = "https://api.sportsgameodds.com/v2"
 OPTICODDS_BASE = "https://api.opticodds.com/api/v3"
@@ -136,6 +139,16 @@ def get_secret(key, default=""):
 ODDS_API_KEY = get_secret("ODDS_API_KEY", "c9f5eadbe263f64c3fd17df20a4f1f3b")
 SPORTSGAMEODDS_API_KEY = get_secret("SPORTSGAMEODDS_API_KEY", "")
 OPTICODDS_API_KEY = get_secret("OPTICODDS_API_KEY", "")
+
+
+# ============================================================
+# v10.8.1 ORIGINAL BASE LINE FIX
+# - Built from the original v10.8 file.
+# - No live pitch-by-pitch layer.
+# - No stacked v11 parser wrappers.
+# - Underdog v1 is tried first.
+# - Underdog line chooser no longer selects max(line).
+# ============================================================
 
 # =========================
 # PAGE CONFIG + UI
@@ -859,7 +872,8 @@ def blend_pitcher_k_rate(profile_k, recent_rows, pitcher_id):
         base = profile_k
         source = "Season pitcher K%"
     learned, scale = apply_learning(pitcher_id, base)
-    return clamp(learned, 0.08, 0.48), source, scale
+    learned, form_msg = v1082_recent_pitcher_form_adjustment(learned, recent_rows)
+    return clamp(learned, 0.08, 0.48), source + " + " + form_msg, scale
 
 def calculate_log5_k_rate(pitcher_k, lineup_k, league_avg_k=LEAGUE_AVG_K):
     pitcher_k = clamp(pitcher_k, 0.01, 0.60)
@@ -1788,6 +1802,13 @@ def clean_real_prop_debug_rows(rows):
 
     return cleaned
 
+
+# v10.8.2 wrapper: preserve original cleaner, then lock/protect Underdog main lines.
+_v1082_original_clean_real_prop_debug_rows = clean_real_prop_debug_rows
+def clean_real_prop_debug_rows(rows):
+    cleaned = _v1082_original_clean_real_prop_debug_rows(rows)
+    return v1082_clean_underdog_mainline_rows(cleaned)
+
 def is_half_point_line(line):
     """True for normal no-push prop lines like 4.5, 5.5, 6.5."""
     val = safe_float(line)
@@ -2282,20 +2303,43 @@ def get_underdog_k_data(player_name):
     accepted_rows = list(dedup.values())
 
     # Pick the live Underdog board line.
-    # Important: alternate/fallback nested rows can produce lower lines.
-    # So we prefer relationship rows, then half-point rows, then highest line among similarly matched rows.
+    # v10.8.1 FIX:
+    # The original code ranked by the highest line, which can accidentally choose an
+    # alternate ladder line. We now prefer the clean relationship parser and choose the
+    # first/highest-confidence direct half-line from the stable board instead of max(line).
     primary_rows = [r for r in accepted_rows if r.get("Parser Mode") == "relationship"] or accepted_rows
     half_rows = [r for r in primary_rows if is_half_point_line(r.get("Line"))] or primary_rows
 
     def row_rank(r):
         rel_bonus = 1 if r.get("Parser Mode") == "relationship" else 0
+        direct_bonus = 1 if any(k in str(r.get("Line Evidence", "")).lower() for k in ["stat_value", "line_score", "over_under_line", "target_value"]) else 0
         half_bonus = 1 if is_half_point_line(r.get("Line")) else 0
         score = safe_float(r.get("Match Score"), 0) or 0
-        line = safe_float(r.get("Line"), -999) or -999
-        return (rel_bonus, half_bonus, round(score, 2), line)
+        # Do NOT rank by line value. That was the wrong-line bug.
+        return (rel_bonus, direct_bonus, half_bonus, round(score, 3))
 
-    best_row = sorted(half_rows, key=row_rank, reverse=True)[0]
+    ranked = sorted(half_rows, key=row_rank, reverse=True)
+    top_rank = row_rank(ranked[0])
+    tied = [r for r in ranked if row_rank(r) == top_rank]
+    # If several tied relationship rows exist, use the median line, not the highest alt.
+    tied_lines = sorted([safe_float(r.get("Line")) for r in tied if safe_float(r.get("Line")) is not None])
+    if len(tied_lines) >= 3:
+        target_line = tied_lines[len(tied_lines) // 2]
+        best_row = sorted(tied, key=lambda r: abs((safe_float(r.get("Line")) or target_line) - target_line))[0]
+    else:
+        best_row = ranked[0]
     active = safe_float(best_row.get("Line"))
+    active = v1082_lock_main_line(
+        pitcher_name,
+        active,
+        "Underdog",
+        evidence=best_row.get("Line Evidence", ""),
+        match_score=best_row.get("Match Score"),
+    )
+    best_row["Line"] = active
+    best_row["line"] = active
+    best_row["Main Line Lock"] = "LOCKED"
+    v1082_log_raw_underdog_row(best_row)
 
     return source_result(
         "Underdog",
@@ -3456,3 +3500,45 @@ with tab6:
             st.error("All logs cleared.")
 
 st.caption("Workflow: Refresh live board → inspect lines → save official before-game snapshot → after games, grade and learn.")
+
+
+# =========================
+# v10.8.2 LINE DEBUG + LOCK UI
+# =========================
+try:
+    with st.expander("🔒 Main-Line Lock / Raw Underdog Debug", expanded=False):
+        st.caption("This table is for verifying that real Underdog lines are being pulled and locked. It does not create fake lines.")
+        lock_rows = load_json(MAIN_LINE_LOCK_FILE, {})
+        if lock_rows:
+            lock_df = pd.DataFrame(list(lock_rows.values()))
+            st.markdown("#### Locked Main Lines")
+            st.dataframe(lock_df.tail(200).iloc[::-1], use_container_width=True, hide_index=True)
+        else:
+            st.info("No locked lines yet. Refresh the board first.")
+
+        raw_rows = load_json(RAW_UNDERDOG_DEBUG_FILE, [])
+        if raw_rows:
+            raw_df = pd.DataFrame(raw_rows)
+            st.markdown("#### Raw Underdog Debug Rows")
+            st.dataframe(raw_df.tail(300).iloc[::-1], use_container_width=True, hide_index=True)
+        else:
+            st.info("No raw Underdog debug rows logged yet.")
+
+    with st.expander("📏 Line Quality Check", expanded=False):
+        board_candidates = globals().get("board", globals().get("picks", globals().get("final_board", [])))
+        if isinstance(board_candidates, list) and board_candidates:
+            rows = []
+            for p in board_candidates:
+                if isinstance(p, dict):
+                    rows.append({
+                        "Pitcher": p.get("pitcher", p.get("player", "")),
+                        "Line": p.get("line", p.get("Line")),
+                        "Projection": p.get("projection", p.get("Projection")),
+                        "Source": p.get("source", p.get("Source", "")),
+                        "Line Quality": v1082_line_quality_flag(p.get("prop_rows", [])),
+                    })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No board rows available yet. Refresh the app first.")
+except Exception as e:
+    st.warning(f"v10.8.2 line debug unavailable: {e}")
