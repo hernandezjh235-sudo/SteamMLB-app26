@@ -57,12 +57,14 @@ MLB_LIVE = "https://statsapi.mlb.com/api/v1.1"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 PRIZEPICKS_URL = "https://api.prizepicks.com/projections"
 UNDERDOG_URLS = [
+    # v11.2.2: v1 first because it has historically matched the normal Underdog board line.
+    # Beta endpoints can expose alternate ladders; those caused repeated 7.5 lines.
+    "https://api.underdogfantasy.com/v1/over_under_lines",
     "https://api.underdogfantasy.com/beta/v6/over_under_lines",
     "https://api.underdogfantasy.com/beta/v5/over_under_lines",
     "https://api.underdogfantasy.com/beta/v4/over_under_lines",
     "https://api.underdogfantasy.com/beta/v3/over_under_lines",
     "https://api.underdogfantasy.com/beta/v2/over_under_lines",
-    "https://api.underdogfantasy.com/v1/over_under_lines",
 ]
 SPORTSGAMEODDS_BASE = "https://api.sportsgameodds.com/v2"
 OPTICODDS_BASE = "https://api.opticodds.com/api/v3"
@@ -2300,19 +2302,40 @@ def get_underdog_k_data(player_name):
     accepted_rows = list(dedup.values())
 
     # Pick the live Underdog board line.
-    # Important: alternate/fallback nested rows can produce lower lines.
-    # So we prefer relationship rows, then half-point rows, then highest line among similarly matched rows.
+    # v11.2.2 FIX:
+    # Do NOT rank by highest line. Beta/alt ladders can contain 7.5 for many pitchers,
+    # which caused every row to display 7.5. Prefer relationship + direct stat/line evidence,
+    # then choose the most central available half-line rather than the highest alternate.
     primary_rows = [r for r in accepted_rows if r.get("Parser Mode") == "relationship"] or accepted_rows
     half_rows = [r for r in primary_rows if is_half_point_line(r.get("Line"))] or primary_rows
 
-    def row_rank(r):
-        rel_bonus = 1 if r.get("Parser Mode") == "relationship" else 0
-        half_bonus = 1 if is_half_point_line(r.get("Line")) else 0
-        score = safe_float(r.get("Match Score"), 0) or 0
-        line = safe_float(r.get("Line"), -999) or -999
-        return (rel_bonus, half_bonus, round(score, 2), line)
+    def _direct_line_bonus(r):
+        ev = str(r.get("Line Evidence", "")).lower()
+        return 1 if any(k in ev for k in ["stat_value", "line_score", "over_under_line", "target_value"]) else 0
 
-    best_row = sorted(half_rows, key=row_rank, reverse=True)[0]
+    def _looks_alt(r):
+        txt = " ".join(str(r.get(k, "")) for k in ["Market", "Line Evidence", "Underdog Path", "Parser Mode", "Matched Name"]).lower()
+        return any(x in txt for x in ["alternate", "alt ", "ladder"])
+
+    standard_rows = [r for r in half_rows if not _looks_alt(r)] or half_rows
+    # Sort by match/directness first, then use the median available line to avoid alt-ladder max selection.
+    standard_rows = sorted(
+        standard_rows,
+        key=lambda r: (
+            1 if r.get("Parser Mode") == "relationship" else 0,
+            _direct_line_bonus(r),
+            round(safe_float(r.get("Match Score"), 0) or 0, 2),
+        ),
+        reverse=True
+    )
+    top_score = round(safe_float(standard_rows[0].get("Match Score"), 0) or 0, 2)
+    top_rows = [r for r in standard_rows if round(safe_float(r.get("Match Score"), 0) or 0, 2) >= top_score - 0.01]
+    line_vals = sorted([safe_float(r.get("Line")) for r in top_rows if safe_float(r.get("Line")) is not None])
+    if line_vals:
+        median_line = line_vals[len(line_vals) // 2]
+        best_row = sorted(top_rows, key=lambda r: abs((safe_float(r.get("Line")) or median_line) - median_line))[0]
+    else:
+        best_row = standard_rows[0]
     active = safe_float(best_row.get("Line"))
 
     return source_result(
@@ -2833,10 +2856,16 @@ def get_all_underdog_k_rows():
                 "Price": None,
                 "Line Evidence": note,
                 "Underdog Path": url.split("/")[-1],
+                "Underdog URL": url,
                 "Board Match": "UNMATCHED UNTIL PROJECTION MATCHES",
                 "Reject Reason": "",
                 "Parser Mode": "relationship-resolved all-board"
             })
+
+    # v11.2.2: if stable v1 rows are present, use them over beta ladder rows.
+    v1_rows = [r for r in rows if "/v1/" in str(r.get("Underdog URL", ""))]
+    if v1_rows:
+        rows = v1_rows
 
     dedup = {}
     for r in rows:
@@ -3942,7 +3971,7 @@ def v1121_clean_prop_rows(prop_rows):
         fixed = v1121_extract_line_from_obj(raw)
         if fixed is not None:
             current = safe_float(rr.get("Line", rr.get("line")), None)
-            if current is None or current == 7.5:
+            if current is None:
                 rr["Line"] = fixed
                 rr["line"] = fixed
         rows.append(rr)
@@ -3960,6 +3989,11 @@ try:
 except Exception:
     pass
 
+
+
+# v11.2.2 Underdog note:
+# Live pitch-by-pitch does not set prop lines. Pregame/live prop lines are pulled from Underdog/PrizePicks.
+# Underdog v1 is prioritized for main board lines; beta endpoints are backup only.
 
 # =========================
 # APP
