@@ -3587,6 +3587,380 @@ def render_pick_card(p):
     </div>
     """, unsafe_allow_html=True)
 
+
+# ============================================================
+# v11.2 AUTO-GRADER + MODEL DASHBOARD + PASS REASONS
+# Safe additive layer. Does not change projection math.
+# ============================================================
+
+def v112_pick_unique_id(p):
+    bits = [
+        str(p.get("date", "")),
+        normalize_name(p.get("pitcher", p.get("player", ""))),
+        str(p.get("line", p.get("Line", ""))),
+        str(p.get("side", p.get("Side", ""))),
+        str(p.get("source", p.get("Provider", p.get("Source", "")))),
+    ]
+    return "_".join(bits)
+
+def v112_get_pitcher_actual_ks_from_boxscore(game_pk, pitcher_id):
+    if not game_pk or not pitcher_id:
+        return None
+    data = safe_get_json(f"{MLB_BASE}/game/{game_pk}/boxscore")
+    if not isinstance(data, dict):
+        return None
+    for side in ["home", "away"]:
+        players = data.get("teams", {}).get(side, {}).get("players", {}) or {}
+        for _, pdata in players.items():
+            person = pdata.get("person", {}) or {}
+            if str(person.get("id")) != str(pitcher_id):
+                continue
+            pitching = (pdata.get("stats", {}) or {}).get("pitching", {}) or {}
+            return safe_int(pitching.get("strikeOuts"), None)
+    return None
+
+def v112_game_is_final(game_pk):
+    if not game_pk:
+        return False
+    data = safe_get_json(f"{MLB_BASE}/game/{game_pk}/feed/live")
+    status = (((data or {}).get("gameData") or {}).get("status") or {})
+    abstract = str(status.get("abstractGameState", "")).lower()
+    detailed = str(status.get("detailedState", "")).lower()
+    return abstract == "final" or "final" in detailed or "game over" in detailed
+
+def v112_grade_pick_result(pick, actual_ks):
+    line = safe_float(pick.get("line", pick.get("Line")))
+    side = str(pick.get("side", pick.get("Side", "over"))).lower()
+    if line is None or actual_ks is None:
+        return None
+    return actual_ks < line if "under" in side else actual_ks > line
+
+def v112_auto_grade_finished_picks(board=None):
+    results = load_json(RESULT_LOG, [])
+    known = {str(r.get("pick_id")) for r in results if r.get("actual") is not None}
+    graded_now = []
+
+    candidates = []
+    saved = load_json(PICK_LOG, [])
+    if isinstance(saved, list):
+        candidates.extend(saved)
+    if isinstance(board, list):
+        candidates.extend(board)
+
+    for p in candidates:
+        if not isinstance(p, dict):
+            continue
+        pid = p.get("pick_id") or v112_pick_unique_id(p)
+        if str(pid) in known:
+            continue
+
+        game_pk = p.get("game_pk") or p.get("GamePk") or p.get("gamePk")
+        pitcher_id = p.get("pitcher_id") or p.get("Pitcher ID") or p.get("player_id")
+        if not game_pk or not pitcher_id:
+            continue
+        if not v112_game_is_final(game_pk):
+            continue
+
+        actual = v112_get_pitcher_actual_ks_from_boxscore(game_pk, pitcher_id)
+        if actual is None:
+            continue
+
+        win = v112_grade_pick_result(p, actual)
+        row = {
+            "graded_at": now_iso(),
+            "pick_id": pid,
+            "date": p.get("date"),
+            "pitcher": p.get("pitcher", p.get("player")),
+            "pitcher_id": pitcher_id,
+            "game_pk": game_pk,
+            "side": p.get("side", p.get("Side", "Over")),
+            "line": safe_float(p.get("line", p.get("Line"))),
+            "projection": safe_float(p.get("projection", p.get("Projection"))),
+            "prob": safe_float(p.get("prob", p.get("over_prob", p.get("Probability")))),
+            "ev": safe_float(p.get("ev", p.get("EV"))),
+            "score": safe_float(p.get("score", p.get("Score"))),
+            "confidence": p.get("confidence", p.get("Confidence")),
+            "actual": actual,
+            "win": win,
+        }
+        results.append(row)
+        graded_now.append(row)
+        known.add(str(pid))
+
+        try:
+            update_learning(pitcher_id, row.get("projection"), actual)
+        except Exception:
+            pass
+
+    save_json(RESULT_LOG, results[-20000:])
+    return graded_now
+
+def v112_build_model_dashboard_rows():
+    rows = load_json(RESULT_LOG, [])
+    clean = []
+    for r in rows:
+        if not isinstance(r, dict) or r.get("actual") is None:
+            continue
+        line = safe_float(r.get("line"))
+        proj = safe_float(r.get("projection"))
+        actual = safe_float(r.get("actual"))
+        win = r.get("win")
+        if line is None or actual is None or win is None:
+            continue
+
+        score = safe_float(r.get("score"))
+        if score is None:
+            tier = "Unknown"
+        elif score >= 92:
+            tier = "Elite 92+"
+        elif score >= 88:
+            tier = "Strong 88-91"
+        elif score >= 82:
+            tier = "Watch 82-87"
+        else:
+            tier = "Low <82"
+
+        clean.append({
+            "Date": r.get("date", ""),
+            "Pitcher": r.get("pitcher", ""),
+            "Side": str(r.get("side", "Over")).title(),
+            "Line": line,
+            "Projection": proj,
+            "Actual Ks": actual,
+            "Win": bool(win),
+            "Score": score,
+            "Tier": tier,
+            "Confidence": str(r.get("confidence", "Unknown")),
+            "EV": safe_float(r.get("ev")),
+            "Error": None if proj is None else actual - proj,
+            "Abs Error": None if proj is None else abs(actual - proj),
+        })
+    return clean
+
+def v112_summarize_group(df, group_col):
+    if df.empty or group_col not in df.columns:
+        return pd.DataFrame()
+    out = df.groupby(group_col).agg(
+        Picks=("Win", "count"),
+        Hit_Rate=("Win", "mean"),
+        Avg_Error=("Error", "mean"),
+        MAE=("Abs Error", "mean"),
+    ).reset_index()
+    out["Hit_Rate"] = (out["Hit_Rate"] * 100).round(1)
+    out["Avg_Error"] = out["Avg_Error"].round(2)
+    out["MAE"] = out["MAE"].round(2)
+    return out.sort_values(["Picks", "Hit_Rate"], ascending=[False, False])
+
+def v112_pass_reasons(p):
+    reasons = []
+    line = safe_float(p.get("line", p.get("Line")))
+    proj = safe_float(p.get("projection", p.get("Projection")))
+    prob = safe_float(p.get("prob", p.get("over_prob", p.get("Probability"))))
+    ev = safe_float(p.get("ev", p.get("EV")))
+    score = safe_float(p.get("score", p.get("Score")))
+    lineup_score = safe_float(p.get("lineup_score", p.get("Lineup Score")))
+    match_score = safe_float(p.get("match_score", p.get("Match Score")))
+    status = str(p.get("status", p.get("Status", ""))).lower()
+
+    try:
+        if line is not None and proj is not None and abs(proj - line) < MIN_BETTABLE_GAP_KS:
+            reasons.append(f"Projection gap only {abs(proj-line):.2f} Ks; need {MIN_BETTABLE_GAP_KS:.2f}+.")
+        if prob is not None and prob < MIN_BETTABLE_PROB:
+            reasons.append(f"Probability {prob*100:.1f}% below {MIN_BETTABLE_PROB*100:.0f}% gate.")
+        if ev is not None and ev < MIN_BETTABLE_EV:
+            reasons.append(f"EV {ev:.3f} below {MIN_BETTABLE_EV:.3f} gate.")
+        if score is not None and score < MIN_BETTABLE_SCORE:
+            reasons.append(f"Model score {score:.0f} below {MIN_BETTABLE_SCORE} bettable gate.")
+        if lineup_score is not None and lineup_score < MIN_CONFIRMED_LINEUP_SCORE:
+            reasons.append("Lineup not strong/confirmed enough.")
+        if match_score is not None and match_score < MIN_MATCH_SCORE_STRICT:
+            reasons.append("Player/line match confidence is too low.")
+        if "lineup" in status and "not" in status:
+            reasons.append("Lineup not posted yet.")
+    except Exception:
+        pass
+
+    if not reasons:
+        reasons.append("No hard rejection detected; likely watchlist/manual-review row.")
+    return reasons
+
+def v112_render_pass_reason_table(board):
+    if not board:
+        st.info("No board rows available for pass-reason review.")
+        return
+    rows = []
+    for p in board:
+        if not isinstance(p, dict):
+            continue
+        is_bet = bool(p.get("bettable", p.get("is_bettable", False))) or str(p.get("grade", "")).upper() in ["BET", "PLAY", "ELITE"]
+        if is_bet:
+            continue
+        rows.append({
+            "Pitcher": p.get("pitcher", p.get("player", "")),
+            "Line": p.get("line", p.get("Line")),
+            "Projection": p.get("projection", p.get("Projection")),
+            "Prob": p.get("prob", p.get("over_prob", p.get("Probability"))),
+            "EV": p.get("ev", p.get("EV")),
+            "Score": p.get("score", p.get("Score")),
+            "Pass Reason": " | ".join(v112_pass_reasons(p)[:3])
+        })
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.success("No pass rows detected, or all visible rows are bettable/watchlist.")
+
+def v112_render_model_dashboard():
+    st.markdown('<div class="section-title-pro">Model Performance Dashboard</div>', unsafe_allow_html=True)
+    rows = v112_build_model_dashboard_rows()
+    if not rows:
+        st.info("No graded results yet. Save official picks, then run after games are final to build this dashboard.")
+        return
+
+    df = pd.DataFrame(rows)
+    total = len(df)
+    hit = df["Win"].mean() * 100 if total else 0
+    mae = df["Abs Error"].dropna().mean()
+    bias = df["Error"].dropna().mean()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Graded Picks", total)
+    c2.metric("Hit Rate", f"{hit:.1f}%")
+    c3.metric("MAE", "—" if pd.isna(mae) else f"{mae:.2f} Ks")
+    c4.metric("Bias", "—" if pd.isna(bias) else f"{bias:+.2f} Ks")
+
+    st.markdown("#### Hit rate by confidence tier")
+    st.dataframe(v112_summarize_group(df, "Tier"), use_container_width=True, hide_index=True)
+
+    st.markdown("#### Hit rate by side")
+    st.dataframe(v112_summarize_group(df, "Side"), use_container_width=True, hide_index=True)
+
+    st.markdown("#### Pitcher history")
+    pitch = v112_summarize_group(df, "Pitcher")
+    if not pitch.empty:
+        st.dataframe(pitch.head(50), use_container_width=True, hide_index=True)
+
+    st.markdown("#### Recent graded picks")
+    st.dataframe(df.tail(100).iloc[::-1], use_container_width=True, hide_index=True)
+
+
+
+# ============================================================
+# v11.2.1 STRICT PROP LINE RESOLVER
+# Fixes repeated/default line bugs such as every pitcher showing 7.5.
+# ============================================================
+
+def v1121_extract_line_from_obj(obj):
+    """Extract a row-specific prop line from one object only.
+
+    Do not use global/default board values. This prevents one repeated line
+    from being copied across every player.
+    """
+    if not isinstance(obj, dict):
+        return None
+
+    # Highest confidence direct keys.
+    direct_keys = [
+        "line_score", "line", "stat_value", "value", "over_under", "total",
+        "points", "target", "threshold", "handicap", "spread"
+    ]
+    for k in direct_keys:
+        val = obj.get(k)
+        f = safe_float(val, None)
+        if f is not None and 0.5 <= f <= 20:
+            return float(f)
+
+    # Underdog/PrizePicks nested option/value containers.
+    nested_keys = ["attributes", "option", "over_under", "projection", "stat", "market", "line"]
+    for nk in nested_keys:
+        nested = obj.get(nk)
+        if isinstance(nested, dict):
+            got = v1121_extract_line_from_obj(nested)
+            if got is not None:
+                return got
+
+    # Some APIs include display text like "Over 5.5" or "Pitcher Strikeouts 6.5".
+    # Use this only on the same object, never globally.
+    text_keys = ["display_line", "display", "description", "title", "name", "label"]
+    for k in text_keys:
+        txt = obj.get(k)
+        if not txt:
+            continue
+        nums = re.findall(r'(?<!\d)(\d+(?:\.5|\.0)?)(?!\d)', str(txt))
+        candidates = []
+        for n in nums:
+            f = safe_float(n, None)
+            if f is not None and 0.5 <= f <= 20:
+                candidates.append(float(f))
+        if candidates:
+            # For K props, the last small decimal in the row text is usually the prop line.
+            return candidates[-1]
+
+    return None
+
+def v1121_is_bad_repeated_line(prop_rows):
+    """Detect impossible parser output where every player got the same line."""
+    if not prop_rows or len(prop_rows) < 6:
+        return False
+    lines = [safe_float(r.get("Line"), None) for r in prop_rows if isinstance(r, dict)]
+    names = [normalize_name(r.get("Player", r.get("Pitcher", ""))) for r in prop_rows if isinstance(r, dict)]
+    lines = [x for x in lines if x is not None]
+    names = [x for x in names if x]
+    if len(lines) < 6 or len(set(names)) < 6:
+        return False
+    most_common = max(set(lines), key=lines.count)
+    return lines.count(most_common) / max(len(lines), 1) >= 0.85
+
+def v1121_repair_repeated_lines_from_raw(prop_rows, raw_rows=None):
+    """Best-effort repair. If the output is clearly repeated, re-read row-specific lines."""
+    if not v1121_is_bad_repeated_line(prop_rows):
+        return prop_rows
+    repaired = []
+    for r in prop_rows:
+        rr = dict(r)
+        raw = rr.get("_raw") or rr.get("Raw") or rr.get("raw") or {}
+        fixed = v1121_extract_line_from_obj(raw)
+        if fixed is not None:
+            rr["Line"] = fixed
+            rr["line"] = fixed
+            rr["Line Repair"] = "v11.2.1 row-specific"
+        else:
+            rr["Line Repair"] = "Needs raw row review"
+        repaired.append(rr)
+    return repaired
+
+def v1121_clean_prop_rows(prop_rows):
+    """Final safety pass for prop rows before display/build."""
+    if not isinstance(prop_rows, list):
+        return prop_rows
+    rows = []
+    for r in prop_rows:
+        if not isinstance(r, dict):
+            continue
+        rr = dict(r)
+        raw = rr.get("_raw") or rr.get("Raw") or rr.get("raw") or {}
+        # If the line is missing or suspiciously copied, prefer row-specific raw value.
+        fixed = v1121_extract_line_from_obj(raw)
+        if fixed is not None:
+            current = safe_float(rr.get("Line", rr.get("line")), None)
+            if current is None or current == 7.5:
+                rr["Line"] = fixed
+                rr["line"] = fixed
+        rows.append(rr)
+    rows = v1121_repair_repeated_lines_from_raw(rows)
+    return rows
+
+
+
+# v11.2.1 wrapper: preserve original cleaner, then repair repeated/default lines.
+try:
+    _v1121_original_clean_real_prop_debug_rows = clean_real_prop_debug_rows
+    def clean_real_prop_debug_rows(rows):
+        cleaned = _v1121_original_clean_real_prop_debug_rows(rows)
+        return v1121_clean_prop_rows(cleaned)
+except Exception:
+    pass
+
+
 # =========================
 # APP
 # =========================
@@ -3966,3 +4340,32 @@ with tab7:
             st.error("All logs cleared.")
 
 st.caption("Workflow: Refresh live board → inspect lines → save official before-game snapshot → after games, grade and learn.")
+
+# =========================
+# v11.2 UI ADD-ONS
+# =========================
+try:
+    with st.expander("✅ Auto Grade + Model Dashboard", expanded=False):
+        current_board_for_grade = globals().get("board", globals().get("picks", globals().get("final_board", [])))
+        if st.button("Run Auto-Grader Now", key="v112_auto_grade_btn_expander"):
+            graded = v112_auto_grade_finished_picks(current_board_for_grade)
+            if graded:
+                st.success(f"Auto-graded {len(graded)} finished picks.")
+                st.dataframe(pd.DataFrame(graded), use_container_width=True, hide_index=True)
+            else:
+                st.info("No new final games/picks were ready to grade.")
+        v112_render_model_dashboard()
+
+    with st.expander("🚫 Pass / No-Bet Reasons", expanded=False):
+        current_board_for_pass = globals().get("board", globals().get("picks", globals().get("final_board", [])))
+        v112_render_pass_reason_table(current_board_for_pass)
+except Exception as e:
+    st.warning(f"v11.2 tracking layer unavailable: {e}")
+
+
+try:
+    _v1121_board_for_warning = globals().get("real_prop_rows", globals().get("prop_rows", []))
+    if v1121_is_bad_repeated_line(_v1121_board_for_warning):
+        st.warning("Line parser warning: many rows still share the same line. Open Missing/Raw Prop Debug and send the raw rows for a deeper source-specific fix.")
+except Exception:
+    pass
