@@ -19,7 +19,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v10.8.2 LINE LOCK + TRUE PROJECTION BOOST"
+APP_VERSION = "v10.8.2.1 LINE LOCK HOTFIX"
 
 try:
     import pytz
@@ -1753,6 +1753,118 @@ def source_result(source, status, line=None, rows=None, message=""):
     return {"source": source, "status": status, "line": safe_float(line), "rows": rows or [], "message": message}
 
 
+
+
+# =========================
+# v10.8.2.1 LINE LOCK + TRUE PROJECTION HELPERS
+# Must be defined before any cleaner/wrapper calls them.
+# =========================
+def v1082_main_line_key(player_name, source="Underdog", date_str=None, market="pitcher_strikeouts"):
+    d = date_str or california_now().strftime("%Y-%m-%d")
+    return f"{d}_{normalize_name(player_name)}_{source}_{market}"
+
+def v1082_lock_main_line(player_name, line, source="Underdog", date_str=None, evidence="", match_score=None):
+    line = safe_float(line)
+    if line is None:
+        return None
+    data = load_json(MAIN_LINE_LOCK_FILE, {})
+    key = v1082_main_line_key(player_name, source, date_str)
+    rec = data.get(key)
+    if not rec:
+        rec = {
+            "player": player_name,
+            "source": source,
+            "date": date_str or california_now().strftime("%Y-%m-%d"),
+            "locked_line": float(line),
+            "first_seen": now_iso(),
+            "last_seen": now_iso(),
+            "evidence": str(evidence)[:220],
+            "match_score": match_score,
+        }
+    else:
+        rec["latest_seen_line"] = float(line)
+        rec["last_seen"] = now_iso()
+        rec["evidence_latest"] = str(evidence)[:220]
+    data[key] = rec
+    save_json(MAIN_LINE_LOCK_FILE, data)
+    return safe_float(rec.get("locked_line"), line)
+
+def v1082_log_raw_underdog_row(row):
+    try:
+        rows = load_json(RAW_UNDERDOG_DEBUG_FILE, [])
+        if isinstance(row, dict):
+            slim = {
+                "time": now_iso(),
+                "Feed Name": row.get("Feed Name") or row.get("Matched Name") or row.get("Player"),
+                "Line": row.get("Line"),
+                "Market": row.get("Market"),
+                "Parser Mode": row.get("Parser Mode"),
+                "Match Score": row.get("Match Score"),
+                "Line Evidence": row.get("Line Evidence"),
+                "Underdog Path": row.get("Underdog Path"),
+            }
+            rows.append(slim)
+            save_json(RAW_UNDERDOG_DEBUG_FILE, rows[-1000:])
+    except Exception:
+        pass
+
+def v1082_clean_underdog_mainline_rows(rows):
+    if not isinstance(rows, list):
+        return rows
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        rr = dict(r)
+        source = rr.get("Source") or rr.get("Provider") or "Underdog"
+        if str(source).lower() == "underdog":
+            player = rr.get("Feed Name") or rr.get("Matched Name") or rr.get("Player") or rr.get("Pitcher")
+            line = safe_float(rr.get("Line"))
+            if player and line is not None:
+                locked = v1082_lock_main_line(
+                    player,
+                    line,
+                    "Underdog",
+                    date_str=rr.get("Date"),
+                    evidence=rr.get("Line Evidence", ""),
+                    match_score=rr.get("Match Score"),
+                )
+                rr["Line"] = locked
+                rr["line"] = locked
+                rr["Main Line Lock"] = "LOCKED"
+                v1082_log_raw_underdog_row(rr)
+        out.append(rr)
+    return out
+
+def v1082_recent_pitcher_form_adjustment(base_k_rate, recent_rows):
+    if not recent_rows:
+        return base_k_rate, "No recent form boost"
+    rates = []
+    for r in recent_rows[:5]:
+        bf = safe_float(r.get("BF"))
+        ks = safe_float(r.get("Ks"))
+        if bf and bf >= 12 and ks is not None:
+            rates.append(ks / bf)
+    if len(rates) < 2:
+        return base_k_rate, "Recent form sample too thin"
+    recent = float(np.mean(rates))
+    diff = recent - base_k_rate
+    factor = clamp(1 + diff * 0.18, 0.965, 1.035)
+    return clamp(base_k_rate * factor, 0.08, 0.50), f"v10.8.2.1 recent pitcher form x{factor:.3f}"
+
+def v1082_line_quality_flag(prop_rows):
+    if not prop_rows:
+        return "NO_LINE_ROWS"
+    lines = [safe_float(r.get("Line")) for r in prop_rows if isinstance(r, dict) and safe_float(r.get("Line")) is not None]
+    if not lines:
+        return "NO_VALID_LINES"
+    if len(lines) >= 5:
+        most = max(set(lines), key=lines.count)
+        if lines.count(most) / len(lines) >= 0.80:
+            return f"WARNING_REPEATED_LINE_{most}"
+    return "OK"
+
+
 def clean_real_prop_debug_rows(rows):
     """Display/storage filter: only valid MLB pitcher strikeout prop rows.
 
@@ -1803,11 +1915,15 @@ def clean_real_prop_debug_rows(rows):
     return cleaned
 
 
-# v10.8.2 wrapper: preserve original cleaner, then lock/protect Underdog main lines.
-_v1082_original_clean_real_prop_debug_rows = clean_real_prop_debug_rows
-def clean_real_prop_debug_rows(rows):
-    cleaned = _v1082_original_clean_real_prop_debug_rows(rows)
-    return v1082_clean_underdog_mainline_rows(cleaned)
+# v10.8.2.1 wrapper: preserve original cleaner, then lock/protect Underdog main lines.
+try:
+    _v1082_original_clean_real_prop_debug_rows = clean_real_prop_debug_rows
+    def clean_real_prop_debug_rows(rows):
+        cleaned = _v1082_original_clean_real_prop_debug_rows(rows)
+        return v1082_clean_underdog_mainline_rows(cleaned)
+except NameError:
+    pass
+
 
 def is_half_point_line(line):
     """True for normal no-push prop lines like 4.5, 5.5, 6.5."""
@@ -3501,13 +3617,12 @@ with tab6:
 
 st.caption("Workflow: Refresh live board → inspect lines → save official before-game snapshot → after games, grade and learn.")
 
-
 # =========================
-# v10.8.2 LINE DEBUG + LOCK UI
+# v10.8.2.1 LINE DEBUG + LOCK UI
 # =========================
 try:
     with st.expander("🔒 Main-Line Lock / Raw Underdog Debug", expanded=False):
-        st.caption("This table is for verifying that real Underdog lines are being pulled and locked. It does not create fake lines.")
+        st.caption("Verify real Underdog lines and locked main-board values. This does not create fake lines.")
         lock_rows = load_json(MAIN_LINE_LOCK_FILE, {})
         if lock_rows:
             lock_df = pd.DataFrame(list(lock_rows.values()))
@@ -3541,4 +3656,4 @@ try:
         else:
             st.info("No board rows available yet. Refresh the app first.")
 except Exception as e:
-    st.warning(f"v10.8.2 line debug unavailable: {e}")
+    st.warning(f"v10.8.2.1 line debug unavailable: {e}")
