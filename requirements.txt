@@ -5,3 +5,5 @@ pandas
 pytz
 xgboost
 scikit-learn
+matplotlib
+scipy
