@@ -19,7 +19,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v10.8.1 RAW DEBUG + HIT RATE DASHBOARD"
+APP_VERSION = "v10.8.2 MERGED TRUE EDGE + RAW DEBUG + HIT RATE"
 
 try:
     import pytz
@@ -121,6 +121,15 @@ XGB_MIN_GRADED_SAMPLES = 100
 XGB_MAX_RESIDUAL_ADJ_KS = 0.35
 XGB_MAX_PERCENT_ADJ = 0.05
 XGB_RECENT_TRAIN_LIMIT = 700
+
+# =========================
+# v10.8.2 MERGED FROM TRUE 10.0 EDGE ENGINE
+# Conservative market-move signal only. This does NOT choose or rewrite lines.
+# It only gives the model a tiny projection nudge after the real active line is found.
+# =========================
+MARKET_MOVE_FACTOR_MIN = 0.985
+MARKET_MOVE_FACTOR_MAX = 1.015
+MARKET_MOVE_K_SHIFT_CAP = 0.25
 
 
 LEAGUE_AVG_WHIFF_BY_PITCH_TYPE = {
@@ -1526,16 +1535,45 @@ def park_k_factor(venue_name):
         "oracle park": 1.010,
         "petco park": 1.010,
         "t mobile park": 1.010,
+        "citi field": 1.010,
+        "pnc park": 1.008,
         "coors field": 0.965,
         "great american ball park": 0.985,
         "fenway park": 0.990,
         "citizens bank park": 0.990,
+        "yankee stadium": 0.990,
         "globe life field": 1.005,
     }
     for name, factor in park_map.items():
         if name in v:
             return factor
     return 1.00
+
+def market_movement_k_factor(open_to_current_delta, active_line=None, enabled=True):
+    """Tiny market movement signal merged from file #2.
+
+    Important: this never selects, overwrites, or locks a prop line. The first file's
+    Underdog/player matching remains the source of truth. Positive line movement
+    gives a small K boost; negative movement gives a small haircut.
+    """
+    if not enabled:
+        return 1.0, "Market movement adjustment off"
+    delta = safe_float(open_to_current_delta)
+    if delta is None:
+        return 1.0, "No market movement history yet; neutral"
+    # Keep this conservative because line movement can reflect price, availability, or alternate ladders.
+    if delta >= 0.5:
+        factor = 1.010
+    elif delta <= -0.5:
+        factor = 0.990
+    elif delta > 0:
+        factor = 1.004
+    elif delta < 0:
+        factor = 0.996
+    else:
+        factor = 1.0
+    factor = float(clamp(factor, MARKET_MOVE_FACTOR_MIN, MARKET_MOVE_FACTOR_MAX))
+    return factor, f"Conservative market movement x{factor:.3f} from open-to-current line delta {delta:+.2f}"
 
 # MLB venue coordinates for live weather. Indoor/retractable parks default neutral.
 VENUE_WEATHER_META = {
@@ -2906,6 +2944,19 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     line_delta = update_clv_snapshot(pitcher_name, active_source, active_line) if active_line is not None else None
     true_line_delta = track_line_delta(pitcher_name, active_source, active_line) if active_line is not None else None
 
+    # v10.8.2 merged upgrade: tiny market-move projection signal from file #2.
+    # This is deliberately applied AFTER line selection so it cannot disturb Underdog matching.
+    market_move_factor, market_move_note = market_movement_k_factor(line_delta, active_line=active_line, enabled=True)
+    if active_line is not None and market_move_factor != 1.0:
+        market_shift = float(clamp((market_move_factor - 1.0) * mean, -MARKET_MOVE_K_SHIFT_CAP, MARKET_MOVE_K_SHIFT_CAP))
+        sims = np.clip(sims + market_shift, 0, None)
+        mean = float(np.mean(sims))
+        median = float(np.median(sims))
+        p10 = float(np.percentile(sims, 10))
+        p90 = float(np.percentile(sims, 90))
+    else:
+        market_shift = 0.0
+
     metrics = calculate_pick_metrics(sims, active_line)
 
     score = data_lock_score(
@@ -3074,6 +3125,9 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "underdog_message": ud_data.get("message"),
         "line_delta": line_delta,
         "true_line_delta": true_line_delta,
+        "market_move_factor": round(safe_float(market_move_factor, 1.0), 3),
+        "market_move_shift": round(safe_float(market_shift, 0.0), 3),
+        "market_move_note": market_move_note,
         "consensus_count": consensus.get("count"),
         "consensus_quality": consensus.get("quality"),
         "consensus_spread": consensus.get("spread"),
