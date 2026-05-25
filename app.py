@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# MLB STRIKEOUT PROP ENGINE — ONE FILE — v11.9
+# MLB PROP PROP ENGINE — ONE FILE — v11.9
 # MERGED: TRUE CALIBRATION + MANAGER HOOK + DENSITY ALTITUDE
 # Refresh first, then save official before-game snapshot
 # Real lines only. No fake prop lines.
@@ -599,6 +599,46 @@ def render_prop_card_board(df, title="Official Board", max_cards=12, prop_label=
             st.caption(f"Card UI skipped safely: {e}")
         except Exception:
             pass
+
+
+# =========================
+# TERMINAL UI ONLY HEADER FIX
+# Hide legacy red v11 hero/header blocks so the new terminal UI is the active visual layer.
+# Engine/projections/Underdog/OF2/grading are untouched.
+# =========================
+TERMINAL_UI_ONLY_HIDE_OLD_CSS = """
+<style>
+/* Hide old oversized hero containers from prior v11 layout */
+.hero-panel,
+.big-title,
+.sub-title {
+    display: none !important;
+}
+
+/* If old header used generic red panels, keep functional buttons/metrics visible */
+div:has(> .big-title),
+div:has(> .sub-title) {
+    display: none !important;
+}
+
+/* Make refresh/save buttons remain normal */
+.stButton button {
+    border-radius: 14px !important;
+    font-weight: 850 !important;
+}
+
+/* New UI spacing */
+.terminal-hero {
+    margin-top: 0 !important;
+}
+</style>
+"""
+
+def hide_legacy_header_ui_only():
+    try:
+        st.markdown(TERMINAL_UI_ONLY_HIDE_OLD_CSS, unsafe_allow_html=True)
+    except Exception:
+        pass
 
 # =========================
 # STORAGE
@@ -5844,8 +5884,8 @@ def render_pick_card(p):
 # =========================
 st.markdown("""
 <div class="hero-panel">
-  <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v11.17 SAFETY GATES + PASS DIRECTION</div>
-  <div class="sub-title">Strict Win Filter + MLB-only Underdog line lock → Refresh → Save → Grade</div>
+  <div class="big-title">MLB PROP TERMINAL PROP PROP ENGINE v11.18 TERMINAL GATES + PASS DIRECTION</div>
+  <div class="sub-title">Live Underdog Props → Refresh → Save → Grade → Track</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -6602,7 +6642,7 @@ def kproj_pitcher_archetype_profile(p, projected_ks=None, expected_bf=None):
     if stability >= 74:
         archetype = "TRUE_K_CREATOR"
     elif stability >= 62:
-        archetype = "STABLE_STRIKEOUT_ARM"
+        archetype = "STABLE_PROP_ARM"
     elif stability >= 45:
         archetype = "MATCHUP_ASSISTED"
     else:
