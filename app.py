@@ -198,6 +198,408 @@ def render_safe_ui_hero():
     except Exception:
         pass
 
+
+# =========================
+# FULL TERMINAL UI UPGRADE v2
+# Safe visual layer only: does not change projections, Underdog parsing, OF2, grading, or learning.
+# =========================
+FULL_TERMINAL_UI_CSS = """
+<style>
+:root {
+  --bg-a:#050814;
+  --bg-b:#0b1324;
+  --panel:#0f172a;
+  --panel-2:#111c33;
+  --border:rgba(148,163,184,.18);
+  --muted:#94a3b8;
+  --text:#f8fafc;
+  --green:#22c55e;
+  --green2:#86efac;
+  --yellow:#facc15;
+  --orange:#fb923c;
+  --red:#ef4444;
+  --blue:#60a5fa;
+  --purple:#a78bfa;
+}
+.stApp {
+  background:
+    radial-gradient(circle at 10% 0%, rgba(37,99,235,.27), transparent 30%),
+    radial-gradient(circle at 92% 5%, rgba(34,197,94,.13), transparent 26%),
+    linear-gradient(180deg, var(--bg-a), var(--bg-b) 54%, #030712);
+  color:var(--text);
+}
+.block-container {
+  padding-top: 1rem;
+  max-width: 1640px;
+}
+h1,h2,h3 { color:var(--text); letter-spacing:-.03em; }
+[data-testid="stMetric"] {
+  background:linear-gradient(145deg, rgba(15,23,42,.98), rgba(17,24,39,.94));
+  border:1px solid var(--border);
+  border-radius:18px;
+  padding:14px;
+  box-shadow:0 12px 34px rgba(0,0,0,.28);
+}
+div[data-testid="stDataFrame"] {
+  border-radius:18px;
+  overflow:hidden;
+  border:1px solid var(--border);
+  box-shadow:0 12px 30px rgba(0,0,0,.24);
+}
+.stTabs [data-baseweb="tab-list"] {
+  gap:8px;
+  background:rgba(15,23,42,.52);
+  border:1px solid var(--border);
+  border-radius:18px;
+  padding:8px;
+  overflow-x:auto;
+}
+.stTabs [data-baseweb="tab"] {
+  height:44px;
+  border-radius:14px;
+  padding:9px 14px;
+  color:#cbd5e1;
+  font-weight:850;
+  white-space:nowrap;
+}
+.stTabs [aria-selected="true"] {
+  background:linear-gradient(135deg,#1d4ed8,#2563eb) !important;
+  color:#fff !important;
+}
+.terminal-hero {
+  display:grid;
+  grid-template-columns: 1.3fr repeat(4, minmax(125px,.55fr));
+  gap:14px;
+  margin: 6px 0 18px 0;
+}
+.terminal-title-card,.terminal-metric {
+  background:linear-gradient(145deg, rgba(15,23,42,.98), rgba(8,16,30,.96));
+  border:1px solid var(--border);
+  border-radius:22px;
+  padding:18px;
+  box-shadow:0 15px 40px rgba(0,0,0,.32);
+}
+.terminal-title {
+  font-size:32px;
+  line-height:1.05;
+  font-weight:950;
+  color:#fff;
+}
+.terminal-sub {
+  color:var(--muted);
+  margin-top:6px;
+  font-size:13px;
+}
+.terminal-pill {
+  display:inline-block;
+  margin-top:10px;
+  padding:7px 11px;
+  border-radius:999px;
+  font-size:12px;
+  font-weight:900;
+  border:1px solid rgba(34,197,94,.25);
+  background:rgba(34,197,94,.12);
+  color:var(--green2);
+}
+.t-label {
+  color:var(--muted);
+  font-size:11px;
+  text-transform:uppercase;
+  letter-spacing:.09em;
+  font-weight:900;
+}
+.t-value {
+  color:#fff;
+  font-size:28px;
+  font-weight:950;
+  margin-top:7px;
+}
+.t-green { color:var(--green); }
+.t-yellow { color:var(--yellow); }
+.t-blue { color:var(--blue); }
+.t-red { color:var(--red); }
+.board-grid {
+  display:grid;
+  grid-template-columns: repeat(3, minmax(0,1fr));
+  gap:14px;
+  margin: 10px 0 16px 0;
+}
+.prop-card {
+  position:relative;
+  background:
+    linear-gradient(145deg, rgba(15,23,42,.98), rgba(12,22,40,.95));
+  border:1px solid rgba(148,163,184,.18);
+  border-radius:22px;
+  padding:16px;
+  box-shadow:0 16px 38px rgba(0,0,0,.30);
+  overflow:hidden;
+}
+.prop-card:before {
+  content:"";
+  position:absolute;
+  inset:0 0 auto 0;
+  height:4px;
+  background:linear-gradient(90deg,var(--blue),var(--green));
+  opacity:.95;
+}
+.prop-card.pass:before { background:linear-gradient(90deg,#64748b,#94a3b8); }
+.prop-card.warn:before { background:linear-gradient(90deg,var(--orange),var(--yellow)); }
+.prop-card.bad:before { background:linear-gradient(90deg,var(--red),var(--orange)); }
+.card-top {
+  display:flex;
+  justify-content:space-between;
+  align-items:flex-start;
+  gap:10px;
+  margin-top:4px;
+}
+.player-title {
+  font-size:19px;
+  font-weight:950;
+  color:#fff;
+  line-height:1.15;
+}
+.player-sub {
+  margin-top:4px;
+  font-size:12px;
+  color:var(--muted);
+}
+.badge-row { margin-top:10px; display:flex; flex-wrap:wrap; gap:6px; }
+.badge {
+  display:inline-flex;
+  align-items:center;
+  gap:5px;
+  padding:5px 9px;
+  border-radius:999px;
+  font-size:11px;
+  font-weight:900;
+  border:1px solid rgba(148,163,184,.20);
+  color:#cbd5e1;
+  background:rgba(15,23,42,.90);
+}
+.badge.good { color:#86efac; border-color:rgba(34,197,94,.28); background:rgba(34,197,94,.11); }
+.badge.warn { color:#fde68a; border-color:rgba(250,204,21,.30); background:rgba(250,204,21,.10); }
+.badge.bad { color:#fecaca; border-color:rgba(239,68,68,.32); background:rgba(239,68,68,.10); }
+.card-stats {
+  display:grid;
+  grid-template-columns: repeat(3,1fr);
+  gap:8px;
+  margin-top:14px;
+}
+.stat-box {
+  background:rgba(2,6,23,.50);
+  border:1px solid rgba(148,163,184,.13);
+  border-radius:14px;
+  padding:10px;
+}
+.stat-label {
+  font-size:10px;
+  color:var(--muted);
+  text-transform:uppercase;
+  font-weight:900;
+  letter-spacing:.07em;
+}
+.stat-value {
+  margin-top:4px;
+  font-size:18px;
+  font-weight:950;
+  color:#fff;
+}
+.edge-bar-wrap {
+  height:9px;
+  border-radius:999px;
+  background:rgba(148,163,184,.13);
+  overflow:hidden;
+  margin-top:12px;
+}
+.edge-bar {
+  height:100%;
+  border-radius:999px;
+  background:linear-gradient(90deg,var(--blue),var(--green));
+}
+.card-footer {
+  margin-top:10px;
+  color:#94a3b8;
+  font-size:11px;
+  display:flex;
+  justify-content:space-between;
+  gap:8px;
+}
+.section-head {
+  display:flex;
+  justify-content:space-between;
+  align-items:end;
+  gap:10px;
+  margin: 12px 0 8px 0;
+}
+.section-title-new {
+  font-size:24px;
+  font-weight:950;
+  color:#fff;
+}
+.section-note {
+  font-size:12px;
+  color:var(--muted);
+}
+@media (max-width: 1300px) {
+  .board-grid { grid-template-columns: repeat(2, minmax(0,1fr)); }
+  .terminal-hero { grid-template-columns: repeat(2, minmax(0,1fr)); }
+}
+@media (max-width: 760px) {
+  .board-grid { grid-template-columns: 1fr; }
+  .terminal-hero { grid-template-columns: 1fr; }
+}
+</style>
+"""
+
+def apply_full_terminal_ui():
+    try:
+        st.markdown(FULL_TERMINAL_UI_CSS, unsafe_allow_html=True)
+    except Exception:
+        pass
+
+def _fmt_ui(v, nd=2):
+    try:
+        if v is None or v == "":
+            return "—"
+        f = float(v)
+        if abs(f - round(f)) < 1e-9:
+            return str(int(round(f)))
+        return f"{f:.{nd}f}"
+    except Exception:
+        return str(v) if v not in [None, ""] else "—"
+
+def _first_existing(row, keys, default=None):
+    try:
+        for k in keys:
+            if k in row and row.get(k) not in [None, ""]:
+                return row.get(k)
+    except Exception:
+        pass
+    return default
+
+def render_terminal_hero():
+    try:
+        results = load_json(RESULT_LOG, [])
+        finished = [r for r in results if r.get("actual") is not None and (r.get("graded_result") in ["WIN","LOSS"] or r.get("win") is not None)]
+        wins = sum(1 for r in finished if r.get("graded_result") == "WIN" or r.get("win") is True)
+        losses = sum(1 for r in finished if r.get("graded_result") == "LOSS" or r.get("win") is False)
+        total = wins + losses
+        wr = round((wins / total) * 100, 1) if total else 0
+    except Exception:
+        total, wins, losses, wr = 0, 0, 0, 0
+
+    st.markdown(f"""
+    <div class="terminal-hero">
+      <div class="terminal-title-card">
+        <div class="terminal-title">MLB PROP TERMINAL</div>
+        <div class="terminal-sub">K PROJ • OF2 Filter • All Props • Underdog Live Lines • Tracking</div>
+        <div class="terminal-pill">UI v2 Safe Mode — no projection changes</div>
+      </div>
+      <div class="terminal-metric">
+        <div class="t-label">Graded</div><div class="t-value">{total}</div>
+      </div>
+      <div class="terminal-metric">
+        <div class="t-label">Record</div><div class="t-value">{wins}-{losses}</div>
+      </div>
+      <div class="terminal-metric">
+        <div class="t-label">Win Rate</div><div class="t-value t-green">{wr}%</div>
+      </div>
+      <div class="terminal-metric">
+        <div class="t-label">Line Mode</div><div class="t-value t-blue">UD</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+def render_prop_card_board(df, title="Official Board", max_cards=12, prop_label="PROP"):
+    try:
+        if df is None or len(df) == 0:
+            return
+        dfx = df.copy()
+        # prefer official/lean rows first
+        if "Tier" in dfx.columns:
+            order = {"A":0,"B":1,"C":2,"PASS":3,"NO LINE":4}
+            dfx["_tier_sort"] = dfx["Tier"].map(order).fillna(6)
+            dfx = dfx.sort_values(["_tier_sort"], ascending=True)
+        elif "Confidence %" in dfx.columns:
+            dfx = dfx.sort_values("Confidence %", ascending=False)
+        dfx = dfx.head(max_cards)
+
+        st.markdown(f"""
+        <div class="section-head">
+          <div>
+            <div class="section-title-new">{title}</div>
+            <div class="section-note">Card view shows strongest visible rows first. Full table remains below.</div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        html = ['<div class="board-grid">']
+        for _, row in dfx.iterrows():
+            player = _first_existing(row, ["Pitcher","Batter","Player","pitcher","batter","player"], "Unknown")
+            matchup = _first_existing(row, ["Matchup","matchup","Team","team"], "")
+            proj = _first_existing(row, ["K PROJ","Projection","projection","Proj"], None)
+            line = _first_existing(row, ["Line","UD/Line","line","active_line"], None)
+            pick = _first_existing(row, ["Pick","Decision","decision","bet_action","Main Engine Action"], "—")
+            conf = _first_existing(row, ["Confidence %","Hit Rate %","fair_probability"], None)
+            tier = _first_existing(row, ["Tier","tier","action_tier"], "")
+            edge = _first_existing(row, ["Edge Gap","edge_ks","Lean Gap","Model Gap"], None)
+            source = _first_existing(row, ["Line Source","line_source","Source"], "Underdog")
+
+            pick_s = str(pick)
+            tier_s = str(tier)
+            card_class = ""
+            if "PASS" in pick_s.upper() or tier_s.upper() == "PASS" or "NO LINE" in pick_s.upper():
+                card_class = "pass"
+            elif "LEAN" in pick_s.upper() or tier_s.upper() == "C":
+                card_class = "warn"
+            elif "UNDER" in pick_s.upper() and safe_float(edge, 0) is not None:
+                card_class = ""
+            elif "LOSS" in pick_s.upper():
+                card_class = "bad"
+
+            try:
+                edge_float = abs(float(edge)) if edge not in [None, ""] else 0
+            except Exception:
+                edge_float = 0
+            bar_width = max(6, min(100, edge_float / 2.5 * 100))
+
+            badge_class = "good"
+            if "PASS" in pick_s.upper() or "NO LINE" in pick_s.upper():
+                badge_class = ""
+            elif "LEAN" in pick_s.upper():
+                badge_class = "warn"
+
+            html.append(f"""
+            <div class="prop-card {card_class}">
+              <div class="card-top">
+                <div>
+                  <div class="player-title">{player}</div>
+                  <div class="player-sub">{matchup}</div>
+                </div>
+                <span class="badge {badge_class}">{pick_s}</span>
+              </div>
+              <div class="badge-row">
+                <span class="badge good">{prop_label}</span>
+                <span class="badge">Tier {tier_s or "—"}</span>
+                <span class="badge">{source}</span>
+              </div>
+              <div class="card-stats">
+                <div class="stat-box"><div class="stat-label">Projection</div><div class="stat-value">{_fmt_ui(proj)}</div></div>
+                <div class="stat-box"><div class="stat-label">Line</div><div class="stat-value">{_fmt_ui(line)}</div></div>
+                <div class="stat-box"><div class="stat-label">Conf</div><div class="stat-value">{_fmt_ui(conf,1)}%</div></div>
+              </div>
+              <div class="edge-bar-wrap"><div class="edge-bar" style="width:{bar_width:.0f}%"></div></div>
+              <div class="card-footer"><span>Edge: {_fmt_ui(edge)}</span><span>Live board</span></div>
+            </div>
+            """)
+        html.append("</div>")
+        st.markdown("".join(html), unsafe_allow_html=True)
+    except Exception as e:
+        try:
+            st.caption(f"Card UI skipped safely: {e}")
+        except Exception:
+            pass
+
 # =========================
 # STORAGE
 # =========================
@@ -8117,6 +8519,7 @@ def render_batter_rbi_tab(board, dates):
     c2.metric("Underdog Lines", int((df["Line Source"] == "Underdog").sum()) if "Line Source" in df.columns else 0)
     c3.metric("Over/Lean", int(df["Decision"].astype(str).str.contains("OVER", regex=False).sum()))
     c4.metric("A/B Tier", int(df["Tier"].isin(["A", "B"]).sum()))
+    render_prop_card_board(df, title="Batter RBI Board", max_cards=12, prop_label="RBI")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 def render_batter_fantasy_tab(board, dates):
@@ -8136,6 +8539,7 @@ def render_batter_fantasy_tab(board, dates):
     c2.metric("Underdog Lines", int((df["Line Source"] == "Underdog").sum()) if "Line Source" in df.columns else 0)
     c3.metric("Over/Lean", int(df["Decision"].astype(str).str.contains("OVER", regex=False).sum()))
     c4.metric("A/B Tier", int(df["Tier"].isin(["A", "B"]).sum()))
+    render_prop_card_board(df, title="Batter Fantasy Board", max_cards=12, prop_label="BAT FS")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 
@@ -8465,6 +8869,7 @@ def render_pitcher_prop_tab(board, kind="outs"):
     c2.metric("Underdog Lines", int((df["Line Source"] == "Underdog").sum()) if "Line Source" in df.columns else 0)
     c3.metric("Over/Lean", int(df["Decision"].astype(str).str.contains("OVER", regex=False).sum()))
     c4.metric("A/B Tier", int(df["Tier"].isin(["A", "B"]).sum()))
+    render_prop_card_board(df, title=f"{labels.get(kind, kind)} Board", max_cards=12, prop_label=labels.get(kind, kind))
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 
