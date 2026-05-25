@@ -7595,58 +7595,229 @@ def extract_batter_candidate_name(obj):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_underdog_batter_prop_candidates(kind="rbi"):
-    """Collect live Underdog batter RBI/Fantasy candidates.
 
-    This is intentionally separate from the pitcher-K parser. It does not create fake lines:
-    only rows with an actual Underdog line field/text are returned. Matching to a batter is
-    done later by name_score against the candidate object blob.
-    """
+# =========================
+# BATTER LINE FIX v2 — stronger Underdog name/line extraction
+# =========================
+def clean_batter_market_name_from_text(text, kind="rbi"):
+    s = str(text or "").strip()
+    if not s:
+        return ""
+    # Remove common prop words while keeping the player name.
+    remove_terms = [
+        "higher", "lower", "over", "under", "vs", "mlb", "baseball",
+        "fantasy points", "fantasy score", "batter fantasy", "hitter fantasy",
+        "player fantasy", "runs batted in", "run batted in", "batter rbi",
+        "player rbi", "rbis", "rbi", "proj", "projection"
+    ]
+    cleaned = s
+    for term in remove_terms:
+        cleaned = re.sub(rf"\b{re.escape(term)}\b", " ", cleaned, flags=re.I)
+    cleaned = re.sub(r"[\|\-_/•:]+", " ", cleaned)
+    cleaned = re.sub(r"\b\d+(\.\d+)?\b", " ", cleaned)
+    cleaned = " ".join(cleaned.split()).strip()
+    # Keep likely human names only.
+    parts = cleaned.split()
+    if len(parts) >= 2 and len(cleaned) <= 60:
+        return cleaned
+    return ""
+
+def extract_batter_candidate_name_strong(obj, kind="rbi"):
+    # Original direct/nested extraction first.
+    nm = extract_batter_candidate_name(obj)
+    if nm:
+        return nm
+
+    if not isinstance(obj, dict):
+        return ""
+
+    # Look at title/description fields that often include "Player Name RBIs".
+    name_fields = [
+        "title", "name", "display_name", "displayName", "description",
+        "over_under_title", "over_under", "market_name", "marketName",
+        "label", "text"
+    ]
+    for k in name_fields:
+        v = obj.get(k)
+        if isinstance(v, str):
+            cleaned = clean_batter_market_name_from_text(v, kind=kind)
+            if cleaned:
+                return cleaned
+
+    # Last resort: scan JSON blob for quoted strings containing market terms.
+    blob = json.dumps(obj, ensure_ascii=False)
+    for m in re.finditer(r'"([^"]{6,90})"', blob):
+        t = m.group(1)
+        if batter_market_matches_text(t, kind):
+            cleaned = clean_batter_market_name_from_text(t, kind=kind)
+            if cleaned:
+                return cleaned
+    return ""
+
+def extract_batter_prop_line_from_obj_strong(obj, kind="rbi"):
+    line, note = extract_batter_prop_line_from_obj(obj)
+    if line is not None:
+        return line, note
+
+    if not isinstance(obj, dict):
+        return None, ""
+
+    blob = json.dumps(obj, ensure_ascii=False)
+
+    # Search near market labels for the closest decimal line.
+    terms = batter_market_terms(kind)
+    low = blob.lower()
+    for term in terms:
+        pos = low.find(term.lower())
+        if pos >= 0:
+            window = blob[max(0, pos-250):pos+350]
+            nums = []
+            for m in re.finditer(r"(?<!\d)(\d{1,2}(?:\.\d)?)(?!\d)", window):
+                v = safe_float(m.group(1))
+                if v is None:
+                    continue
+                if kind == "rbi" and 0.5 <= v <= 3.5:
+                    nums.append(v)
+                elif kind == "fantasy" and 1.5 <= v <= 40.5:
+                    nums.append(v)
+            if nums:
+                # Prefer half-lines if present.
+                halfs = [x for x in nums if abs(x % 1 - 0.5) < 0.001]
+                return float(halfs[0] if halfs else nums[0]), f"line near {term}"
+
+    return None, "no strong valid line"
+
+def build_underdog_link_maps(data):
+    """Build ID maps from Underdog payload so line objects can be linked to players/markets."""
+    flat = flatten_json(data)
+    by_id = {}
+    player_names = {}
+    for obj in flat:
+        if not isinstance(obj, dict):
+            continue
+        oid = str(obj.get("id") or obj.get("uuid") or obj.get("_id") or "")
+        if oid:
+            by_id[oid] = obj
+        nm = extract_batter_candidate_name_strong(obj, kind="rbi") or extract_batter_candidate_name_strong(obj, kind="fantasy")
+        blob = json.dumps(obj, ensure_ascii=False).lower()
+        if nm and any(x in blob for x in ["player", "appearance", "athlete", "participant"]):
+            if oid:
+                player_names[oid] = nm
+    return flat, by_id, player_names
+
+def linked_text_for_obj(obj, by_id, depth=0):
+    if depth > 2 or not isinstance(obj, dict):
+        return ""
+    pieces = [json.dumps(obj, ensure_ascii=False)]
+    # Follow obvious id fields/relationships.
+    for k, v in obj.items():
+        if isinstance(v, (str, int)):
+            sid = str(v)
+            if sid in by_id and by_id[sid] is not obj:
+                pieces.append(json.dumps(by_id[sid], ensure_ascii=False))
+        elif isinstance(v, dict):
+            pieces.append(linked_text_for_obj(v, by_id, depth+1))
+        elif isinstance(v, list):
+            for x in v[:6]:
+                if isinstance(x, (str, int)) and str(x) in by_id:
+                    pieces.append(json.dumps(by_id[str(x)], ensure_ascii=False))
+                elif isinstance(x, dict):
+                    pieces.append(linked_text_for_obj(x, by_id, depth+1))
+    return " ".join(pieces)
+
+def linked_name_for_obj(obj, by_id, kind="rbi"):
+    nm = extract_batter_candidate_name_strong(obj, kind=kind)
+    if nm:
+        return nm
+    text = linked_text_for_obj(obj, by_id)
+    # Search linked text for a title-like string.
+    for m in re.finditer(r'"([^"]{6,90})"', text):
+        t = m.group(1)
+        if batter_market_matches_text(t, kind):
+            cleaned = clean_batter_market_name_from_text(t, kind=kind)
+            if cleaned:
+                return cleaned
+    # Search linked player-looking dicts.
+    for m in re.finditer(r'"(?:full_name|fullName|display_name|displayName|player_name|playerName)"\s*:\s*"([^"]{4,60})"', text):
+        val = m.group(1)
+        if not batter_market_matches_text(val, kind):
+            return val
+    return ""
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_underdog_batter_prop_candidates(kind="rbi"):
+    """Collect live Underdog batter RBI/Fantasy candidates with stronger linked parsing."""
     candidates = []
     seen = set()
     for url in UNDERDOG_URLS:
         data = safe_get_json(url, timeout=16)
         if not data:
             continue
-        flat = flatten_json(data)
+
+        flat, by_id, player_names = build_underdog_link_maps(data)
+
         for obj in flat:
             if not isinstance(obj, dict):
                 continue
-            blob = json.dumps(obj, ensure_ascii=False)
-            low = blob.lower()
+
+            linked_blob = linked_text_for_obj(obj, by_id)
+            low = linked_blob.lower()
+
             if not batter_market_matches_text(low, kind):
                 continue
-            line, line_note = extract_batter_prop_line_from_obj(obj)
+
+            line, line_note = extract_batter_prop_line_from_obj_strong(obj, kind=kind)
+            if line is None:
+                # Try linked object text as a pseudo object through text scanning.
+                line, line_note = extract_batter_prop_line_from_obj_strong({"linked_text": linked_blob}, kind=kind)
+
             if line is None:
                 continue
-            # Fantasy lines may be larger; RBI lines should usually be small.
+
             if kind == "rbi" and not (0.5 <= line <= 3.5):
                 continue
             if kind == "fantasy" and not (1.5 <= line <= 40.5):
                 continue
-            nm = extract_batter_candidate_name(obj)
-            # Find a compact market label.
+
+            nm = linked_name_for_obj(obj, by_id, kind=kind)
+
+            # If still blank, try any player name ID linked in the object.
+            if not nm:
+                raw = json.dumps(obj, ensure_ascii=False)
+                for pid, pname in player_names.items():
+                    if pid and pid in raw:
+                        nm = pname
+                        break
+
+            # Do not discard if name is blank; show raw market so user sees UD lines exist.
+            display_nm = nm or "UNKNOWN BATTER — CHECK UD MATCH"
+
             market = ""
             for k in BATTER_PROP_MARKET_KEYS:
                 v = obj.get(k)
                 if isinstance(v, str) and batter_market_matches_text(v, kind):
                     market = v
                     break
-            key = (url, nm, round(float(line), 2), market, str(obj.get("id") or obj.get("uuid") or "")[:50])
+            if not market:
+                market = "Batter Fantasy Score" if kind == "fantasy" else "Batter RBIs"
+
+            key = (url, display_nm, round(float(line), 2), market, str(obj.get("id") or obj.get("uuid") or "")[:50])
             if key in seen:
                 continue
             seen.add(key)
+
             candidates.append({
                 "Source": "Underdog",
                 "Provider": "Underdog",
                 "Kind": kind,
-                "Player Candidate": nm,
+                "Player Candidate": display_nm,
                 "Line": float(line),
-                "Market": market or ("Batter Fantasy Score" if kind == "fantasy" else "Batter RBIs"),
+                "Market": market,
                 "Line Evidence": line_note,
-                "Blob": blob[:6000],
+                "Blob": linked_blob[:8000],
                 "URL": url,
             })
+
     log_source_request(f"Underdog Batter {kind}", "OK" if candidates else "NO_MATCH", f"{len(candidates)} candidates")
     return candidates
 
@@ -7928,10 +8099,15 @@ def build_batter_prop_table_ud_only(board, dates, kind="rbi", use_underdog=True)
 
 def render_batter_rbi_tab(board, dates):
     st.markdown("### Batter RBIs / Run Production Model")
-    st.caption("Live Underdog RBI lines only. If UD has no line, the tab will still show projected hitters as NO LINE.")
+    st.caption("Live Underdog RBI lines only. This version uses stronger UD market/name parsing.")
     df = build_batter_prop_table_ud_only(board, dates, kind="rbi", use_underdog=True)
+    candidates = fetch_underdog_batter_prop_candidates("rbi")
+    with st.expander("Underdog RBI parser debug"):
+        st.write(f"RBI candidates found: {len(candidates)}")
+        if candidates:
+            st.dataframe(pd.DataFrame(candidates)[["Player Candidate","Line","Market","Line Evidence"]].head(50), use_container_width=True, hide_index=True)
     if df.empty:
-        st.info("No batter rows available yet. Refresh the board or wait for MLB/Underdog data.")
+        st.info("No Underdog RBI lines found in the current payload yet.")
         return
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Batter Rows", len(df))
@@ -7942,10 +8118,15 @@ def render_batter_rbi_tab(board, dates):
 
 def render_batter_fantasy_tab(board, dates):
     st.markdown("### Batter Fantasy Score Model")
-    st.caption("Live Underdog fantasy score lines only. Projection includes hits/total bases, RBIs, runs, walks/HBP, and steals.")
+    st.caption("Live Underdog fantasy score lines only. This version uses stronger UD market/name parsing.")
     df = build_batter_prop_table_ud_only(board, dates, kind="fantasy", use_underdog=True)
+    candidates = fetch_underdog_batter_prop_candidates("fantasy")
+    with st.expander("Underdog Batter Fantasy parser debug"):
+        st.write(f"Fantasy candidates found: {len(candidates)}")
+        if candidates:
+            st.dataframe(pd.DataFrame(candidates)[["Player Candidate","Line","Market","Line Evidence"]].head(50), use_container_width=True, hide_index=True)
     if df.empty:
-        st.info("No batter fantasy rows available yet. Refresh the board or wait for MLB/Underdog data.")
+        st.info("No Underdog batter fantasy lines found in the current payload yet.")
         return
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Batter Rows", len(df))
