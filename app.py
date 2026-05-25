@@ -20,7 +20,10 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.18 K PROJ UPSIDE TAB + REALISM + ARCHETYPE + OFFICIAL PLAY FILTER 2.0"
+APP_VERSION = "v11.18 K PROJ UPSIDE TAB + REALISM + ARCHETYPE + OFFICIAL PLAY FILTER 2.0 — UD ONLY"
+
+# Manual line entry disabled for speed/consistency. Live Underdog lines remain primary.
+MANUAL_LINES_ENABLED = False
 
 try:
     import pytz
@@ -7762,14 +7765,173 @@ def build_batter_prop_table(board, dates, kind="rbi", default_line=0.5, use_unde
         df = df.sort_values(sort_cols, ascending=[True, False, False])
     return df
 
+
+# =========================
+# UD-ONLY BATTER DISPLAY FIX v1
+# Faster loading: show Underdog batter markets first, then enrich with MLB projection data when available.
+# This avoids empty batter tabs when expected lineup/roster fallback is slow or unavailable.
+# =========================
+def _safe_batter_base_lookup(board, dates):
+    lookup = {}
+    try:
+        base = build_expected_batter_board(board, dates)
+        for r in base or []:
+            nm = normalize_name(r.get("batter"))
+            if nm and nm not in lookup:
+                lookup[nm] = r
+    except Exception as e:
+        try:
+            st.warning(f"Batter lineup fallback unavailable; showing Underdog batter board only. ({e})")
+        except Exception:
+            pass
+    return lookup
+
+def _projection_from_ud_batter_candidate(c, kind="rbi", base_row=None):
+    # If we have MLB base row, use the normal projection model.
+    if base_row:
+        if kind == "rbi":
+            return project_batter_rbi(base_row)
+        return project_batter_fantasy_score(base_row)
+
+    # UD-only fallback projection: intentionally conservative and transparent.
+    # This lets the tab load and show lines even when MLB hitter profile is missing.
+    line = safe_float(c.get("Line"), None)
+    if line is None:
+        if kind == "rbi":
+            return 0.35, "UD-only fallback"
+        return 7.0, "UD-only fallback"
+
+    if kind == "rbi":
+        # RBI props are usually 0.5; center projection near line but not forced.
+        return round(float(clamp(line * 0.92, 0.10, 1.10)), 2), "UD-only line-based fallback"
+
+    # Fantasy score line fallback.
+    return round(float(clamp(line * 0.96, 2.0, 20.0)), 2), "UD-only line-based fallback"
+
+def build_batter_prop_table_ud_only(board, dates, kind="rbi", use_underdog=True):
+    base_lookup = _safe_batter_base_lookup(board, dates)
+    rows = []
+
+    candidates = []
+    if use_underdog:
+        try:
+            candidates = fetch_underdog_batter_prop_candidates(kind) or []
+        except Exception as e:
+            candidates = []
+            try:
+                st.warning(f"Could not load Underdog batter {kind} lines: {e}")
+            except Exception:
+                pass
+
+    seen = set()
+
+    # Primary: real Underdog batter lines.
+    for c in candidates:
+        player = c.get("Player Candidate") or c.get("Matched Name") or c.get("Player") or ""
+        if not player:
+            # Try to recover a name from blob text if parser didn't isolate it.
+            blob = str(c.get("Blob") or "")
+            player = str(c.get("Title") or c.get("Name") or "").strip()
+        if not player:
+            continue
+
+        norm = normalize_name(player)
+        key = (norm, kind, safe_float(c.get("Line"), None))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        base_row = base_lookup.get(norm)
+        proj, src = _projection_from_ud_batter_candidate(c, kind=kind, base_row=base_row)
+        live_line = safe_float(c.get("Line"), None)
+        floor, median, ceiling, vol = batter_distribution(proj, kind)
+        decision, side, gap, conf, tier = batter_decision(proj, live_line, kind)
+
+        rows.append({
+            "Batter": player,
+            "Team": (base_row or {}).get("team"),
+            "Matchup": (base_row or {}).get("matchup"),
+            "Order": (base_row or {}).get("order"),
+            "Lineup": (base_row or {}).get("lineup_status", "UD MARKET"),
+            "Projection": proj,
+            "Floor": floor,
+            "Median": median,
+            "Ceiling": ceiling,
+            "Volatility": vol,
+            "Line": live_line,
+            "Line Source": "Underdog",
+            "Decision": decision,
+            "Model Lean": side,
+            "Edge Gap": gap,
+            "Confidence %": conf,
+            "Tier": tier,
+            "PA": (base_row or {}).get("PA"),
+            "RBI": (base_row or {}).get("RBI"),
+            "Runs": (base_row or {}).get("R"),
+            "HR": (base_row or {}).get("HR"),
+            "OBP": (base_row or {}).get("OBP"),
+            "SLG": (base_row or {}).get("SLG"),
+            "Source": src,
+            "UD Matched Name": player,
+            "UD Market": c.get("Market"),
+            "UD Match Score": c.get("Match Score"),
+        })
+
+    # Secondary: show expected lineup players even if no UD line, so tab never looks broken.
+    if not rows:
+        for norm, r in list(base_lookup.items())[:80]:
+            if kind == "rbi":
+                proj, src = project_batter_rbi(r)
+            else:
+                proj, src = project_batter_fantasy_score(r)
+            floor, median, ceiling, vol = batter_distribution(proj, kind)
+            rows.append({
+                "Batter": r.get("batter"),
+                "Team": r.get("team"),
+                "Matchup": r.get("matchup"),
+                "Order": r.get("order"),
+                "Lineup": r.get("lineup_status"),
+                "Projection": proj,
+                "Floor": floor,
+                "Median": median,
+                "Ceiling": ceiling,
+                "Volatility": vol,
+                "Line": None,
+                "Line Source": "NO UD LINE",
+                "Decision": "NO LINE",
+                "Model Lean": "NO LINE",
+                "Edge Gap": None,
+                "Confidence %": None,
+                "Tier": "NO LINE",
+                "PA": r.get("PA"),
+                "RBI": r.get("RBI"),
+                "Runs": r.get("R"),
+                "HR": r.get("HR"),
+                "OBP": r.get("OBP"),
+                "SLG": r.get("SLG"),
+                "Source": src,
+                "UD Matched Name": None,
+                "UD Market": None,
+                "UD Match Score": None,
+            })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        # Sort Underdog lines first, then official confidence.
+        tier_order = {"A": 0, "B": 1, "C": 2, "PASS": 3, "NO LINE": 4}
+        df["_tier_sort"] = df["Tier"].map(tier_order).fillna(9)
+        df["_ud_sort"] = (df["Line Source"] != "Underdog").astype(int)
+        df = df.sort_values(["_ud_sort", "_tier_sort", "Confidence %", "Projection"], ascending=[True, True, False, False])
+        df = df.drop(columns=["_tier_sort", "_ud_sort"], errors="ignore")
+    return df
+
+
 def render_batter_rbi_tab(board, dates):
     st.markdown("### Batter RBIs / Run Production Model")
-    st.caption("Auto-pulls live Underdog RBI lines when available. Manual default is only fallback for missing lines. Does not change K PROJ.")
-    use_ud = st.toggle("Use live Underdog RBI lines", value=True, key="batter_rbi_use_ud")
-    default_line = st.number_input("Fallback RBI line if no Underdog line", min_value=0.5, max_value=3.5, value=0.5, step=0.5, key="batter_rbi_line")
-    df = build_batter_prop_table(board, dates, kind="rbi", default_line=default_line, use_underdog=use_ud)
+    st.caption("Live Underdog RBI lines only. If UD has no line, the tab will still show projected hitters as NO LINE.")
+    df = build_batter_prop_table_ud_only(board, dates, kind="rbi", use_underdog=True)
     if df.empty:
-        st.info("Refresh the board first or select a date with MLB games.")
+        st.info("No batter rows available yet. Refresh the board or wait for MLB/Underdog data.")
         return
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Batter Rows", len(df))
@@ -7780,12 +7942,10 @@ def render_batter_rbi_tab(board, dates):
 
 def render_batter_fantasy_tab(board, dates):
     st.markdown("### Batter Fantasy Score Model")
-    st.caption("Auto-pulls live Underdog fantasy score lines when available. Manual default is only fallback. Projection includes hits/total bases, RBIs, runs, walks/HBP, and steals.")
-    use_ud = st.toggle("Use live Underdog Fantasy lines", value=True, key="batter_fs_use_ud")
-    default_line = st.number_input("Fallback fantasy score line if no Underdog line", min_value=2.5, max_value=25.5, value=7.5, step=0.5, key="batter_fs_line")
-    df = build_batter_prop_table(board, dates, kind="fantasy", default_line=default_line, use_underdog=use_ud)
+    st.caption("Live Underdog fantasy score lines only. Projection includes hits/total bases, RBIs, runs, walks/HBP, and steals.")
+    df = build_batter_prop_table_ud_only(board, dates, kind="fantasy", use_underdog=True)
     if df.empty:
-        st.info("Refresh the board first or select a date with MLB games.")
+        st.info("No batter fantasy rows available yet. Refresh the board or wait for MLB/Underdog data.")
         return
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Batter Rows", len(df))
@@ -8108,14 +8268,11 @@ def render_pitcher_prop_tab(board, kind="outs"):
     }
     st.markdown(f"### {labels.get(kind, kind)}")
     st.caption("Auto-pulls live Underdog lines when available. Manual default is only fallback. This does not change K PROJ.")
-    use_ud = st.toggle(f"Use live Underdog {labels.get(kind, kind)} lines", value=True, key=f"pitcher_{kind}_use_ud")
+    use_ud = True  # UD-only mode
     default = PITCHER_LINE_DEFAULTS.get(kind, 1.5)
     lo, hi = PITCHER_LINE_RANGES.get(kind, (0.5, 40.5))
-    default_line = st.number_input(
-        f"Fallback {labels.get(kind, kind)} line if no Underdog line",
-        min_value=float(lo), max_value=float(hi), value=float(default), step=0.5, key=f"pitcher_{kind}_line"
-    )
-    df = build_pitcher_prop_table(board, kind=kind, default_line=default_line, use_underdog=use_ud)
+    default_line = None  # manual fallback disabled; use live Underdog only
+    df = build_pitcher_prop_table(board, kind=kind, default_line=None, use_underdog=True)
     if df.empty:
         st.info("Refresh the board first or select a date with MLB games.")
         return
@@ -8126,7 +8283,91 @@ def render_pitcher_prop_tab(board, kind="outs"):
     c4.metric("A/B Tier", int(df["Tier"].isin(["A", "B"]).sum()))
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-tab_kproj, tab_outs, tab_er, tab_walks, tab_pitcher_fantasy, tab_rbi, tab_fantasy, tab_all, tab_props, tab_statcast, tab_learning, tab_settings = st.tabs([
+
+# =========================
+# TRACKING / RESULTS TAB
+# =========================
+def render_tracking_results_tab():
+    st.markdown("### ✅❌ Tracking / Results")
+    st.caption("Shows graded props from your saved result log. Green = cleared/win, red = missed/loss.")
+
+    rows = load_json(RESULT_LOG, [])
+    if not rows:
+        st.info("No graded results found yet. Grade after games to populate this tab.")
+        return
+
+    out = []
+    for r in rows[-500:]:
+        result = str(r.get("graded_result") or "").upper()
+        win_val = r.get("win")
+        if result == "WIN" or win_val is True:
+            status = "✅ WIN"
+            status_color = "green"
+        elif result == "LOSS" or win_val is False:
+            status = "❌ LOSS"
+            status_color = "red"
+        else:
+            status = "⏳ PENDING"
+            status_color = "gray"
+
+        player = (
+            r.get("pitcher") or r.get("player") or r.get("batter") or
+            r.get("player_name") or r.get("name") or "Unknown"
+        )
+        prop_type = (
+            r.get("prop_type") or r.get("market") or r.get("Market") or
+            r.get("prop") or "Pitcher Ks"
+        )
+        projection = r.get("projection") or r.get("Projection") or r.get("k_proj")
+        line = r.get("line") or r.get("Line") or r.get("active_line")
+        actual = r.get("actual") or r.get("Actual") or r.get("result_value")
+        side = r.get("pick_side") or r.get("side") or r.get("Model Lean") or r.get("pick")
+        date = r.get("date") or r.get("game_date") or r.get("saved_at") or r.get("graded_at") or r.get("time")
+        matchup = r.get("matchup") or r.get("Matchup") or ""
+
+        out.append({
+            "Status": status,
+            "Player": player,
+            "Prop": prop_type,
+            "Pick": side,
+            "Projection": projection,
+            "Line": line,
+            "Actual": actual,
+            "Matchup": matchup,
+            "Date/Time": date,
+        })
+
+    df = pd.DataFrame(out)
+    if df.empty:
+        st.info("No usable graded rows found.")
+        return
+
+    wins = int(df["Status"].astype(str).str.contains("WIN", regex=False).sum())
+    losses = int(df["Status"].astype(str).str.contains("LOSS", regex=False).sum())
+    total = wins + losses
+    wr = round((wins / total) * 100, 1) if total else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Graded", total)
+    c2.metric("Wins", wins)
+    c3.metric("Losses", losses)
+    c4.metric("Win Rate", f"{wr}%")
+
+    def color_status(val):
+        s = str(val)
+        if "WIN" in s:
+            return "background-color: rgba(34,197,94,.25); color: #22c55e; font-weight: 900;"
+        if "LOSS" in s:
+            return "background-color: rgba(239,68,68,.25); color: #ef4444; font-weight: 900;"
+        return "background-color: rgba(148,163,184,.18); color: #cbd5e1; font-weight: 800;"
+
+    try:
+        styled = df.style.map(color_status, subset=["Status"])
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+    except Exception:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+tab_kproj, tab_outs, tab_er, tab_walks, tab_pitcher_fantasy, tab_rbi, tab_fantasy, tab_tracking, tab_all, tab_props, tab_statcast, tab_learning, tab_settings = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHING OUTS",
     "EARNED RUNS",
@@ -8134,6 +8375,7 @@ tab_kproj, tab_outs, tab_er, tab_walks, tab_pitcher_fantasy, tab_rbi, tab_fantas
     "PITCHER FANTASY",
     "BATTER RBIs",
     "BATTER FANTASY SCORE",
+    "TRACKING / RESULTS",
     "ALL PLAYERS",
     "REAL PROP BOARD",
     "STATCAST",
@@ -8161,6 +8403,9 @@ with tab_rbi:
 
 with tab_fantasy:
     render_batter_fantasy_tab(board, dates)
+
+with tab_tracking:
+    render_tracking_results_tab()
 
 with tab_all:
     st.markdown("### All Players")
