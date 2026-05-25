@@ -10,6 +10,7 @@
 import os
 import json
 import math
+import html
 import difflib
 import io
 import unicodedata
@@ -511,63 +512,75 @@ def render_terminal_hero():
     """, unsafe_allow_html=True)
 
 def render_prop_card_board(df, title="Official Board", max_cards=12, prop_label="PROP"):
+    """Render compact prop cards safely.
+
+    Fixes:
+    - Uses prop-specific Projection first, not K PROJ.
+    - Produces non-indented HTML so Streamlit does not show raw HTML as a code block.
+    - Re-sanity-checks card direction from Projection vs Line for auxiliary prop tabs.
+    """
     try:
         if df is None or len(df) == 0:
             return
+
         dfx = df.copy()
-        # prefer official/lean rows first
         if "Tier" in dfx.columns:
-            order = {"A":0,"B":1,"C":2,"PASS":3,"NO LINE":4}
+            order = {"A": 0, "B": 1, "C": 2, "PASS": 3, "NO LINE": 4}
             dfx["_tier_sort"] = dfx["Tier"].map(order).fillna(6)
             dfx = dfx.sort_values(["_tier_sort"], ascending=True)
         elif "Confidence %" in dfx.columns:
             dfx = dfx.sort_values("Confidence %", ascending=False)
         dfx = dfx.head(max_cards)
 
-        st.markdown(f"""
-        <div class="section-head">
-          <div>
-            <div class="section-title-new">{title}</div>
-            <div class="section-note">Card view shows strongest visible rows first. Full table remains below.</div>
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
+        safe_title = html.escape(str(title))
+        st.markdown(
+            f'<div class="section-head"><div><div class="section-title-new">{safe_title}</div>'
+            f'<div class="section-note">Card view shows strongest visible rows first. Full table remains below.</div></div></div>',
+            unsafe_allow_html=True
+        )
 
-        html = ['<div class="board-grid">']
+        parts = ['<div class="board-grid">']
+
         for _, row in dfx.iterrows():
-            player = _first_existing(row, ["Pitcher","Batter","Player","pitcher","batter","player"], "Unknown")
-            matchup = _first_existing(row, ["Matchup","matchup","Team","team"], "")
-            proj = _first_existing(row, ["K PROJ","Projection","projection","Proj"], None)
-            line = _first_existing(row, ["Line","UD/Line","line","active_line"], None)
-            pick = _first_existing(row, ["Pick","Decision","decision","bet_action","Main Engine Action"], "—")
-            conf = _first_existing(row, ["Confidence %","Hit Rate %","fair_probability"], None)
-            tier = _first_existing(row, ["Tier","tier","action_tier"], "")
-            edge = _first_existing(row, ["Edge Gap","edge_ks","Lean Gap","Model Gap"], None)
+            player = _first_existing(row, ["Pitcher", "Batter", "Player", "pitcher", "batter", "player"], "Unknown")
+            matchup = _first_existing(row, ["Matchup", "matchup", "Team", "team"], "")
 
-            # Card-level sanity: prevent stale impossible OVER/UNDER labels.
+            # IMPORTANT: for non-K prop tabs, use prop Projection before K PROJ.
+            proj = _first_existing(row, ["Projection", "projection", "Proj", "K PROJ"], None)
+            line = _first_existing(row, ["Line", "UD/Line", "line", "active_line"], None)
+            pick = _first_existing(row, ["Pick", "Decision", "decision", "bet_action", "Main Engine Action"], "—")
+            conf = _first_existing(row, ["Confidence %", "Hit Rate %", "fair_probability"], None)
+            tier = _first_existing(row, ["Tier", "tier", "action_tier"], "")
+            edge = _first_existing(row, ["Edge Gap", "edge_ks", "Lean Gap", "Model Gap"], None)
+            source = _first_existing(row, ["Line Source", "line_source", "Source"], "Underdog")
+
+            prop_upper = str(prop_label).upper()
             proj_num = safe_float(proj, None)
             line_num = safe_float(line, None)
-            if proj_num is not None and line_num is not None and str(prop_label).upper() not in ["K PROJ", "STRIKEOUTS"]:
+
+            # Card-level direction sanity for auxiliary props.
+            if proj_num is not None and line_num is not None and not any(x in prop_upper for x in ["K PROJ", "STRIKEOUT"]):
                 side_fix = "OVER" if proj_num > line_num else "UNDER"
                 gap_fix = abs(proj_num - line_num)
-                if str(pick).startswith("✅"):
+                pick_text = str(pick)
+                if pick_text.startswith("✅"):
                     pick = f"✅ {side_fix}"
-                elif "LEAN" in str(pick).upper():
+                elif "LEAN" in pick_text.upper():
                     pick = f"⚠️ {side_fix} LEAN"
-                elif "PASS" in str(pick).upper():
+                elif "PASS" in pick_text.upper():
                     pick = f"🚫 PASS — {side_fix}"
+                elif "NO LINE" not in pick_text.upper():
+                    pick = f"✅ {side_fix}"
                 edge = round(gap_fix, 2)
-            source = _first_existing(row, ["Line Source","line_source","Source"], "Underdog")
 
             pick_s = str(pick)
             tier_s = str(tier)
+
             card_class = ""
             if "PASS" in pick_s.upper() or tier_s.upper() == "PASS" or "NO LINE" in pick_s.upper():
                 card_class = "pass"
             elif "LEAN" in pick_s.upper() or tier_s.upper() == "C":
                 card_class = "warn"
-            elif "UNDER" in pick_s.upper() and safe_float(edge, 0) is not None:
-                card_class = ""
             elif "LOSS" in pick_s.upper():
                 card_class = "bad"
 
@@ -583,36 +596,49 @@ def render_prop_card_board(df, title="Official Board", max_cards=12, prop_label=
             elif "LEAN" in pick_s.upper():
                 badge_class = "warn"
 
-            html.append(f"""
-            <div class="prop-card {card_class}">
-              <div class="card-top">
-                <div>
-                  <div class="player-title">{player}</div>
-                  <div class="player-sub">{matchup}</div>
-                </div>
-                <span class="badge {badge_class}">{pick_s}</span>
-              </div>
-              <div class="badge-row">
-                <span class="badge good">{prop_label}</span>
-                <span class="badge">Tier {tier_s or "—"}</span>
-                <span class="badge">{source}</span>
-              </div>
-              <div class="card-stats">
-                <div class="stat-box"><div class="stat-label">Projection</div><div class="stat-value">{_fmt_ui(proj)}</div></div>
-                <div class="stat-box"><div class="stat-label">Line</div><div class="stat-value">{_fmt_ui(line)}</div></div>
-                <div class="stat-box"><div class="stat-label">Conf</div><div class="stat-value">{_fmt_ui(conf,1)}%</div></div>
-              </div>
-              <div class="edge-bar-wrap"><div class="edge-bar" style="width:{bar_width:.0f}%"></div></div>
-              <div class="card-footer"><span>Edge: {_fmt_ui(edge)}</span><span>Live board</span></div>
-            </div>
-            """)
-        html.append("</div>")
-        st.markdown("".join(html), unsafe_allow_html=True)
+            player_h = html.escape(str(player))
+            matchup_h = html.escape(str(matchup))
+            pick_h = html.escape(str(pick_s))
+            prop_h = html.escape(str(prop_label))
+            tier_h = html.escape(str(tier_s or "—"))
+            source_h = html.escape(str(source))
+
+            parts.append(
+                f'<div class="prop-card {card_class}">'
+                f'<div class="card-top"><div>'
+                f'<div class="player-title">{player_h}</div>'
+                f'<div class="player-sub">{matchup_h}</div>'
+                f'</div><span class="badge {badge_class}">{pick_h}</span></div>'
+                f'<div class="badge-row">'
+                f'<span class="badge good">{prop_h}</span>'
+                f'<span class="badge">Tier {tier_h}</span>'
+                f'<span class="badge">{source_h}</span>'
+                f'</div>'
+                f'<div class="card-stats">'
+                f'<div class="stat-box"><div class="stat-label">Projection</div><div class="stat-value">{_fmt_ui(proj)}</div></div>'
+                f'<div class="stat-box"><div class="stat-label">Line</div><div class="stat-value">{_fmt_ui(line)}</div></div>'
+                f'<div class="stat-box"><div class="stat-label">Conf</div><div class="stat-value">{_fmt_ui(conf,1)}%</div></div>'
+                f'</div>'
+                f'<div class="edge-bar-wrap"><div class="edge-bar" style="width:{bar_width:.0f}%"></div></div>'
+                f'<div class="card-footer"><span>Edge: {_fmt_ui(edge)}</span><span>Live board</span></div>'
+                f'</div>'
+            )
+
+        parts.append("</div>")
+        html_out = "".join(parts)
+
+        # st.html exists in newer Streamlit; fallback to markdown.
+        try:
+            st.html(html_out)
+        except Exception:
+            st.markdown(html_out, unsafe_allow_html=True)
+
     except Exception as e:
         try:
             st.caption(f"Card UI skipped safely: {e}")
         except Exception:
             pass
+
 
 # =========================
 # STORAGE
