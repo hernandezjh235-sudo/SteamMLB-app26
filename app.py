@@ -20,156 +20,180 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-# =========================
-# UI TERMINAL UPGRADE v1
-# =========================
-GLOBAL_UI_CSS = '''
-<style>
-.main {
-    background: #0b1020;
-}
-.stApp {
-    background: linear-gradient(180deg,#0b1020 0%, #121a31 100%);
-    color: #f3f4f6;
-}
-.hero-row {
-    display:grid;
-    grid-template-columns: repeat(4,1fr);
-    gap:14px;
-    margin-bottom:16px;
-}
-.metric-card {
-    background: rgba(20,28,48,.95);
-    border:1px solid rgba(80,120,255,.22);
-    border-radius:18px;
-    padding:16px;
-    box-shadow:0 6px 18px rgba(0,0,0,.28);
-}
-.metric-label {
-    font-size:12px;
-    color:#9ca3af;
-    text-transform:uppercase;
-    letter-spacing:.08em;
-}
-.metric-value {
-    font-size:28px;
-    font-weight:700;
-    color:white;
-}
-.player-card {
-    background: rgba(17,24,39,.92);
-    border-radius:22px;
-    padding:16px;
-    margin-bottom:14px;
-    border:1px solid rgba(255,255,255,.08);
-}
-.edge-good {
-    color:#22c55e;
-    font-weight:700;
-}
-.edge-mid {
-    color:#facc15;
-    font-weight:700;
-}
-.edge-bad {
-    color:#ef4444;
-    font-weight:700;
-}
-.section-title {
-    font-size:24px;
-    font-weight:800;
-    margin-top:10px;
-    margin-bottom:10px;
-    color:#f8fafc;
-}
-div[data-baseweb="tab-list"] {
-    gap:10px;
-}
-button[data-baseweb="tab"] {
-    background:#111827 !important;
-    border-radius:14px !important;
-    border:1px solid rgba(255,255,255,.08) !important;
-    padding:10px 16px !important;
-}
-</style>
-'''
-
-def apply_global_ui():
-    try:
-        st.markdown(GLOBAL_UI_CSS, unsafe_allow_html=True)
-    except Exception:
-        pass
-
-def render_hero_metrics(total_plays=0, avg_edge=0, avg_conf=0, win_rate=0):
-    st.markdown(
-        f'''
-        <div class="hero-row">
-            <div class="metric-card">
-                <div class="metric-label">Official Plays</div>
-                <div class="metric-value">{total_plays}</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Average Edge</div>
-                <div class="metric-value">{avg_edge}</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Confidence</div>
-                <div class="metric-value">{avg_conf}%</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Win Rate</div>
-                <div class="metric-value">{win_rate}%</div>
-            </div>
-        </div>
-        ''',
-        unsafe_allow_html=True
-    )
-
-def render_player_card(player, proj, line, pick, edge):
-    edge_class = "edge-good" if edge >= 1 else "edge-mid" if edge >= 0.4 else "edge-bad"
-    st.markdown(
-        f'''
-        <div class="player-card">
-            <div style="display:flex;justify-content:space-between;align-items:center;">
-                <div>
-                    <div style="font-size:20px;font-weight:700;color:white;">{player}</div>
-                    <div style="color:#9ca3af;font-size:13px;">Projection Terminal</div>
-                </div>
-                <div class="{edge_class}" style="font-size:18px;">
-                    EDGE {edge}
-                </div>
-            </div>
-
-            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:14px;">
-                <div class="metric-card">
-                    <div class="metric-label">Projection</div>
-                    <div class="metric-value">{proj}</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">Line</div>
-                    <div class="metric-value">{line}</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">Pick</div>
-                    <div class="metric-value">{pick}</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">Status</div>
-                    <div class="metric-value">LIVE</div>
-                </div>
-            </div>
-        </div>
-        ''',
-        unsafe_allow_html=True
-    )
-
-
 APP_VERSION = "v11.18 K PROJ UPSIDE TAB + REALISM + ARCHETYPE + OFFICIAL PLAY FILTER 2.0"
 
 try:
     import pytz
 except Exception:
     pytz = None
+
+
+# =========================
+# SAFE UI UPGRADE v1.1
+# Non-destructive: CSS + optional top dashboard only.
+# Does NOT alter projection logic, Underdog parsing, OF2 filters, or tabs.
+# =========================
+SAFE_UI_UPGRADE_CSS = """
+<style>
+:root {
+    --bg0:#07111f;
+    --bg1:#0b1628;
+    --card:#101d33;
+    --card2:#0f213b;
+    --line:rgba(148,163,184,.18);
+    --text:#f8fafc;
+    --muted:#94a3b8;
+    --green:#22c55e;
+    --yellow:#facc15;
+    --red:#ef4444;
+    --blue:#3b82f6;
+}
+.stApp {
+    background:
+        radial-gradient(circle at 10% 0%, rgba(37,99,235,.24), transparent 32%),
+        radial-gradient(circle at 85% 8%, rgba(34,197,94,.11), transparent 28%),
+        linear-gradient(180deg,var(--bg0),var(--bg1) 58%,#050914);
+    color:var(--text);
+}
+.block-container {
+    padding-top: 1.1rem;
+    max-width: 1580px;
+}
+[data-testid="stMetric"] {
+    background: linear-gradient(145deg, rgba(15,29,51,.96), rgba(10,20,36,.96));
+    border:1px solid var(--line);
+    border-radius:18px;
+    padding:16px;
+    box-shadow:0 10px 28px rgba(0,0,0,.28);
+}
+.stTabs [data-baseweb="tab-list"] {
+    gap:10px;
+    background:rgba(15,23,42,.55);
+    border:1px solid var(--line);
+    border-radius:18px;
+    padding:8px;
+}
+.stTabs [data-baseweb="tab"] {
+    height:46px;
+    border-radius:14px;
+    padding:10px 16px;
+    color:#cbd5e1;
+    font-weight:850;
+}
+.stTabs [aria-selected="true"] {
+    background:linear-gradient(135deg,#1d4ed8,#2563eb) !important;
+    color:#fff !important;
+}
+div[data-testid="stDataFrame"] {
+    border-radius:18px;
+    overflow:hidden;
+    border:1px solid var(--line);
+    box-shadow:0 10px 28px rgba(0,0,0,.22);
+}
+.safe-ui-hero {
+    display:grid;
+    grid-template-columns: 1.3fr repeat(4, minmax(120px, .55fr));
+    gap:14px;
+    margin: 8px 0 18px 0;
+}
+.safe-ui-title-card, .safe-ui-metric-card {
+    background:linear-gradient(145deg, rgba(15,29,51,.98), rgba(8,18,32,.98));
+    border:1px solid rgba(148,163,184,.18);
+    border-radius:20px;
+    padding:18px;
+    box-shadow:0 12px 30px rgba(0,0,0,.30);
+}
+.safe-ui-title {
+    font-size:30px;
+    font-weight:950;
+    letter-spacing:-.03em;
+    color:#fff;
+}
+.safe-ui-sub {
+    color:#94a3b8;
+    font-size:13px;
+    margin-top:4px;
+}
+.safe-ui-label {
+    color:#94a3b8;
+    font-size:11px;
+    text-transform:uppercase;
+    letter-spacing:.08em;
+    font-weight:900;
+}
+.safe-ui-value {
+    color:#fff;
+    font-size:26px;
+    font-weight:950;
+    margin-top:7px;
+}
+.safe-ui-green { color:#22c55e; }
+.safe-ui-yellow { color:#facc15; }
+.safe-ui-blue { color:#60a5fa; }
+.safe-ui-pill {
+    display:inline-block;
+    padding:6px 10px;
+    border-radius:999px;
+    font-size:12px;
+    font-weight:900;
+    background:rgba(34,197,94,.12);
+    color:#86efac;
+    border:1px solid rgba(34,197,94,.25);
+    margin-top:8px;
+}
+@media (max-width: 1100px) {
+    .safe-ui-hero {
+        grid-template-columns: repeat(2, minmax(0,1fr));
+    }
+}
+</style>
+"""
+
+def apply_safe_ui_upgrade():
+    try:
+        st.markdown(SAFE_UI_UPGRADE_CSS, unsafe_allow_html=True)
+    except Exception:
+        pass
+
+def render_safe_ui_hero():
+    try:
+        results = load_json(RESULT_LOG, [])
+        finished = [r for r in results if r.get("actual") is not None and (r.get("graded_result") in ["WIN","LOSS"] or r.get("win") is not None)]
+        wins = sum(1 for r in finished if r.get("graded_result") == "WIN" or r.get("win") is True)
+        losses = sum(1 for r in finished if r.get("graded_result") == "LOSS" or r.get("win") is False)
+        total = wins + losses
+        wr = round((wins / total) * 100, 1) if total else 0
+    except Exception:
+        total, wins, losses, wr = 0, 0, 0, 0
+
+    try:
+        st.markdown(f"""
+        <div class="safe-ui-hero">
+            <div class="safe-ui-title-card">
+                <div class="safe-ui-title">MLB PROP ENGINE <span style="font-size:13px;color:#93c5fd;">v11.18</span></div>
+                <div class="safe-ui-sub">Official Play Filter 2.0 • All Props • Underdog Connected</div>
+                <div class="safe-ui-pill">Engine Safe Mode: UI only</div>
+            </div>
+            <div class="safe-ui-metric-card">
+                <div class="safe-ui-label">Total Graded</div>
+                <div class="safe-ui-value">{total}</div>
+            </div>
+            <div class="safe-ui-metric-card">
+                <div class="safe-ui-label">Record</div>
+                <div class="safe-ui-value">{wins}-{losses}</div>
+            </div>
+            <div class="safe-ui-metric-card">
+                <div class="safe-ui-label">Win Rate</div>
+                <div class="safe-ui-value safe-ui-green">{wr}%</div>
+            </div>
+            <div class="safe-ui-metric-card">
+                <div class="safe-ui-label">OF2 Filter</div>
+                <div class="safe-ui-value safe-ui-blue">Active</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    except Exception:
+        pass
 
 # =========================
 # STORAGE
@@ -179,7 +203,7 @@ LOCAL_DIR = "mlb_engine"
 
 try:
     from google.colab import drive
-    if not os.path.exists("/content/drive/MyDrive</div>', unsafe_allow_html=True):
+    if not os.path.exists("/content/drive/MyDrive"):
         drive.mount("/content/drive", force_remount=False)
     os.makedirs(DRIVE_DIR, exist_ok=True)
     STORAGE_DIR = DRIVE_DIR
@@ -5692,7 +5716,7 @@ def build_best4_table(board):
     return safe_top4, aggressive, df
 
 def render_best4_builder(board):
-    st.markdown('<div class="section-title-pro">Best 4 Builder / Top Hit-Rate Picks</div>', unsafe_allow_html=True)
+    st.markdown("### Best 4 Builder / Top Hit-Rate Picks")
     st.caption("Display-only ranker. It does not change projections, EV, calibration, or saved official snapshots.")
     top4_safe, aggressive_top4, ranked_all = build_best4_table(board)
 
@@ -7201,7 +7225,7 @@ def build_kproj_table(board):
     return df
 
 def render_kproj_tab(board):
-    st.markdown('<div class="section-title-pro">K PROJ / Pure Upside Model</div>', unsafe_allow_html=True)
+    st.markdown("### K PROJ / Pure Upside Model")
     st.caption("K Upside now uses true-talent projection + distribution simulation: floor, median, ceiling, volatility, recent Ks, BF, matchup, and Underdog line. Main engine stays separate.")
     if not board:
         st.info("Click 🔄 Refresh Live Board first.")
@@ -7739,7 +7763,7 @@ def build_batter_prop_table(board, dates, kind="rbi", default_line=0.5, use_unde
     return df
 
 def render_batter_rbi_tab(board, dates):
-    st.markdown('<div class="section-title-pro">Batter RBIs / Run Production Model</div>', unsafe_allow_html=True)
+    st.markdown("### Batter RBIs / Run Production Model")
     st.caption("Auto-pulls live Underdog RBI lines when available. Manual default is only fallback for missing lines. Does not change K PROJ.")
     use_ud = st.toggle("Use live Underdog RBI lines", value=True, key="batter_rbi_use_ud")
     default_line = st.number_input("Fallback RBI line if no Underdog line", min_value=0.5, max_value=3.5, value=0.5, step=0.5, key="batter_rbi_line")
@@ -7755,7 +7779,7 @@ def render_batter_rbi_tab(board, dates):
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 def render_batter_fantasy_tab(board, dates):
-    st.markdown('<div class="section-title-pro">Batter Fantasy Score Model</div>', unsafe_allow_html=True)
+    st.markdown("### Batter Fantasy Score Model")
     st.caption("Auto-pulls live Underdog fantasy score lines when available. Manual default is only fallback. Projection includes hits/total bases, RBIs, runs, walks/HBP, and steals.")
     use_ud = st.toggle("Use live Underdog Fantasy lines", value=True, key="batter_fs_use_ud")
     default_line = st.number_input("Fallback fantasy score line if no Underdog line", min_value=2.5, max_value=25.5, value=7.5, step=0.5, key="batter_fs_line")
@@ -8082,7 +8106,7 @@ def render_pitcher_prop_tab(board, kind="outs"):
         "walks": "Walks Allowed Model",
         "pitcher_fantasy": "Pitcher Fantasy Score Model",
     }
-    st.markdown(f'<div class="section-title-pro">{labels.get(kind, kind)}</div>', unsafe_allow_html=True)
+    st.markdown(f"### {labels.get(kind, kind)}")
     st.caption("Auto-pulls live Underdog lines when available. Manual default is only fallback. This does not change K PROJ.")
     use_ud = st.toggle(f"Use live Underdog {labels.get(kind, kind)} lines", value=True, key=f"pitcher_{kind}_use_ud")
     default = PITCHER_LINE_DEFAULTS.get(kind, 1.5)
@@ -8139,7 +8163,7 @@ with tab_fantasy:
     render_batter_fantasy_tab(board, dates)
 
 with tab_all:
-    st.markdown('<div class="section-title-pro">All Players</div>', unsafe_allow_html=True)
+    st.markdown("### All Players")
     if board:
         show = pd.DataFrame([{k: v for k, v in p.items() if k not in ["prop_rows", "lineup_rows", "pitch_type_rows"]} for p in board])
         cols = [
@@ -8154,7 +8178,7 @@ with tab_all:
         st.info("No players loaded.")
 
 with tab_props:
-    st.markdown('<div class="section-title-pro">Real Prop Rows + Underdog Debug</div>', unsafe_allow_html=True)
+    st.markdown("### Real Prop Rows + Underdog Debug")
     rows = []
     for p in board:
         for r in p.get("prop_rows", []):
@@ -8173,7 +8197,7 @@ with tab_props:
         st.warning("No valid MLB pitcher strikeout prop rows found. Rejected NBA/basketball rows are hidden.")
 
 with tab_statcast:
-    st.markdown('<div class="section-title-pro">Statcast + Pitch-Type</div>', unsafe_allow_html=True)
+    st.markdown("### Statcast + Pitch-Type")
     if board:
         stat_rows = []
         pitch_rows = []
@@ -8234,7 +8258,7 @@ with tab_statcast:
         st.info("Load the board first.")
 
 with tab_learning:
-    st.markdown('<div class="section-title-pro">After Games — Grade + Learn</div>', unsafe_allow_html=True)
+    st.markdown("### After Games — Grade + Learn")
     if st.button("✅ AFTER GAMES — Grade Results + Update Learning", use_container_width=True):
         graded = grade_finished_games()
         st.success(f"Graded {graded} finished official snapshots and updated learning.")
@@ -8256,7 +8280,7 @@ with tab_learning:
             c4.metric("Avg Edge", "N/A")
             c5.metric("Calibration", "N/A")
         st.dataframe(df.tail(200), use_container_width=True)
-        st.markdown('<div class="section-title-pro">Signal Tracking</div>', unsafe_allow_html=True)
+        st.markdown("### Signal Tracking")
         sig = build_signal_tracking()
         if not sig.empty:
             st.dataframe(sig, use_container_width=True, hide_index=True)
@@ -8266,7 +8290,7 @@ with tab_learning:
         st.info("No graded history yet. Save official snapshots before games, then grade after games finish.")
 
 with tab_settings:
-    st.markdown('<div class="section-title-pro">Settings / Saved Files</div>', unsafe_allow_html=True)
+    st.markdown("### Settings / Saved Files")
     st.code(STORAGE_DIR)
     st.write("Pick Log:")
     st.code(PICK_LOG)
