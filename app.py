@@ -8952,7 +8952,43 @@ def build_pitcher_prop_table(board, kind="outs", default_line=None, use_underdog
     return df
 
 
+
+# =========================
+# PITCHER PROP LINE DEFAULTS / RANGES
+# Required by extra prop tabs. Manual entry is disabled, but render functions reference these safely.
+# =========================
+PITCHER_LINE_DEFAULTS = {
+    "outs": 16.5,
+    "earned_runs": 2.5,
+    "walks": 1.5,
+    "pitcher_fantasy": 29.5,
+}
+
+PITCHER_LINE_RANGES = {
+    "outs": (6.5, 24.5),
+    "earned_runs": (0.5, 7.5),
+    "walks": (0.5, 5.5),
+    "pitcher_fantasy": (2.5, 60.5),
+}
+
+
 def render_pitcher_prop_tab(board, kind="outs"):
+    global PITCHER_LINE_DEFAULTS, PITCHER_LINE_RANGES
+    if "PITCHER_LINE_DEFAULTS" not in globals():
+        PITCHER_LINE_DEFAULTS = {
+            "outs": 16.5,
+            "earned_runs": 2.5,
+            "walks": 1.5,
+            "pitcher_fantasy": 29.5,
+        }
+    if "PITCHER_LINE_RANGES" not in globals():
+        PITCHER_LINE_RANGES = {
+            "outs": (6.5, 24.5),
+            "earned_runs": (0.5, 7.5),
+            "walks": (0.5, 5.5),
+            "pitcher_fantasy": (2.5, 60.5),
+        }
+
     labels = {
         "outs": "Pitching Outs Model",
         "earned_runs": "Earned Runs Allowed Model",
