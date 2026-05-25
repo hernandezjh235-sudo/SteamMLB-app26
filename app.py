@@ -20,6 +20,150 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
+# =========================
+# UI TERMINAL UPGRADE v1
+# =========================
+GLOBAL_UI_CSS = '''
+<style>
+.main {
+    background: #0b1020;
+}
+.stApp {
+    background: linear-gradient(180deg,#0b1020 0%, #121a31 100%);
+    color: #f3f4f6;
+}
+.hero-row {
+    display:grid;
+    grid-template-columns: repeat(4,1fr);
+    gap:14px;
+    margin-bottom:16px;
+}
+.metric-card {
+    background: rgba(20,28,48,.95);
+    border:1px solid rgba(80,120,255,.22);
+    border-radius:18px;
+    padding:16px;
+    box-shadow:0 6px 18px rgba(0,0,0,.28);
+}
+.metric-label {
+    font-size:12px;
+    color:#9ca3af;
+    text-transform:uppercase;
+    letter-spacing:.08em;
+}
+.metric-value {
+    font-size:28px;
+    font-weight:700;
+    color:white;
+}
+.player-card {
+    background: rgba(17,24,39,.92);
+    border-radius:22px;
+    padding:16px;
+    margin-bottom:14px;
+    border:1px solid rgba(255,255,255,.08);
+}
+.edge-good {
+    color:#22c55e;
+    font-weight:700;
+}
+.edge-mid {
+    color:#facc15;
+    font-weight:700;
+}
+.edge-bad {
+    color:#ef4444;
+    font-weight:700;
+}
+.section-title {
+    font-size:24px;
+    font-weight:800;
+    margin-top:10px;
+    margin-bottom:10px;
+    color:#f8fafc;
+}
+div[data-baseweb="tab-list"] {
+    gap:10px;
+}
+button[data-baseweb="tab"] {
+    background:#111827 !important;
+    border-radius:14px !important;
+    border:1px solid rgba(255,255,255,.08) !important;
+    padding:10px 16px !important;
+}
+</style>
+'''
+
+def apply_global_ui():
+    try:
+        st.markdown(GLOBAL_UI_CSS, unsafe_allow_html=True)
+    except Exception:
+        pass
+
+def render_hero_metrics(total_plays=0, avg_edge=0, avg_conf=0, win_rate=0):
+    st.markdown(
+        f'''
+        <div class="hero-row">
+            <div class="metric-card">
+                <div class="metric-label">Official Plays</div>
+                <div class="metric-value">{total_plays}</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Average Edge</div>
+                <div class="metric-value">{avg_edge}</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Confidence</div>
+                <div class="metric-value">{avg_conf}%</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Win Rate</div>
+                <div class="metric-value">{win_rate}%</div>
+            </div>
+        </div>
+        ''',
+        unsafe_allow_html=True
+    )
+
+def render_player_card(player, proj, line, pick, edge):
+    edge_class = "edge-good" if edge >= 1 else "edge-mid" if edge >= 0.4 else "edge-bad"
+    st.markdown(
+        f'''
+        <div class="player-card">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+                <div>
+                    <div style="font-size:20px;font-weight:700;color:white;">{player}</div>
+                    <div style="color:#9ca3af;font-size:13px;">Projection Terminal</div>
+                </div>
+                <div class="{edge_class}" style="font-size:18px;">
+                    EDGE {edge}
+                </div>
+            </div>
+
+            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:14px;">
+                <div class="metric-card">
+                    <div class="metric-label">Projection</div>
+                    <div class="metric-value">{proj}</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Line</div>
+                    <div class="metric-value">{line}</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Pick</div>
+                    <div class="metric-value">{pick}</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Status</div>
+                    <div class="metric-value">LIVE</div>
+                </div>
+            </div>
+        </div>
+        ''',
+        unsafe_allow_html=True
+    )
+
+
 APP_VERSION = "v11.18 K PROJ UPSIDE TAB + REALISM + ARCHETYPE + OFFICIAL PLAY FILTER 2.0"
 
 try:
@@ -35,7 +179,7 @@ LOCAL_DIR = "mlb_engine"
 
 try:
     from google.colab import drive
-    if not os.path.exists("/content/drive/MyDrive"):
+    if not os.path.exists("/content/drive/MyDrive</div>', unsafe_allow_html=True):
         drive.mount("/content/drive", force_remount=False)
     os.makedirs(DRIVE_DIR, exist_ok=True)
     STORAGE_DIR = DRIVE_DIR
@@ -7626,8 +7770,344 @@ def render_batter_fantasy_tab(board, dates):
     c4.metric("A/B Tier", int(df["Tier"].isin(["A", "B"]).sum()))
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-tab_kproj, tab_rbi, tab_fantasy, tab_all, tab_props, tab_statcast, tab_learning, tab_settings = st.tabs([
+
+# =========================
+# PITCHER PROP TABS: OUTS / EARNED RUNS / WALKS / FANTASY SCORE
+# =========================
+# These are separate from the strikeout engine. They reuse the same realism inputs
+# already produced for each pitcher: expected BF, recent IP, run-damage profile,
+# leash risk, K projection, and live Underdog lines when available.
+PITCHER_MARKET_TERMS = {
+    "outs": ["pitching outs", "outs recorded", "pitcher outs", "recorded outs"],
+    "earned_runs": ["earned runs", "earned runs allowed", "pitcher earned runs", "er allowed"],
+    "walks": ["walks allowed", "pitcher walks", "bases on balls", "base on balls", "bb allowed"],
+    "pitcher_fantasy": ["pitcher fantasy", "fantasy score", "fantasy points", "pitcher fantasy score"],
+}
+
+PITCHER_LINE_DEFAULTS = {
+    "outs": 15.5,
+    "earned_runs": 2.5,
+    "walks": 1.5,
+    "pitcher_fantasy": 25.5,
+}
+
+PITCHER_LINE_RANGES = {
+    "outs": (3.5, 27.5),
+    "earned_runs": (0.5, 8.5),
+    "walks": (0.5, 6.5),
+    "pitcher_fantasy": (2.5, 60.5),
+}
+
+
+def pitcher_prop_market_matches_text(text, kind="outs"):
+    t = str(text or "").lower()
+    if not t:
+        return False
+    if is_bad_sport_text(t) and not ("mlb" in t or "baseball" in t):
+        return False
+    terms = PITCHER_MARKET_TERMS.get(kind, [])
+    if not any(term in t for term in terms):
+        return False
+    # Keep pitcher tabs from stealing hitter fantasy/RBI markets.
+    if kind == "pitcher_fantasy" and any(x in t for x in ["batter fantasy", "hitter fantasy", "player fantasy batter"]):
+        return False
+    if any(x in t for x in ["batter", "hitter", "total bases", "hits+runs+rbi", "rbi", "stolen base"]):
+        if not any(y in t for y in ["pitcher", "pitching", "earned runs", "walks allowed", "outs recorded"]):
+            return False
+    return True
+
+
+def extract_pitcher_prop_line_from_obj(obj, kind="outs"):
+    line, note = extract_batter_prop_line_from_obj(obj)
+    if line is None:
+        return None, note
+    lo, hi = PITCHER_LINE_RANGES.get(kind, (0.5, 80.5))
+    if lo <= line <= hi:
+        return line, note
+    return None, "line outside expected pitcher prop range"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_underdog_pitcher_prop_candidates(kind="outs"):
+    candidates = []
+    seen = set()
+    for url in UNDERDOG_URLS:
+        data = safe_get_json(url, timeout=16)
+        if not data:
+            continue
+        for obj in flatten_json(data):
+            if not isinstance(obj, dict):
+                continue
+            blob = json.dumps(obj, ensure_ascii=False)
+            low = blob.lower()
+            if not pitcher_prop_market_matches_text(low, kind):
+                continue
+            line, line_note = extract_pitcher_prop_line_from_obj(obj, kind=kind)
+            if line is None:
+                continue
+            nm = extract_batter_candidate_name(obj)
+            market = ""
+            for k in BATTER_PROP_MARKET_KEYS:
+                v = obj.get(k)
+                if isinstance(v, str) and pitcher_prop_market_matches_text(v, kind):
+                    market = v
+                    break
+            key = (url, nm, round(float(line), 2), market, str(obj.get("id") or obj.get("uuid") or "")[:50])
+            if key in seen:
+                continue
+            seen.add(key)
+            label = {
+                "outs": "Pitching Outs",
+                "earned_runs": "Earned Runs Allowed",
+                "walks": "Walks Allowed",
+                "pitcher_fantasy": "Pitcher Fantasy Score",
+            }.get(kind, kind)
+            candidates.append({
+                "Source": "Underdog",
+                "Provider": "Underdog",
+                "Kind": kind,
+                "Player Candidate": nm,
+                "Line": float(line),
+                "Market": market or label,
+                "Line Evidence": line_note,
+                "Blob": blob[:6000],
+                "URL": url,
+            })
+    log_source_request(f"Underdog Pitcher {kind}", "OK" if candidates else "NO_MATCH", f"{len(candidates)} candidates")
+    return candidates
+
+
+def match_underdog_pitcher_prop_line(player_name, kind="outs", min_score=0.88):
+    pname = normalize_name(player_name)
+    if not pname:
+        return None
+    candidates = fetch_underdog_pitcher_prop_candidates(kind)
+    best = None
+    for c in candidates:
+        cand_name = c.get("Player Candidate") or ""
+        blob = c.get("Blob") or ""
+        score = name_score(player_name, cand_name) if cand_name else 0.0
+        if pname and pname in normalize_name(blob):
+            score = max(score, 0.94)
+        if score < min_score:
+            continue
+        row = dict(c)
+        row["Match Score"] = round(float(score), 3)
+        row["Matched Name"] = cand_name or player_name
+        if best is None or row["Match Score"] > best["Match Score"]:
+            best = row
+    return best
+
+
+def pitcher_prop_live_line_for_row(p, kind="outs", default_line=None, use_underdog=True):
+    if use_underdog:
+        m = match_underdog_pitcher_prop_line(p.get("pitcher"), kind=kind)
+        if m and safe_float(m.get("Line")) is not None:
+            return safe_float(m.get("Line")), "Underdog", m
+    if default_line is not None:
+        return safe_float(default_line), "Manual Default", None
+    return None, "NO LINE", None
+
+
+def pitcher_expected_ip(p):
+    bf = safe_float(p.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
+    bf_ip = bf / 4.25
+    recent_ip = safe_float(p.get("recent_ip_avg"), None)
+    if recent_ip is None:
+        recent_ip = safe_float(p.get("recent_ip"), None)
+    vals = [bf_ip]
+    if recent_ip is not None and recent_ip > 0:
+        vals.append(recent_ip)
+    ip = sum(vals) / len(vals)
+    leash = str(p.get("leash_risk") or "").upper()
+    if leash in ["SHORT_RECENT_STARTS", "HIGH_PITCH_COUNT", "HIGH_RECENT_WORKLOAD"]:
+        ip *= 0.94
+    if str(p.get("run_damage_risk_level") or "").upper() in ["HIGH", "EXTREME"]:
+        ip *= 0.96
+    return float(clamp(ip, 1.0, 8.0))
+
+
+def project_pitcher_prop(p, kind="outs"):
+    ip = pitcher_expected_ip(p)
+    k_proj = safe_float(p.get("projection"), 0.0) or 0.0
+    bb9 = safe_float(p.get("run_damage_bb9"), None)
+    recent_bb = safe_float(p.get("recent_bb_avg"), None)
+    recent_er = safe_float(p.get("recent_er_avg"), None)
+    hr9 = safe_float(p.get("run_damage_hr9"), None)
+    h9 = safe_float(p.get("run_damage_h9"), None)
+    rd_score = safe_float(p.get("run_damage_score"), 35) or 35
+    rd_level = str(p.get("run_damage_risk_level") or "").upper()
+
+    if kind == "outs":
+        proj = ip * 3.0
+        src = "expected BF/IP + leash"
+        return round(float(clamp(proj, 3.0, 24.0)), 2), src
+
+    if kind == "walks":
+        season_walks = (bb9 / 9.0 * ip) if bb9 is not None else 1.75
+        if recent_bb is not None:
+            proj = season_walks * 0.55 + recent_bb * 0.45
+            src = "BB9 + recent BB avg"
+        else:
+            proj = season_walks
+            src = "BB9/IP estimate"
+        if safe_float(p.get("ppb"), 3.9) >= 4.1:
+            proj *= 1.07
+        return round(float(clamp(proj, 0.25, 5.5)), 2), src
+
+    if kind == "earned_runs":
+        # A transparent ER model: recent ER baseline + season damage profile + projected innings.
+        season_proxy = 2.25
+        if h9 is not None:
+            season_proxy += clamp((h9 - 8.2) * 0.12, -0.35, 0.55)
+        if hr9 is not None:
+            season_proxy += clamp((hr9 - 1.05) * 0.45, -0.25, 0.65)
+        season_proxy += clamp((rd_score - 35) * 0.018, -0.30, 0.70)
+        season_proxy *= clamp(ip / 5.4, 0.65, 1.25)
+        if recent_er is not None:
+            proj = recent_er * 0.50 + season_proxy * 0.50
+            src = "recent ER + run-damage profile"
+        else:
+            proj = season_proxy
+            src = "run-damage profile"
+        if rd_level == "EXTREME":
+            proj *= 1.10
+        elif rd_level == "HIGH":
+            proj *= 1.06
+        return round(float(clamp(proj, 0.3, 7.0)), 2), src
+
+    # Conservative Underdog-style pitcher fantasy proxy.
+    outs = ip * 3.0
+    walks, _ = project_pitcher_prop(p, "walks")
+    er, _ = project_pitcher_prop(p, "earned_runs")
+    proj = (k_proj * 3.0) + (outs * 0.75) - (er * 3.0) - (walks * 0.6)
+    if str(p.get("pick_side") or "").upper() == "OVER" and k_proj >= 6:
+        proj += 0.8
+    src = "Ks + outs - ER/BB fantasy proxy"
+    return round(float(clamp(proj, 2.0, 55.0)), 2), src
+
+
+def pitcher_prop_distribution(proj, kind="outs"):
+    proj = safe_float(proj, 0) or 0
+    if kind == "outs":
+        vol = 2.2
+    elif kind == "earned_runs":
+        vol = clamp(0.85 + proj * 0.45, 0.95, 2.4)
+    elif kind == "walks":
+        vol = clamp(0.55 + proj * 0.35, 0.65, 1.7)
+    else:
+        vol = clamp(4.0 + proj * 0.08, 4.0, 8.5)
+    floor = max(0.0, proj - vol)
+    ceiling = proj + vol * 1.45
+    return round(floor, 2), round(proj, 2), round(ceiling, 2), round(vol, 2)
+
+
+def pitcher_prop_decision(proj, line, kind="outs"):
+    proj = safe_float(proj, 0) or 0
+    line = safe_float(line, None)
+    if line is None:
+        return "NO LINE", "NO LINE", None, None, "NO LINE"
+    side = "OVER" if proj > line else "UNDER"
+    gap = abs(proj - line)
+    thresholds = {
+        "outs": (2.0, 1.0),
+        "earned_runs": (0.55, 0.28),
+        "walks": (0.45, 0.22),
+        "pitcher_fantasy": (4.0, 2.0),
+    }
+    official_gap, lean_gap = thresholds.get(kind, (1.0, 0.5))
+    confidence = clamp(50 + (gap / max(official_gap, 0.01)) * 18, 50, 84)
+    if gap >= official_gap:
+        decision = f"✅ {side}"
+        tier = "A" if confidence >= 73 else "B"
+    elif gap >= lean_gap:
+        decision = f"⚠️ {side} LEAN"
+        tier = "C"
+    else:
+        decision = f"🚫 PASS — {side}"
+        tier = "PASS"
+    return decision, side, round(gap, 2), round(confidence, 1), tier
+
+
+def build_pitcher_prop_table(board, kind="outs", default_line=None, use_underdog=True):
+    out = []
+    for p in board or []:
+        proj, src = project_pitcher_prop(p, kind)
+        live_line, line_source, ud_match = pitcher_prop_live_line_for_row(
+            p, kind=kind, default_line=default_line, use_underdog=use_underdog
+        )
+        floor, median, ceiling, vol = pitcher_prop_distribution(proj, kind)
+        decision, side, gap, conf, tier = pitcher_prop_decision(proj, live_line, kind)
+        out.append({
+            "Pitcher": p.get("pitcher"),
+            "Matchup": p.get("matchup"),
+            "Projection": proj,
+            "Floor": floor,
+            "Median": median,
+            "Ceiling": ceiling,
+            "Volatility": vol,
+            "Line": live_line,
+            "Line Source": line_source,
+            "Decision": decision,
+            "Model Lean": side,
+            "Edge Gap": gap,
+            "Confidence %": conf,
+            "Tier": tier,
+            "K PROJ": p.get("projection"),
+            "Expected BF": p.get("expected_bf"),
+            "IP Estimate": round(pitcher_expected_ip(p), 2),
+            "Pitcher K%": p.get("pitcher_k"),
+            "Opp K%": p.get("opp_k"),
+            "Leash Risk": p.get("leash_risk"),
+            "Run Damage": p.get("run_damage_risk_level"),
+            "Recent ER Avg": p.get("recent_er_avg"),
+            "Recent BB Avg": p.get("recent_bb_avg"),
+            "BB/9": p.get("run_damage_bb9"),
+            "HR/9": p.get("run_damage_hr9"),
+            "Source": src,
+            "UD Matched Name": (ud_match or {}).get("Matched Name"),
+            "UD Market": (ud_match or {}).get("Market"),
+            "UD Match Score": (ud_match or {}).get("Match Score"),
+        })
+    df = pd.DataFrame(out)
+    if not df.empty:
+        df = df.sort_values(["Tier", "Confidence %", "Projection"], ascending=[True, False, False])
+    return df
+
+
+def render_pitcher_prop_tab(board, kind="outs"):
+    labels = {
+        "outs": "Pitching Outs Model",
+        "earned_runs": "Earned Runs Allowed Model",
+        "walks": "Walks Allowed Model",
+        "pitcher_fantasy": "Pitcher Fantasy Score Model",
+    }
+    st.markdown(f'<div class="section-title-pro">{labels.get(kind, kind)}</div>', unsafe_allow_html=True)
+    st.caption("Auto-pulls live Underdog lines when available. Manual default is only fallback. This does not change K PROJ.")
+    use_ud = st.toggle(f"Use live Underdog {labels.get(kind, kind)} lines", value=True, key=f"pitcher_{kind}_use_ud")
+    default = PITCHER_LINE_DEFAULTS.get(kind, 1.5)
+    lo, hi = PITCHER_LINE_RANGES.get(kind, (0.5, 40.5))
+    default_line = st.number_input(
+        f"Fallback {labels.get(kind, kind)} line if no Underdog line",
+        min_value=float(lo), max_value=float(hi), value=float(default), step=0.5, key=f"pitcher_{kind}_line"
+    )
+    df = build_pitcher_prop_table(board, kind=kind, default_line=default_line, use_underdog=use_ud)
+    if df.empty:
+        st.info("Refresh the board first or select a date with MLB games.")
+        return
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Pitcher Rows", len(df))
+    c2.metric("Underdog Lines", int((df["Line Source"] == "Underdog").sum()) if "Line Source" in df.columns else 0)
+    c3.metric("Over/Lean", int(df["Decision"].astype(str).str.contains("OVER", regex=False).sum()))
+    c4.metric("A/B Tier", int(df["Tier"].isin(["A", "B"]).sum()))
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+tab_kproj, tab_outs, tab_er, tab_walks, tab_pitcher_fantasy, tab_rbi, tab_fantasy, tab_all, tab_props, tab_statcast, tab_learning, tab_settings = st.tabs([
     "K PROJ / UPSIDE",
+    "PITCHING OUTS",
+    "EARNED RUNS",
+    "WALKS ALLOWED",
+    "PITCHER FANTASY",
     "BATTER RBIs",
     "BATTER FANTASY SCORE",
     "ALL PLAYERS",
@@ -7639,6 +8119,18 @@ tab_kproj, tab_rbi, tab_fantasy, tab_all, tab_props, tab_statcast, tab_learning,
 
 with tab_kproj:
     render_kproj_tab(board)
+
+with tab_outs:
+    render_pitcher_prop_tab(board, kind="outs")
+
+with tab_er:
+    render_pitcher_prop_tab(board, kind="earned_runs")
+
+with tab_walks:
+    render_pitcher_prop_tab(board, kind="walks")
+
+with tab_pitcher_fantasy:
+    render_pitcher_prop_tab(board, kind="pitcher_fantasy")
 
 with tab_rbi:
     render_batter_rbi_tab(board, dates)
