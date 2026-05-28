@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI"
+APP_VERSION = "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD"
 
 try:
     import pytz
@@ -7951,8 +7951,218 @@ def render_elite_ui_polish_header(board):
         return
 
 
-tab_kproj, tab_moneyline_edge, tab_lineup_lock, tab_results_dash, tab_auto_results, tab_safe_vol, tab_pitch_ump, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+
+# =========================
+# FINAL BOARD TAB
+# Merged decision center: K projection + lineup + safety + pitch alert
+# + pitch-type/umpire refinement + line edge.
+# Display/decision layer only. Does not rewrite core K math.
+# =========================
+def _fb_side(p):
+    s = str(p.get("model_lean") or p.get("Model Lean") or p.get("Decision") or p.get("Pick") or "").upper()
+    if "UNDER" in s or s.startswith("U") or "PU" in s:
+        return "UNDER"
+    if "OVER" in s or s.startswith("O") or "PO" in s:
+        return "OVER"
+    proj = safe_float(p.get("projection") or p.get("K PROJ"), None)
+    line = safe_float(p.get("line") or p.get("underdog_line") or p.get("Line"), None)
+    if proj is None or line is None:
+        return "NO LINE"
+    return "OVER" if proj > line else "UNDER"
+
+def _fb_score_row(p):
+    proj = safe_float(p.get("projection") or p.get("K PROJ"), None)
+    line = safe_float(p.get("line") or p.get("underdog_line") or p.get("Line"), None)
+    refined = safe_float(p.get("Refined Read"), proj)
+    side = _fb_side(p)
+    edge = None if refined is None or line is None else abs(refined - line)
+    conf = safe_float(p.get("fair_probability") or p.get("hit_rate") or p.get("Confidence %"), None)
+    if conf is not None and conf <= 1:
+        conf *= 100
+
+    lineup = str(p.get("Lineup Lock") or p.get("lineup_status") or p.get("Lineup") or "").upper()
+    safety = str(p.get("Safety Tag") or "MODERATE").upper()
+    alert = str(p.get("Pitch Alert") or "").upper()
+    arsenal = str(p.get("Pitch-Type Label") or "").upper()
+    ump = str(p.get("Advanced Umpire Label") or "").upper()
+    tier = str(p.get("action_tier") or p.get("Tier") or "").upper()
+
+    score = 50.0
+    if conf is not None:
+        score += clamp((conf - 55) * 0.55, -8, 20)
+    if edge is not None:
+        score += clamp(edge * 6.0, -4, 22)
+
+    if safety == "SAFE":
+        score += 9
+    elif safety == "VOLATILE":
+        score -= 10
+    elif safety == "MODERATE":
+        score += 2
+
+    if "CONFIRMED" in lineup or "TRUE" in lineup:
+        score += 8
+    elif "FALLBACK" in lineup or not lineup:
+        score -= 8
+    elif "PROJECTED" in lineup:
+        score -= 3
+
+    if "HIGH_ALERT" in alert:
+        score -= 14
+    elif "MEDIUM_ALERT" in alert:
+        score -= 8
+    elif "LOW_ALERT" in alert:
+        score -= 4
+    elif "CLEAR" in alert:
+        score += 4
+
+    if "ARSENAL_EDGE" in arsenal:
+        score += 5
+    elif "ARSENAL_RISK" in arsenal:
+        score -= 5
+    if "UMP_K_BOOST" in ump:
+        score += 2
+    elif "UMP_K_DRAG" in ump:
+        score -= 2
+
+    if tier == "A":
+        score += 5
+    elif tier == "B":
+        score += 2
+    elif tier == "C":
+        score -= 2
+    elif "PASS" in tier:
+        score -= 8
+
+    if side == "NO LINE" or line is None:
+        score = min(score, 30)
+    score = int(clamp(round(score), 0, 100))
+
+    if score >= 82:
+        label = "🔥 FINAL PLAY"
+        cls = "good-badge"
+    elif score >= 70:
+        label = "✅ STRONG LEAN"
+        cls = "good-badge"
+    elif score >= 58:
+        label = "⚠️ MONITOR"
+        cls = "yellow-badge"
+    else:
+        label = "🚫 PASS / WAIT"
+        cls = "red-badge"
+
+    warnings, positives = [], []
+    if "FALLBACK" in lineup or not lineup:
+        warnings.append("WAIT LINEUP")
+    elif "CONFIRMED" in lineup or "TRUE" in lineup:
+        positives.append("LINEUP LOCKED")
+    if safety == "VOLATILE":
+        warnings.append("VOLATILE")
+    elif safety == "SAFE":
+        positives.append("SAFE")
+    if "HIGH_ALERT" in alert or "MEDIUM_ALERT" in alert:
+        warnings.append(alert.replace("_", " "))
+    if "ARSENAL_EDGE" in arsenal:
+        positives.append("ARSENAL EDGE")
+    if "ARSENAL_RISK" in arsenal:
+        warnings.append("ARSENAL RISK")
+    if "UMP_K_BOOST" in ump:
+        positives.append("UMP BOOST")
+    if edge is not None and edge >= 1.5:
+        positives.append("BIG EDGE")
+    if edge is not None and edge < 0.5:
+        warnings.append("SMALL EDGE")
+
+    return {
+        "Pitcher": p.get("pitcher"), "Matchup": p.get("matchup"), "Side": side,
+        "Line": line, "Projection": proj, "Refined": refined,
+        "Edge": None if edge is None else round(edge, 2),
+        "Final Score": score, "Final Label": label, "Final Class": cls,
+        "Safety Tag": safety, "Lineup": lineup or "UNKNOWN",
+        "Pitch Alert": alert or "UNKNOWN", "Arsenal": arsenal or "UNKNOWN",
+        "Umpire": ump or "UNKNOWN", "Tier": tier,
+        "Warnings": " | ".join(warnings) if warnings else "—",
+        "Positives": " | ".join(positives) if positives else "—",
+    }
+
+def build_final_board_rows(board):
+    try:
+        if "apply_elite_safety_overlays_to_board" in globals():
+            board = apply_elite_safety_overlays_to_board(board)
+        if "apply_safe_volatile_tags" in globals():
+            board = apply_safe_volatile_tags(board)
+        if "apply_elite_refinement_overlays" in globals():
+            board = apply_elite_refinement_overlays(board)
+    except Exception:
+        pass
+    rows = [_fb_score_row(p) for p in (board or []) if isinstance(p, dict) and p.get("pitcher")]
+    rows.sort(key=lambda r: (r.get("Final Score") or 0, r.get("Edge") or 0), reverse=True)
+    return rows
+
+def render_final_pick_card(r):
+    score = safe_float(r.get("Final Score"), 0) or 0
+    proj = safe_float(r.get("Projection"), None)
+    ref = safe_float(r.get("Refined"), proj)
+    shift = 0 if proj is None or ref is None else ref - proj
+    line = r.get("Line")
+    line_txt = "NO LINE" if line is None else f"{line:g}"
+    bar = int(clamp(score, 4, 100))
+    color = "#31e84f" if score >= 70 else "#ffbe3c" if score >= 58 else "#ff5f5f"
+    st.markdown(f"""
+    <div class="pick-card">
+      <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;">
+        <div>
+          <div class="small-muted">FINAL BOARD • merged decision layer</div>
+          <div class="player-name">{html.escape(str(r.get("Pitcher","—")))}</div>
+          <div class="small-muted">{html.escape(str(r.get("Matchup","—")))}</div>
+        </div>
+        <div class="badge {r.get("Final Class","yellow-badge")}">{html.escape(str(r.get("Final Label","—")))}</div>
+      </div>
+      <div class="kpi-strip" style="grid-template-columns:repeat(5,minmax(0,1fr));">
+        <div class="kpi-box"><div class="kpi-label">Pick</div><div class="kpi-value">{html.escape(str(r.get("Side","—")))} {line_txt}</div><div class="kpi-sub">line</div></div>
+        <div class="kpi-box"><div class="kpi-label">K Proj</div><div class="kpi-value">{proj if proj is not None else "—"}</div><div class="kpi-sub">base</div></div>
+        <div class="kpi-box"><div class="kpi-label">Refined</div><div class="kpi-value">{ref if ref is not None else "—"}</div><div class="kpi-sub">shift {shift:+.2f}</div></div>
+        <div class="kpi-box"><div class="kpi-label">Edge</div><div class="kpi-value">{r.get("Edge","—")}</div><div class="kpi-sub">vs line</div></div>
+        <div class="kpi-box"><div class="kpi-label">Final Score</div><div class="kpi-value" style="color:{color};">{int(score)}</div><div class="kpi-sub">0-100</div></div>
+      </div>
+      <div class="progress-wrap"><div class="progress-green" style="width:{bar}%;"></div></div>
+      <div style="margin-top:12px;">
+        <span class="badge">{html.escape(str(r.get("Safety Tag","—")))}</span>
+        <span class="badge">{html.escape(str(r.get("Lineup","—")))}</span>
+        <span class="badge">{html.escape(str(r.get("Pitch Alert","—")))}</span>
+        <span class="badge">{html.escape(str(r.get("Arsenal","—")))}</span>
+        <span class="badge">{html.escape(str(r.get("Umpire","—")))}</span>
+      </div>
+      <div class="hr-soft"></div>
+      <div><b>Positives:</b> {html.escape(str(r.get("Positives","—")))}</div>
+      <div><b>Warnings:</b> {html.escape(str(r.get("Warnings","—")))}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+def render_final_board_tab(board, dates=None):
+    st.markdown("### 🧠 FINAL BOARD — Final Decision Center")
+    st.caption("Use this after lineups post. It merges all tabs into one final pick board.")
+    rows = build_final_board_rows(board)
+    if not rows:
+        st.info("No board loaded yet. Refresh the live board first.")
+        return
+    df = pd.DataFrame(rows)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Final Plays", int(df["Final Label"].astype(str).str.contains("FINAL PLAY").sum()))
+    c2.metric("Strong Leans", int(df["Final Label"].astype(str).str.contains("STRONG LEAN").sum()))
+    c3.metric("Wait Lineup", int(df["Warnings"].astype(str).str.contains("WAIT LINEUP").sum()))
+    c4.metric("Avg Score", round(pd.to_numeric(df["Final Score"], errors="coerce").mean(), 1))
+    st.markdown('<div class="section-title-pro">Top Final Cards</div>', unsafe_allow_html=True)
+    for r in rows[:10]:
+        render_final_pick_card(r)
+    st.markdown('<div class="section-title-pro">Final Board Table</div>', unsafe_allow_html=True)
+    keep = ["Pitcher","Matchup","Side","Line","Projection","Refined","Edge","Final Score","Final Label","Safety Tag","Lineup","Pitch Alert","Arsenal","Umpire","Warnings","Positives"]
+    st.dataframe(df[[c for c in keep if c in df.columns]], use_container_width=True, hide_index=True)
+
+
+tab_kproj, tab_final_board, tab_moneyline_edge, tab_lineup_lock, tab_results_dash, tab_auto_results, tab_safe_vol, tab_pitch_ump, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
+    "FINAL BOARD",
     "MONEYLINE EDGE",
     "LINEUP LOCK",
     "RESULTS DASHBOARD",
@@ -7970,6 +8180,9 @@ tab_kproj, tab_moneyline_edge, tab_lineup_lock, tab_results_dash, tab_auto_resul
 
 with tab_kproj:
     render_kproj_tab(board)
+
+with tab_final_board:
+    render_final_board_tab(board, dates)
 
 with tab_moneyline_edge:
     render_moneyline_edge_tab(board, dates)
