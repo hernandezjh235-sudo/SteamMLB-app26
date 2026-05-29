@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -9034,6 +9034,147 @@ def render_settings_visible_tab(board=None, dates=None):
         "APP_VERSION": globals().get("APP_VERSION", "—"),
     }
     st.dataframe(pd.DataFrame([{"Setting": k, "Value": v} for k, v in settings.items()]), use_container_width=True, hide_index=True)
+
+
+
+# =========================
+# MOBILE K UPSIDE PLAYER CARD FIX
+# CSS/UI only. Does NOT affect projections, decisions, Final Board, ML, grading, or data.
+# =========================
+def inject_mobile_k_card_fix():
+    st.markdown("""
+    <style>
+    @media (max-width: 780px) {
+        html, body, [data-testid="stAppViewContainer"], .main, .block-container {
+            max-width: 100vw !important;
+            overflow-x: hidden !important;
+        }
+        .block-container {
+            padding-left: 0.6rem !important;
+            padding-right: 0.6rem !important;
+        }
+
+        .pick-card, .kproj-card, .player-card, .pitcher-card {
+            width: 100% !important;
+            max-width: calc(100vw - 1.2rem) !important;
+            min-width: 0 !important;
+            box-sizing: border-box !important;
+            overflow: hidden !important;
+            padding: 18px 16px !important;
+            border-radius: 22px !important;
+        }
+
+        .kproj-top, .card-top, .pick-top, .player-top, .hero-grid, .main-grid,
+        .kproj-main-row, .projection-row, .edge-row, .card-main-row {
+            display: grid !important;
+            grid-template-columns: 1fr !important;
+            gap: 14px !important;
+            width: 100% !important;
+            max-width: 100% !important;
+            overflow: hidden !important;
+        }
+
+        .kpi-strip, .metric-strip, .stats-strip, .kproj-metrics,
+        .card-metrics, .mini-metrics {
+            display: grid !important;
+            grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+            gap: 12px !important;
+            width: 100% !important;
+            max-width: 100% !important;
+            overflow: visible !important;
+        }
+
+        .kpi-box, .metric-box, .stat-box, .mini-card, .metric-card {
+            min-width: 0 !important;
+            width: 100% !important;
+            max-width: 100% !important;
+            box-sizing: border-box !important;
+            padding: 13px 10px !important;
+            border-radius: 16px !important;
+            overflow: hidden !important;
+            text-align: center !important;
+        }
+
+        .kpi-label, .metric-label, .stat-label, .mini-label, .k-label, .label {
+            white-space: normal !important;
+            word-break: keep-all !important;
+            overflow-wrap: normal !important;
+            hyphens: none !important;
+            font-size: 11px !important;
+            line-height: 1.2 !important;
+            letter-spacing: 0.03em !important;
+            text-align: center !important;
+        }
+
+        .kpi-value, .metric-value, .stat-value, .mini-value, .big-number {
+            white-space: normal !important;
+            word-break: normal !important;
+            overflow-wrap: normal !important;
+            font-size: clamp(24px, 8vw, 42px) !important;
+            line-height: 1.02 !important;
+            text-align: center !important;
+        }
+
+        .kpi-sub, .metric-sub, .stat-sub, .mini-sub {
+            white-space: normal !important;
+            word-break: normal !important;
+            overflow-wrap: normal !important;
+            font-size: 12px !important;
+            line-height: 1.25 !important;
+            text-align: center !important;
+        }
+
+        div[data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap !important;
+            gap: 0.75rem !important;
+            width: 100% !important;
+        }
+
+        div[data-testid="column"] {
+            min-width: 0 !important;
+        }
+
+        .pick-card div[data-testid="column"],
+        .kproj-card div[data-testid="column"],
+        .player-card div[data-testid="column"],
+        .pitcher-card div[data-testid="column"] {
+            width: 100% !important;
+            min-width: 100% !important;
+            flex: 1 1 100% !important;
+        }
+
+        .decision-box, .edge-box, .pick-decision, .final-decision {
+            width: 100% !important;
+            max-width: 100% !important;
+            text-align: center !important;
+            overflow: hidden !important;
+        }
+
+        .last10, .last-10, .mini-k-bars, .distribution-box, .distribution {
+            width: 100% !important;
+            max-width: 100% !important;
+            overflow-x: auto !important;
+            white-space: nowrap !important;
+        }
+
+        div[data-testid="stDataFrame"] {
+            max-width: 100% !important;
+            overflow-x: auto !important;
+        }
+    }
+
+    @media (max-width: 430px) {
+        .kpi-strip, .metric-strip, .stats-strip, .kproj-metrics,
+        .card-metrics, .mini-metrics {
+            grid-template-columns: 1fr 1fr !important;
+            gap: 10px !important;
+        }
+        .kpi-box, .metric-box, .stat-box, .mini-card, .metric-card {
+            padding: 12px 8px !important;
+        }
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
 
 tab_kproj, tab_final_board, tab_moneyline_edge, tab_lineup_lock, tab_results_dash, tab_auto_results, tab_safe_vol, tab_pitch_ump, tab2, tab3, tab4, tab5, tab6 = st.tabs([
