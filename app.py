@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD"
+APP_VERSION = "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD"
 
 try:
     import pytz
@@ -7970,12 +7970,37 @@ def _fb_side(p):
         return "NO LINE"
     return "OVER" if proj > line else "UNDER"
 
+
 def _fb_score_row(p):
+    """Balanced Final Board scorer.
+
+    K PROJ remains the projection truth.
+    Final Board adjusts confidence/trust, not raw projection direction.
+    Refinement is capped small so it does not over-suppress elite upside.
+    """
     proj = safe_float(p.get("projection") or p.get("K PROJ"), None)
     line = safe_float(p.get("line") or p.get("underdog_line") or p.get("Line"), None)
-    refined = safe_float(p.get("Refined Read"), proj)
-    side = _fb_side(p)
-    edge = None if refined is None or line is None else abs(refined - line)
+
+    # Small pitch-type/umpire read only. Never allow huge suppression.
+    pt_factor = safe_float(p.get("Pitch-Type Factor"), 1.0) or 1.0
+    ump_factor = safe_float(p.get("Advanced Umpire Factor"), 1.0) or 1.0
+    raw_factor = clamp(pt_factor * ump_factor, 0.970, 1.035)
+
+    if proj is not None:
+        refined_raw = proj * raw_factor
+        max_shift = 0.35
+        refined = proj + clamp(refined_raw - proj, -max_shift, max_shift)
+    else:
+        refined = None
+
+    # Direction comes from K PROJ, not from safety-suppressed reads.
+    if proj is None or line is None:
+        side = "NO LINE"
+    else:
+        side = "OVER" if proj > line else "UNDER"
+
+    edge = None if proj is None or line is None else abs(proj - line)
+
     conf = safe_float(p.get("fair_probability") or p.get("hit_rate") or p.get("Confidence %"), None)
     if conf is not None and conf <= 1:
         conf *= 100
@@ -7987,39 +8012,68 @@ def _fb_score_row(p):
     ump = str(p.get("Advanced Umpire Label") or "").upper()
     tier = str(p.get("action_tier") or p.get("Tier") or "").upper()
 
-    score = 50.0
-    if conf is not None:
-        score += clamp((conf - 55) * 0.55, -8, 20)
-    if edge is not None:
-        score += clamp(edge * 6.0, -4, 22)
+    exp_bf = safe_float(p.get("Exp BF") or p.get("expected_bf"), None)
+    ip_floor = safe_float(p.get("IP Floor") or p.get("ip_floor"), None)
+    volatility = safe_float(p.get("Volatility") or p.get("volatility"), None)
 
+    score = 50.0
+
+    # Raw edge + sim confidence drive the score.
+    if conf is not None:
+        score += clamp((conf - 55) * 0.45, -8, 18)
+    if edge is not None:
+        score += clamp(edge * 7.0, -4, 24)
+
+    # Risk layers modify confidence only.
     if safety == "SAFE":
-        score += 9
-    elif safety == "VOLATILE":
-        score -= 10
+        score += 8
     elif safety == "MODERATE":
         score += 2
+    elif safety == "VOLATILE":
+        score -= 7 if (edge is not None and edge >= 1.5) else 10
 
     if "CONFIRMED" in lineup or "TRUE" in lineup:
         score += 8
     elif "FALLBACK" in lineup or not lineup:
-        score -= 8
+        score -= 5 if (edge is not None and edge >= 1.25) else 8
     elif "PROJECTED" in lineup:
         score -= 3
 
     if "HIGH_ALERT" in alert:
-        score -= 14
+        score -= 12
     elif "MEDIUM_ALERT" in alert:
-        score -= 8
+        score -= 7
     elif "LOW_ALERT" in alert:
-        score -= 4
+        score -= 3
     elif "CLEAR" in alert:
         score += 4
+
+    # BF/leash realism: important, but not projection-destroying.
+    if exp_bf is not None:
+        if exp_bf >= 22:
+            score += 5
+        elif exp_bf < 16.5:
+            score -= 9
+        elif exp_bf < 18:
+            score -= 5
+
+    if ip_floor is not None:
+        if ip_floor >= 5:
+            score += 4
+        elif ip_floor < 3.6:
+            score -= 7
+
+    if volatility is not None:
+        if volatility >= 2.25:
+            score -= 5
+        elif volatility <= 1.55:
+            score += 3
 
     if "ARSENAL_EDGE" in arsenal:
         score += 5
     elif "ARSENAL_RISK" in arsenal:
         score -= 5
+
     if "UMP_K_BOOST" in ump:
         score += 2
     elif "UMP_K_DRAG" in ump:
@@ -8032,19 +8086,21 @@ def _fb_score_row(p):
     elif tier == "C":
         score -= 2
     elif "PASS" in tier:
-        score -= 8
+        score -= 4 if (edge is not None and edge >= 1.25) else 8
 
     if side == "NO LINE" or line is None:
         score = min(score, 30)
+
     score = int(clamp(round(score), 0, 100))
 
-    if score >= 82:
+    # Final labels: lineup confirmed earns true FINAL PLAY, otherwise strong raw edge is STRONG LEAN/MONITOR.
+    if score >= 84 and ("CONFIRMED" in lineup or "TRUE" in lineup):
         label = "🔥 FINAL PLAY"
         cls = "good-badge"
-    elif score >= 70:
+    elif score >= 78:
         label = "✅ STRONG LEAN"
         cls = "good-badge"
-    elif score >= 58:
+    elif score >= 64:
         label = "⚠️ MONITOR"
         cls = "yellow-badge"
     else:
@@ -8056,34 +8112,59 @@ def _fb_score_row(p):
         warnings.append("WAIT LINEUP")
     elif "CONFIRMED" in lineup or "TRUE" in lineup:
         positives.append("LINEUP LOCKED")
+
     if safety == "VOLATILE":
         warnings.append("VOLATILE")
     elif safety == "SAFE":
         positives.append("SAFE")
+
     if "HIGH_ALERT" in alert or "MEDIUM_ALERT" in alert:
         warnings.append(alert.replace("_", " "))
+    elif "CLEAR" in alert:
+        positives.append("CLEAR ALERT")
+
     if "ARSENAL_EDGE" in arsenal:
         positives.append("ARSENAL EDGE")
-    if "ARSENAL_RISK" in arsenal:
+    elif "ARSENAL_RISK" in arsenal:
         warnings.append("ARSENAL RISK")
+
     if "UMP_K_BOOST" in ump:
         positives.append("UMP BOOST")
+
     if edge is not None and edge >= 1.5:
-        positives.append("BIG EDGE")
-    if edge is not None and edge < 0.5:
+        positives.append("BIG RAW EDGE")
+    elif edge is not None and edge < 0.5:
         warnings.append("SMALL EDGE")
 
+    if exp_bf is not None and exp_bf < 18:
+        warnings.append("LOW BF")
+    elif exp_bf is not None and exp_bf >= 22:
+        positives.append("STRONG BF")
+
     return {
-        "Pitcher": p.get("pitcher"), "Matchup": p.get("matchup"), "Side": side,
-        "Line": line, "Projection": proj, "Refined": refined,
+        "Pitcher": p.get("pitcher"),
+        "Matchup": p.get("matchup"),
+        "Side": side,
+        "Line": line,
+        "Projection": None if proj is None else round(proj, 2),
+        "Refined": None if refined is None else round(refined, 2),
+        "Refined Shift": None if proj is None or refined is None else round(refined - proj, 2),
         "Edge": None if edge is None else round(edge, 2),
-        "Final Score": score, "Final Label": label, "Final Class": cls,
-        "Safety Tag": safety, "Lineup": lineup or "UNKNOWN",
-        "Pitch Alert": alert or "UNKNOWN", "Arsenal": arsenal or "UNKNOWN",
-        "Umpire": ump or "UNKNOWN", "Tier": tier,
+        "Final Score": score,
+        "Final Label": label,
+        "Final Class": cls,
+        "Safety Tag": safety,
+        "Lineup": lineup or "UNKNOWN",
+        "Pitch Alert": alert or "UNKNOWN",
+        "Arsenal": arsenal or "UNKNOWN",
+        "Umpire": ump or "UNKNOWN",
+        "Tier": tier,
+        "Exp BF": exp_bf,
+        "IP Floor": ip_floor,
         "Warnings": " | ".join(warnings) if warnings else "—",
         "Positives": " | ".join(positives) if positives else "—",
     }
+
 
 def build_final_board_rows(board):
     try:
@@ -8156,7 +8237,7 @@ def render_final_board_tab(board, dates=None):
     for r in rows[:10]:
         render_final_pick_card(r)
     st.markdown('<div class="section-title-pro">Final Board Table</div>', unsafe_allow_html=True)
-    keep = ["Pitcher","Matchup","Side","Line","Projection","Refined","Edge","Final Score","Final Label","Safety Tag","Lineup","Pitch Alert","Arsenal","Umpire","Warnings","Positives"]
+    keep = ["Pitcher","Matchup","Side","Line","Projection","Refined","Refined Shift","Edge","Final Score","Final Label","Safety Tag","Lineup","Pitch Alert","Arsenal","Umpire","Exp BF","IP Floor","Warnings","Positives"]
     st.dataframe(df[[c for c in keep if c in df.columns]], use_container_width=True, hide_index=True)
 
 
