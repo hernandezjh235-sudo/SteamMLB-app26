@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 # ============================================================
 # MLB STRIKEOUT PROP ENGINE — ONE FILE — v11.9
@@ -21,7 +22,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -6947,6 +6948,28 @@ def render_kproj_pitcher_card(p):
     else:
         st.caption("No confirmed batter-by-batter lineup yet. This tab will improve when lineups lock.")
 
+
+# =========================
+# UNIVERSAL K PROJ DISPLAY SYNC
+# Display-only helper. Matches K Upside tab exactly.
+# Does NOT change projection math, sims, probabilities, or decisions.
+# =========================
+def display_kproj_truth(p):
+    """Exact displayed K PROJ used by K Upside tab."""
+    try:
+        d = kproj_decision(p)
+        v = safe_float(d.get("projection"), None)
+        if v is not None:
+            return round(v, 2)
+    except Exception:
+        pass
+    for key in ["K PROJ", "k_proj", "kproj", "k_projection", "raw_k_proj", "base_k_proj", "upside_projection", "K_PROJ"]:
+        v = safe_float((p or {}).get(key), None)
+        if v is not None:
+            return round(v, 2)
+    return None if safe_float((p or {}).get("projection"), None) is None else round(safe_float((p or {}).get("projection")), 2)
+
+
 def build_kproj_table(board):
     rows = []
     for p in board or []:
@@ -7522,7 +7545,7 @@ def render_confirmed_lineup_lock_tab(board, dates=None):
         rows.append({
             "Pitcher": p.get("pitcher"),
             "Matchup": p.get("matchup"),
-            "K PROJ": p.get("projection"),
+            "K PROJ": display_kproj_truth(p),
             "Line": p.get("line") or p.get("underdog_line"),
             "Pick": p.get("model_lean") or p.get("lean_side") or p.get("Decision"),
             "Tier": p.get("action_tier") or p.get("Tier"),
@@ -7769,7 +7792,7 @@ def render_safe_volatile_tab(board, dates=None):
         rows.append({
             "Pitcher": p.get("pitcher"),
             "Matchup": p.get("matchup"),
-            "K PROJ": p.get("projection"),
+            "K PROJ": display_kproj_truth(p),
             "Line": p.get("line") or p.get("underdog_line"),
             "Pick": p.get("model_lean") or p.get("Decision"),
             "Tier": p.get("action_tier") or p.get("Tier"),
@@ -8243,7 +8266,7 @@ def render_pitchtype_umpire_refinement_tab(board, dates=None):
         rows.append({
             "Pitcher": p.get("pitcher"),
             "Matchup": p.get("matchup"),
-            "K PROJ": p.get("projection"),
+            "K PROJ": display_kproj_truth(p),
             "Refined Read": p.get("Refined Read"),
             "Refined Shift": p.get("Refined Shift"),
             "Line": p.get("line") or p.get("underdog_line"),
@@ -8502,8 +8525,7 @@ def build_true_kproj_lookup(board):
 
         k_val = None
         try:
-            d = kproj_decision(r)
-            k_val = safe_float(d.get("projection"), None)
+            k_val = display_kproj_truth(r)
         except Exception:
             k_val = None
 
@@ -8542,8 +8564,7 @@ def final_board_true_kproj(p, true_lookup=None):
 
     # Direct fallback must match K Upside.
     try:
-        d = kproj_decision(p)
-        v = safe_float(d.get("projection"), None)
+        v = display_kproj_truth(p)
         if v is not None:
             return v
     except Exception:
