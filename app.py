@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -8481,11 +8481,15 @@ def _fb_norm_matchup(x):
     return str(x or "").upper().replace(" ", "").strip()
 
 def build_true_kproj_lookup(board):
-    """Map pitcher+matchup and pitcher name to the exact K Upside K PROJ.
+    """Map pitcher+matchup to the exact K Upside K PROJ.
 
-    The K Upside tab uses the row field that may display as 'K PROJ'.
-    Some internal Final Board layers use adjusted/risk projection fields.
-    This lookup forces Final Board Raw K PROJ to use the original K Upside value.
+    IMPORTANT:
+    K Upside table displays:
+        d = kproj_decision(p)
+        K PROJ = d["projection"]
+
+    So this lookup calls kproj_decision(p) directly instead of using p["projection"],
+    because p["projection"] can be the main/risk adjusted projection.
     """
     lookup = {}
     for r in board or []:
@@ -8493,24 +8497,34 @@ def build_true_kproj_lookup(board):
             continue
         pitcher = r.get("pitcher") or r.get("Pitcher")
         matchup = r.get("matchup") or r.get("Matchup")
-        # Prefer explicit K PROJ/upside fields; avoid generic 'projection' unless no other source exists.
+        if not pitcher:
+            continue
+
         k_val = None
-        for key in ["K PROJ", "k_proj", "kproj", "k_projection", "raw_k_proj", "base_k_proj", "upside_projection", "K_PROJ"]:
-            v = safe_float(r.get(key), None)
-            if v is not None:
-                k_val = v
-                break
+        try:
+            d = kproj_decision(r)
+            k_val = safe_float(d.get("projection"), None)
+        except Exception:
+            k_val = None
+
+        # Fallbacks only if kproj_decision is unavailable.
         if k_val is None:
-            # In the main board, 'projection' may be the K Upside projection before Final Board adjustment.
-            # Use only as fallback.
-            k_val = safe_float(r.get("projection"), None)
-        if pitcher and k_val is not None:
-            name_key = _fb_norm_key_name(pitcher)
-            matchup_key = _fb_norm_matchup(matchup)
-            lookup[("name", name_key)] = k_val
-            if matchup_key:
-                lookup[("name_matchup", name_key, matchup_key)] = k_val
+            for key in ["K PROJ", "k_proj", "kproj", "k_projection", "raw_k_proj", "base_k_proj", "upside_projection", "K_PROJ"]:
+                v = safe_float(r.get(key), None)
+                if v is not None:
+                    k_val = v
+                    break
+
+        if k_val is None:
+            continue
+
+        name_key = _fb_norm_key_name(pitcher)
+        matchup_key = _fb_norm_matchup(matchup)
+        lookup[("name", name_key)] = k_val
+        if matchup_key:
+            lookup[("name_matchup", name_key, matchup_key)] = k_val
     return lookup
+
 
 def final_board_true_kproj(p, true_lookup=None):
     """Return exact K Upside projection for this pitcher when available."""
@@ -8526,22 +8540,32 @@ def final_board_true_kproj(p, true_lookup=None):
         if ("name", name_key) in true_lookup:
             return true_lookup[("name", name_key)]
 
-    # Fallback priority: explicit K fields only before generic projection.
+    # Direct fallback must match K Upside.
+    try:
+        d = kproj_decision(p)
+        v = safe_float(d.get("projection"), None)
+        if v is not None:
+            return v
+    except Exception:
+        pass
+
     for key in ["K PROJ", "k_proj", "kproj", "k_projection", "raw_k_proj", "base_k_proj", "upside_projection", "K_PROJ"]:
         v = safe_float(p.get(key), None)
         if v is not None:
             return v
+
     return safe_float(p.get("projection"), None)
 
 
 def _fb_score_row(p, board=None, true_k_lookup=None):
-    """Balanced Final Board scorer.
+    """Final Board scorer.
 
-    K PROJ remains the projection truth.
-    Final Board adjusts confidence/trust, not raw projection direction.
-    Refinement is capped small so it does not over-suppress elite upside.
+    Raw K PROJ is forced to match K Upside:
+        kproj_decision(p)["projection"]
+
+    Risk Read can still use the main/risk projection path.
     """
-    risk_proj = safe_float(p.get("projection") or p.get("K PROJ"), None)
+    risk_proj = safe_float(p.get("projection"), None)
     raw_kproj = final_board_true_kproj(p, true_k_lookup)
     proj = raw_kproj if raw_kproj is not None else risk_proj
     line = safe_float(p.get("line") or p.get("underdog_line") or p.get("Line"), None)
@@ -8551,8 +8575,8 @@ def _fb_score_row(p, board=None, true_k_lookup=None):
     ump_factor = safe_float(p.get("Advanced Umpire Factor"), 1.0) or 1.0
     raw_factor = clamp(pt_factor * ump_factor, 0.970, 1.035)
 
-    # Risk Read starts from the risk-adjusted projection source when available.
-    # Raw K PROJ remains the true K Upside projection.
+    # Risk Read starts from the main/risk projection source when available.
+    # Raw K PROJ remains the exact K Upside projection.
     risk_base = risk_proj if risk_proj is not None else proj
     if risk_base is not None:
         refined_raw = risk_base * raw_factor
@@ -8754,7 +8778,9 @@ def _fb_score_row(p, board=None, true_k_lookup=None):
 
 
 def build_final_board_rows(board):
+    # Build lookup from original K Upside board BEFORE any overlays mutate board.
     true_k_lookup = build_true_kproj_lookup(board)
+
     try:
         if "apply_elite_safety_overlays_to_board" in globals():
             board = apply_elite_safety_overlays_to_board(board)
@@ -8764,9 +8790,15 @@ def build_final_board_rows(board):
             board = apply_elite_refinement_overlays(board)
     except Exception:
         pass
-    rows = [_fb_score_row(p, board, true_k_lookup) for p in (board or []) if isinstance(p, dict) and p.get("pitcher")]
+
+    rows = [
+        _fb_score_row(p, board, true_k_lookup)
+        for p in (board or [])
+        if isinstance(p, dict) and p.get("pitcher")
+    ]
     rows.sort(key=lambda r: (r.get("Final Score") or 0, r.get("Edge") or 0), reverse=True)
     return rows
+
 
 def render_final_pick_card(r):
     score = safe_float(r.get("Final Score"), 0) or 0
