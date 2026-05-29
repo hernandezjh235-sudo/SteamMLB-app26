@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + MOBILE CLEAN K UI"
+APP_VERSION = "NO_TOP_PLAYS_BUILD | " +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -225,146 +225,6 @@ OPTICODDS_API_KEY = get_secret("OPTICODDS_API_KEY", "")
 # =========================
 # PAGE CONFIG + UI
 # =========================
-
-# =========================
-# MOBILE CLEAN K UPSIDE UI
-# UI-only CSS. Does NOT touch projections, simulations, picks, lines, or Final Board math.
-# =========================
-def inject_mobile_clean_k_ui():
-    st.markdown("""
-    <style>
-    /* Mobile-first cleanup for K Upside / player cards */
-    @media (max-width: 760px) {
-        .block-container {
-            padding-left: 0.55rem !important;
-            padding-right: 0.55rem !important;
-            max-width: 100% !important;
-        }
-
-        /* Main card: no sideways overflow */
-        .pick-card,
-        .hero-panel,
-        div[data-testid="stVerticalBlock"] > div {
-            max-width: 100% !important;
-            overflow-x: hidden !important;
-        }
-
-        /* Player card internal layout */
-        .pick-card {
-            padding: 18px 16px !important;
-            border-radius: 22px !important;
-        }
-
-        .player-name {
-            font-size: 30px !important;
-            line-height: 1.05 !important;
-            word-break: normal !important;
-            overflow-wrap: anywhere !important;
-        }
-
-        .small-muted {
-            font-size: 14px !important;
-            line-height: 1.25 !important;
-        }
-
-        .big-number {
-            font-size: 42px !important;
-            line-height: 1.0 !important;
-        }
-
-        .badge {
-            font-size: 14px !important;
-            padding: 8px 11px !important;
-            border-radius: 999px !important;
-            white-space: normal !important;
-        }
-
-        /* KPI strips become readable 2-column cards */
-        .kpi-strip {
-            display: grid !important;
-            grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
-            gap: 10px !important;
-            width: 100% !important;
-        }
-
-        .kpi-box {
-            min-width: 0 !important;
-            padding: 12px 10px !important;
-            border-radius: 16px !important;
-            overflow-wrap: anywhere !important;
-            word-break: normal !important;
-            text-align: center !important;
-        }
-
-        .kpi-label {
-            font-size: 11px !important;
-            letter-spacing: .04em !important;
-            line-height: 1.15 !important;
-            white-space: normal !important;
-        }
-
-        .kpi-value {
-            font-size: 28px !important;
-            line-height: 1.05 !important;
-            white-space: normal !important;
-        }
-
-        .kpi-sub {
-            font-size: 12px !important;
-            line-height: 1.2 !important;
-            white-space: normal !important;
-        }
-
-        /* Prevent skinny unreadable stat columns */
-        [class*="metric"],
-        div[data-testid="stMetric"] {
-            min-width: 0 !important;
-            overflow-wrap: anywhere !important;
-        }
-
-        div[data-testid="stMetricValue"] {
-            font-size: 28px !important;
-            line-height: 1.05 !important;
-        }
-
-        div[data-testid="stMetricLabel"] {
-            font-size: 13px !important;
-            white-space: normal !important;
-        }
-
-        /* Tables still scroll horizontally instead of squeezing text */
-        div[data-testid="stDataFrame"] {
-            overflow-x: auto !important;
-        }
-
-        /* Make columns stack better on phone */
-        div[data-testid="column"] {
-            min-width: 0 !important;
-        }
-    }
-
-    /* Extra tiny phone width */
-    @media (max-width: 430px) {
-        .kpi-strip {
-            grid-template-columns: 1fr 1fr !important;
-        }
-        .player-name {
-            font-size: 28px !important;
-        }
-        .big-number {
-            font-size: 38px !important;
-        }
-        .kpi-value {
-            font-size: 25px !important;
-        }
-        .pick-card {
-            padding: 16px 13px !important;
-        }
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-
 st.set_page_config(
     page_title="MLB K Prop Engine — Refresh Then Save",
     layout="wide",
@@ -5708,7 +5568,6 @@ def display_clean_real_prop_rows(rows, **kwargs):
 
 
 # =========================
-# v11.11 BEST 4 BUILDER / HIT-RATE RANKER
 # =========================
 def _best4_num(x, default=0.0):
     v = safe_float(x, default)
@@ -5866,7 +5725,6 @@ def build_best4_table(board):
     return safe_top4, aggressive, df
 
 def render_best4_builder(board):
-    st.markdown('<div class="section-title-pro">Best 4 Builder / Top Hit-Rate Picks</div>', unsafe_allow_html=True)
     st.caption("Display-only ranker. It does not change projections, EV, calibration, or saved official snapshots.")
     top4_safe, aggressive_top4, ranked_all = build_best4_table(board)
 
@@ -8235,7 +8093,129 @@ def _fb_side(p):
     return "OVER" if proj > line else "UNDER"
 
 
-def _fb_score_row(p):
+
+# =========================
+# FINAL BOARD ML CONTEXT LAYER
+# Light confidence-only layer.
+# DOES NOT change K PROJ, simulations, or OVER/UNDER direction.
+# Uses Moneyline context only to slightly adjust Final Board trust.
+# =========================
+ML_CONTEXT_ENABLED = True
+ML_CONTEXT_MAX_SCORE_SWING = 5
+
+def _ml_context_pitcher_team(p):
+    """Best-effort pitcher team from matchup and home/away fields."""
+    p = p or {}
+    matchup = str(p.get("matchup") or p.get("Matchup") or "")
+    away, home = ("", "")
+    if "@" in matchup:
+        away, home = [x.strip().upper() for x in matchup.split("@", 1)]
+
+    team = str(
+        p.get("team") or p.get("Team") or p.get("pitcher_team") or
+        p.get("player_team") or p.get("abbr") or ""
+    ).upper().strip()
+
+    if team:
+        return team
+    # fallback: if the row has home_away marker
+    ha = str(p.get("home_away") or p.get("Home/Away") or "").upper()
+    if "HOME" in ha:
+        return home
+    if "AWAY" in ha:
+        return away
+    return ""
+
+def _ml_context_lookup(board, matchup):
+    """Find moneyline row for same matchup from ml_build_board, safely."""
+    try:
+        df = ml_build_board(board)
+        if df is None or df.empty:
+            return None
+        m = str(matchup or "").upper().replace(" ", "")
+        for _, r in df.iterrows():
+            rm = str(r.get("Matchup", "")).upper().replace(" ", "")
+            if rm == m:
+                return r.to_dict()
+    except Exception:
+        return None
+    return None
+
+def final_board_ml_context(p, board=None):
+    """Return light ML context fields for Final Board scoring only."""
+    if not ML_CONTEXT_ENABLED:
+        return {"ML Context": "OFF", "ML Context Score": 0, "ML Context Note": "Off"}
+
+    p = p or {}
+    matchup = p.get("matchup") or p.get("Matchup")
+    ml = _ml_context_lookup(board, matchup) if board is not None else None
+    if not ml:
+        return {
+            "ML Context": "UNKNOWN",
+            "ML Context Score": 0,
+            "ML Context Note": "No ML row matched",
+        }
+
+    pitcher_team = _ml_context_pitcher_team(p)
+    ml_pick = str(ml.get("Pick") or "").upper().strip()
+    edge = safe_float(ml.get("ML Edge %"), 0) or 0
+    grade = str(ml.get("ML Grade") or "")
+    status = str(ml.get("Status") or "")
+
+    # Small, confidence-only context.
+    score = 0
+    label = "NEUTRAL"
+    note_parts = []
+
+    if pitcher_team and ml_pick:
+        if pitcher_team == ml_pick:
+            if edge >= 8:
+                score += 5
+                label = "FAVORABLE"
+                note_parts.append("ML supports pitcher team strongly")
+            elif edge >= 4:
+                score += 3
+                label = "FAVORABLE"
+                note_parts.append("ML supports pitcher team")
+            elif edge >= 2:
+                score += 1
+                label = "SLIGHT_SUPPORT"
+                note_parts.append("Small ML support")
+        else:
+            if edge >= 8:
+                score -= 5
+                label = "GAME_SCRIPT_RISK"
+                note_parts.append("ML strongly against pitcher team")
+            elif edge >= 4:
+                score -= 3
+                label = "RISK"
+                note_parts.append("ML against pitcher team")
+            elif edge >= 2:
+                score -= 1
+                label = "SLIGHT_RISK"
+                note_parts.append("Small ML risk")
+    else:
+        note_parts.append("Pitcher team unknown")
+
+    # If ML is model-only, slightly reduce influence.
+    if "MODEL ONLY" in status.upper() or "MODEL ONLY" in grade.upper():
+        score = int(round(score * 0.7))
+        note_parts.append("model-only ML")
+
+    score = int(clamp(score, -ML_CONTEXT_MAX_SCORE_SWING, ML_CONTEXT_MAX_SCORE_SWING))
+    if score == 0 and label not in ["FAVORABLE", "RISK", "GAME_SCRIPT_RISK"]:
+        label = "NEUTRAL"
+
+    return {
+        "ML Context": label,
+        "ML Context Score": score,
+        "ML Context Note": " | ".join(note_parts) if note_parts else "Neutral ML context",
+        "ML Context Pick": ml_pick,
+        "ML Context Edge": edge,
+    }
+
+
+def _fb_score_row(p, board=None):
     """Balanced Final Board scorer.
 
     K PROJ remains the projection truth.
@@ -8275,6 +8255,11 @@ def _fb_score_row(p):
     arsenal = str(p.get("Pitch-Type Label") or "").upper()
     ump = str(p.get("Advanced Umpire Label") or "").upper()
     tier = str(p.get("action_tier") or p.get("Tier") or "").upper()
+
+    ml_ctx = final_board_ml_context(p, board)
+    ml_context_label = ml_ctx.get("ML Context", "UNKNOWN")
+    ml_context_score = safe_float(ml_ctx.get("ML Context Score"), 0) or 0
+    ml_context_note = ml_ctx.get("ML Context Note", "")
 
     exp_bf = safe_float(p.get("Exp BF") or p.get("expected_bf"), None)
     ip_floor = safe_float(p.get("IP Floor") or p.get("ip_floor"), None)
@@ -8343,6 +8328,9 @@ def _fb_score_row(p):
     elif "UMP_K_DRAG" in ump:
         score -= 2
 
+    # ML context is confidence-only and capped very lightly.
+    score += clamp(ml_context_score, -ML_CONTEXT_MAX_SCORE_SWING, ML_CONTEXT_MAX_SCORE_SWING)
+
     if tier == "A":
         score += 5
     elif tier == "B":
@@ -8394,6 +8382,10 @@ def _fb_score_row(p):
 
     if "UMP_K_BOOST" in ump:
         positives.append("UMP BOOST")
+    if ml_context_score >= 3:
+        positives.append("ML SUPPORT")
+    elif ml_context_score <= -3:
+        warnings.append("ML SCRIPT RISK")
 
     if edge is not None and edge >= 1.5:
         positives.append("BIG RAW EDGE")
@@ -8425,6 +8417,11 @@ def _fb_score_row(p):
         "Tier": tier,
         "Exp BF": exp_bf,
         "IP Floor": ip_floor,
+        "ML Context": ml_context_label,
+        "ML Context Score": ml_context_score,
+        "ML Context Note": ml_context_note,
+        "ML Context Pick": ml_ctx.get("ML Context Pick"),
+        "ML Context Edge": ml_ctx.get("ML Context Edge"),
         "Warnings": " | ".join(warnings) if warnings else "—",
         "Positives": " | ".join(positives) if positives else "—",
     }
@@ -8440,7 +8437,7 @@ def build_final_board_rows(board):
             board = apply_elite_refinement_overlays(board)
     except Exception:
         pass
-    rows = [_fb_score_row(p) for p in (board or []) if isinstance(p, dict) and p.get("pitcher")]
+    rows = [_fb_score_row(p, board) for p in (board or []) if isinstance(p, dict) and p.get("pitcher")]
     rows.sort(key=lambda r: (r.get("Final Score") or 0, r.get("Edge") or 0), reverse=True)
     return rows
 
@@ -8477,6 +8474,7 @@ def render_final_pick_card(r):
         <span class="badge">{html.escape(str(r.get("Pitch Alert","—")))}</span>
         <span class="badge">{html.escape(str(r.get("Arsenal","—")))}</span>
         <span class="badge">{html.escape(str(r.get("Umpire","—")))}</span>
+        <span class="badge">ML Context: {html.escape(str(r.get("ML Context","—")))}</span>
       </div>
       <div class="hr-soft"></div>
       <div><b>Positives:</b> {html.escape(str(r.get("Positives","—")))}</div>
@@ -8501,7 +8499,7 @@ def render_final_board_tab(board, dates=None):
     for r in rows[:10]:
         render_final_pick_card(r)
     st.markdown('<div class="section-title-pro">Final Board Table</div>', unsafe_allow_html=True)
-    keep = ["Pitcher","Matchup","Side","Line","Projection","Refined","Refined Shift","Edge","Final Score","Final Label","Safety Tag","Lineup","Pitch Alert","Arsenal","Umpire","Exp BF","IP Floor","Warnings","Positives"]
+    keep = ["Pitcher","Matchup","Side","Line","Projection","Refined","Refined Shift","Edge","Final Score","Final Label","Safety Tag","Lineup","Pitch Alert","Arsenal","Umpire","ML Context","ML Context Score","ML Context Pick","ML Context Edge","Exp BF","IP Floor","Warnings","Positives"]
     st.dataframe(df[[c for c in keep if c in df.columns]], use_container_width=True, hide_index=True)
 
 
@@ -8514,8 +8512,6 @@ tab_kproj, tab_final_board, tab_moneyline_edge, tab_lineup_lock, tab_results_das
     "AUTO RESULTS",
     "SAFE/VOLATILE",
     "PITCH TYPE / UMP",
-    "TOP PLAYS",
-    "BEST 4 BUILDER",
     "ALL PLAYERS",
     "REAL PROP BOARD",
     "STATCAST",
@@ -8548,7 +8544,6 @@ with tab_pitch_ump:
     render_pitchtype_umpire_refinement_tab(board, dates)
 
 with tab1:
-    st.markdown('<div class="section-title-pro">Top Plays</div>', unsafe_allow_html=True)
     if not board:
         st.info("Click 🔄 Refresh Live Board first.")
     else:
