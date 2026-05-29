@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -8731,21 +8731,20 @@ def render_final_board_tab(board, dates=None):
     keep = ["Pitcher","Matchup","Side","Line","Projection","Refined","Refined Shift","Edge","Final Score","Final Label","Safety Tag","Lineup","Pitch Alert","Arsenal","Umpire","ML Context","ML Context Score","ML Context Pick","ML Context Edge","Exp BF","IP Floor","Warnings","Positives"]
     st.dataframe(df[[c for c in keep if c in df.columns]], use_container_width=True, hide_index=True)
 
-
-tab_kproj, tab_final_board, tab_moneyline_edge, tab_lineup_lock, tab_results_dash, tab_auto_results, tab_safe_vol, tab_pitch_ump, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "K PROJ / UPSIDE",
-    "FINAL BOARD",
-    "MONEYLINE EDGE",
-    "LINEUP LOCK",
-    "RESULTS DASHBOARD",
-    "AUTO RESULTS",
-    "SAFE/VOLATILE",
-    "PITCH TYPE / UMP",
-    "ALL PLAYERS",
-    "REAL PROP BOARD",
-    "STATCAST",
-    "AFTER GAMES / LEARNING",
-    "SETTINGS"
+tab_kproj, tab_final_board, tab_moneyline_edge, tab_lineup_lock, tab_results_dash, tab_auto_results, tab_safe_vol, tab_pitch_ump, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    'K PROJ / UPSIDE',
+    'FINAL BOARD',
+    'MONEYLINE EDGE',
+    'LINEUP LOCK',
+    'RESULTS DASH',
+    'AUTO RESULTS',
+    'SAFE/VOLATILE',
+    'PITCH TYPE / UMP',
+    'ALL PITCHERS',
+    'OFFICIAL SAVE / GRADE',
+    'CALIBRATION',
+    'SOURCE LOG',
+    'SETTINGS'
 ])
 
 with tab_kproj:
@@ -8772,202 +8771,3 @@ with tab_safe_vol:
 with tab_pitch_ump:
     render_pitchtype_umpire_refinement_tab(board, dates)
 
-with tab1:
-    if not board:
-        st.info("Click 🔄 Refresh Live Board first.")
-    else:
-        top = sorted(
-            board,
-            key=lambda x: (
-                x.get("signal_type") == "good",
-                x.get("ev") if x.get("ev") is not None else -999,
-                x.get("fair_probability") if x.get("fair_probability") is not None else 0
-            ),
-            reverse=True
-        )
-        for p in top:
-            render_pick_card(p)
-
-with tab_best4:
-    render_best4_builder(board)
-
-with tab2:
-    st.markdown('<div class="section-title-pro">All Players</div>', unsafe_allow_html=True)
-    if board:
-        show = pd.DataFrame([{k: v for k, v in p.items() if k not in ["prop_rows", "lineup_rows", "pitch_type_rows"]} for p in board])
-        cols = [
-            "date", "pitcher", "matchup", "hand", "projection", "line", "pick_side", "bet_action", "action_tier",
-            "fair_probability", "edge_ks", "ev", "price_source", "price_is_real", "signal", "risk_label",
-            "line_source", "projection_source", "lineup_status", "bullpen_status", "bullpen_bf_factor", "bullpen_recent_pitches", "bullpen_recent_ip", "bullpen_back_to_back_relievers", "underdog_line", "underdog_status", "underdog_message", "data_score", "lineup_locked", "pitcher_confirmed",
-            "statcast_available", "pitch_type_matchup_available", "pitch_type_factor", "bayesian_markov_enabled", "xgboost_active", "xgboost_samples", "xgboost_adjustment", "bettable", "leash_risk"
-        ]
-        cols = [c for c in cols if c in show.columns]
-        st.dataframe(show[cols], use_container_width=True, hide_index=True)
-    else:
-        st.info("No players loaded.")
-
-with tab3:
-    st.markdown('<div class="section-title-pro">Real Prop Rows + Underdog Debug</div>', unsafe_allow_html=True)
-    rows = []
-    for p in board:
-        for r in p.get("prop_rows", []):
-            rr = dict(r)
-            rr["Pitcher"] = p.get("pitcher")
-            rr["Projection"] = p.get("projection")
-            rr["Data Score"] = p.get("data_score")
-            rows.append(rr)
-    rows = clean_real_prop_debug_rows(rows)
-    if rows:
-        df_rows = pd.DataFrame(rows)
-        preferred = [c for c in ["Pitcher", "Source", "Parser Mode", "Matched Name", "Line", "Market", "Line Evidence", "Underdog Path", "Match Score", "Reject Reason", "Projection", "Model Lean", "Model Prob %"] if c in df_rows.columns]
-        other = [c for c in df_rows.columns if c not in preferred]
-        st.dataframe(df_rows[preferred + other], use_container_width=True, hide_index=True)
-    else:
-        st.warning("No valid MLB pitcher strikeout prop rows found. Rejected NBA/basketball rows are hidden.")
-
-with tab4:
-    st.markdown('<div class="section-title-pro">Statcast + Pitch-Type</div>', unsafe_allow_html=True)
-    if board:
-        stat_rows = []
-        pitch_rows = []
-        batter_pitch_rows = []
-        lineup_rows = []
-        for p in board:
-            stat_rows.append({
-                "Pitcher": p.get("pitcher"),
-                "Statcast Available": p.get("statcast_available"),
-                "Statcast Rows": p.get("statcast_rows"),
-                "CSW%": p.get("statcast_csw"),
-                "Whiff%": p.get("statcast_whiff"),
-                "Pitch-Type Available": p.get("pitch_type_matchup_available"),
-                "Pitch-Type Factor": p.get("pitch_type_factor"),
-                "Pitch-Type Note": p.get("pitch_type_note"),
-                "Weather Factor": p.get("weather_factor"),
-                "Weather Note": p.get("weather_note"),
-                "Density Altitude Factor": p.get("density_altitude_factor"),
-                "Manager Hook": p.get("manager_hook_status"),
-                "Manager Hook Note": p.get("manager_hook_note"),
-                "Umpire": p.get("umpire"),
-                "Umpire Factor": p.get("ump_factor"),
-                "Umpire Note": p.get("umpire_note"),
-                "Environment Factor": p.get("environment_factor"),
-            })
-            for r in p.get("pitch_type_rows", []):
-                rr = dict(r)
-                rr["Pitcher"] = p.get("pitcher")
-                pitch_rows.append(rr)
-            for r in p.get("batter_pitch_profile_rows", []):
-                rr = dict(r)
-                rr["Pitcher"] = p.get("pitcher")
-                rr["Matchup"] = p.get("matchup")
-                batter_pitch_rows.append(rr)
-            for r in p.get("lineup_rows", []):
-                rr = dict(r)
-                rr["Pitcher"] = p.get("pitcher")
-                rr["Matchup"] = p.get("matchup")
-                lineup_rows.append(rr)
-        st.subheader("Pitcher Statcast Summary")
-        st.dataframe(pd.DataFrame(stat_rows), use_container_width=True, hide_index=True)
-        st.subheader("Pitch-Type Rows")
-        if pitch_rows:
-            st.dataframe(pd.DataFrame(pitch_rows), use_container_width=True, hide_index=True)
-        else:
-            st.info("No pitch-type rows loaded yet.")
-        st.subheader("Per-Batter Pitch-Type Profile")
-        if batter_pitch_rows:
-            st.dataframe(pd.DataFrame(batter_pitch_rows), use_container_width=True, hide_index=True)
-        else:
-            st.info("No per-batter pitch-type rows loaded yet.")
-        st.subheader("Lineup Batter K Inputs")
-        if lineup_rows:
-            st.dataframe(pd.DataFrame(lineup_rows), use_container_width=True, hide_index=True)
-        else:
-            st.info("No posted lineup rows loaded yet.")
-    else:
-        st.info("Load the board first.")
-
-with tab5:
-    st.markdown('<div class="section-title-pro">After Games — Grade + Learn</div>', unsafe_allow_html=True)
-    if st.button("✅ AFTER GAMES — Grade Results + Update Learning", use_container_width=True):
-        graded = grade_finished_games()
-        st.success(f"Graded {graded} finished official snapshots and updated learning.")
-    results = load_json(RESULT_LOG, [])
-    if results:
-        df = pd.DataFrame(results)
-        finished = df[df["graded_result"].isin(["WIN", "LOSS"])] if "graded_result" in df.columns else pd.DataFrame()
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Total Graded", len(finished))
-        if not finished.empty:
-            c2.metric("Win Rate", f"{(finished['graded_result'].eq('WIN').mean()*100):.1f}%")
-            c3.metric("Avg EV", f"{(finished['ev'].dropna().mean()*100 if 'ev' in finished.columns and not finished['ev'].dropna().empty else 0):.2f}%")
-            c4.metric("Avg Edge", f"{(finished['abs_edge'].dropna().mean() if 'abs_edge' in finished.columns and not finished['abs_edge'].dropna().empty else 0):.2f}")
-            cal = build_model_calibration_profile(results)
-            c5.metric("Calibration", f"{cal.get('quality_score', 0)}/100")
-        else:
-            c2.metric("Win Rate", "N/A")
-            c3.metric("Avg EV", "N/A")
-            c4.metric("Avg Edge", "N/A")
-            c5.metric("Calibration", "N/A")
-        st.dataframe(df.tail(200), use_container_width=True)
-        st.markdown('<div class="section-title-pro">Signal Tracking</div>', unsafe_allow_html=True)
-        sig = build_signal_tracking()
-        if not sig.empty:
-            st.dataframe(sig, use_container_width=True, hide_index=True)
-        else:
-            st.info("Signal tracking starts after graded wins/losses.")
-    else:
-        st.info("No graded history yet. Save official snapshots before games, then grade after games finish.")
-
-with tab6:
-    st.markdown('<div class="section-title-pro">Settings / Saved Files</div>', unsafe_allow_html=True)
-    st.code(STORAGE_DIR)
-    st.write("Pick Log:")
-    st.code(PICK_LOG)
-    st.write("Result Log:")
-    st.code(RESULT_LOG)
-    st.write("Learning File:")
-    st.code(LEARN_FILE)
-    st.write("CLV File:")
-    st.code(CLV_FILE)
-    st.write("Long Backtest File:")
-    st.code(LONG_BACKTEST_FILE)
-    st.subheader("Advanced Model Status")
-    xgb_train_df = build_xgb_training_frame()
-    st.write(f"XGBoost training samples available: {len(xgb_train_df)} / {XGB_MIN_GRADED_SAMPLES} needed")
-    st.caption("XGBoost is a capped residual assist only. It never overrides Underdog lines or no-bet gates.")
-    st.subheader("Source Status")
-    if board:
-        src_rows = []
-        for p in board:
-            rr = {"Pitcher": p.get("pitcher")}
-            rr.update(p.get("source_status", {}))
-            src_rows.append(rr)
-        st.dataframe(pd.DataFrame(src_rows), use_container_width=True, hide_index=True)
-    req = load_json(REQUEST_LOG_FILE, [])
-    if req:
-        st.subheader("Recent Source Requests / Errors")
-        st.dataframe(pd.DataFrame(req).tail(75), use_container_width=True)
-    col_a, col_b, col_c = st.columns(3)
-    with col_a:
-        if st.button("Clear Current Date-Range Official Snapshots"):
-            picks = load_json(PICK_LOG, [])
-            picks = [p for p in picks if p.get("date") not in dates]
-            save_json(PICK_LOG, picks)
-            st.warning("Cleared current date-range official snapshots.")
-    with col_b:
-        if st.button("Clear Request Logs"):
-            save_json(REQUEST_LOG_FILE, [])
-            st.warning("Request logs cleared.")
-    with col_c:
-        if st.button("Clear ALL Logs"):
-            save_json(PICK_LOG, [])
-            save_json(RESULT_LOG, [])
-            save_json(LEARN_FILE, {})
-            save_json(CLV_FILE, {})
-            save_json(SIGNAL_TRACKING_FILE, [])
-            save_json(LONG_BACKTEST_FILE, [])
-            save_json(LINE_HISTORY_FILE, {})
-            save_json(LINEUP_CACHE_FILE, {})
-            st.error("All logs cleared.")
-
-st.caption("Workflow: Refresh live board -> inspect lines -> save official before-game snapshot -> after games, grade and learn.")
