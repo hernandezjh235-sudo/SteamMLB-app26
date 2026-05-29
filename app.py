@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 # ============================================================
 # MLB STRIKEOUT PROP ENGINE — ONE FILE — v11.9
@@ -22,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -8882,6 +8881,161 @@ def render_final_board_tab(board, dates=None):
     keep = ["Pitcher","Matchup","Side","Line","Raw K PROJ","Risk Read","Refined Shift","Edge","Final Score","Final Label","Safety Tag","Lineup","Pitch Alert","Arsenal","Umpire","ML Context","ML Context Score","ML Context Pick","ML Context Edge","Exp BF","IP Floor","Warnings","Positives"]
     st.dataframe(df[[c for c in keep if c in df.columns]], use_container_width=True, hide_index=True)
 
+
+# =========================
+# VISIBLE LOWER TABS RESTORE
+# UI-only render helpers for ALL PITCHERS / SAVE-GRADE / CALIBRATION / SOURCE LOG / SETTINGS.
+# Does NOT touch K projections, Final Board math, ML, or grading logic.
+# =========================
+def _safe_df(obj):
+    try:
+        return pd.DataFrame(obj or [])
+    except Exception:
+        return pd.DataFrame()
+
+def render_all_pitchers_visible_tab(board, dates=None):
+    st.markdown("### 📋 All Pitchers")
+    st.caption("Full current board. Display-only.")
+    df = _safe_df(board)
+    if df.empty:
+        st.info("No pitcher board loaded yet. Refresh the live board first.")
+        return
+    preferred = [
+        "pitcher","matchup","projection","line","bet_action","decision","data_score",
+        "pitcher_k","opp_k","expected_bf","lineup_status","Safety Tag","Pitch Alert",
+        "Pitch-Type Label","Advanced Umpire Label"
+    ]
+    cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
+    st.dataframe(df[cols], use_container_width=True, hide_index=True)
+
+def render_official_save_grade_visible_tab(board, dates=None):
+    st.markdown("### 💾 Official Save / Grade")
+    st.caption("Save before-game snapshots and review saved/graded picks.")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("💾 Save current board snapshot", use_container_width=True):
+            try:
+                picks = []
+                for p in board or []:
+                    if not isinstance(p, dict):
+                        continue
+                    d = {}
+                    try:
+                        d = kproj_decision(p)
+                    except Exception:
+                        d = {}
+                    row = dict(p)
+                    row["pick_id"] = row.get("pick_id") or f"{row.get('game_pk','NA')}_{row.get('pitcher_id', row.get('pitcher',''))}_{row.get('line', row.get('underdog_line',''))}_{row.get('pick_side', d.get('lean_side',''))}"
+                    row["k_proj_snapshot"] = d.get("projection", row.get("projection"))
+                    row["line"] = d.get("line", row.get("line", row.get("underdog_line")))
+                    row["pick_side"] = d.get("lean_side", row.get("pick_side"))
+                    row["decision"] = d.get("decision", row.get("decision", row.get("bet_action")))
+                    row["saved_from_tab"] = "OFFICIAL_SAVE_GRADE"
+                    picks.append(row)
+                added = save_many_once(picks) if "save_many_once" in globals() else 0
+                st.success(f"Saved {added} new snapshot rows.")
+            except Exception as e:
+                st.error(f"Save failed: {e}")
+    with c2:
+        if st.button("✅ Auto-grade finished games", use_container_width=True):
+            try:
+                graded = grade_finished_games() if "grade_finished_games" in globals() else 0
+                st.success(f"Graded {graded} finished picks.")
+            except Exception as e:
+                st.error(f"Grade failed: {e}")
+
+    picks = load_json(PICK_LOG, []) if "PICK_LOG" in globals() else []
+    results = load_json(RESULT_LOG, []) if "RESULT_LOG" in globals() else []
+    st.markdown("#### Saved Picks")
+    if picks:
+        st.dataframe(pd.DataFrame(picks[-250:]), use_container_width=True, hide_index=True)
+    else:
+        st.info("No saved picks yet.")
+    st.markdown("#### Results")
+    if results:
+        st.dataframe(pd.DataFrame(results[-250:]), use_container_width=True, hide_index=True)
+    else:
+        st.info("No graded results yet.")
+
+def render_calibration_visible_tab(board=None, dates=None):
+    st.markdown("### 🧪 Calibration")
+    st.caption("Calibration dashboard based on graded result history.")
+    results = load_json(RESULT_LOG, []) if "RESULT_LOG" in globals() else []
+    if not results:
+        st.info("No graded results yet. Calibration will populate after results are graded.")
+        return
+    try:
+        profile, df = build_true_calibration_dashboard(results)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Samples", profile.get("samples", len(results)) if isinstance(profile, dict) else len(results))
+        c2.metric("Buckets", len(df) if df is not None else 0)
+        if isinstance(profile, dict):
+            c3.metric("Overall Bias", profile.get("overall_bias", "—"))
+        if df is not None and not df.empty:
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No calibration buckets yet.")
+    except Exception as e:
+        st.warning(f"Calibration dashboard unavailable: {e}")
+        st.dataframe(pd.DataFrame(results[-250:]), use_container_width=True, hide_index=True)
+
+def render_source_log_visible_tab(board=None, dates=None):
+    st.markdown("### 🧾 Source Log")
+    st.caption("Recent API/source diagnostics and request records.")
+    possible_logs = []
+    for name in ["REQUEST_LOG", "SOURCE_LOG", "DEBUG_LOG"]:
+        if name in globals():
+            possible_logs.append(globals().get(name))
+    loaded_any = False
+    for log_path in possible_logs:
+        try:
+            rows = load_json(log_path, [])
+            if rows:
+                loaded_any = True
+                st.markdown(f"#### {log_path}")
+                st.dataframe(pd.DataFrame(rows[-250:]), use_container_width=True, hide_index=True)
+        except Exception:
+            pass
+    if not loaded_any:
+        st.info("No source log rows yet for this session.")
+        try:
+            if board:
+                preview = []
+                for p in board[:100]:
+                    if isinstance(p, dict):
+                        preview.append({
+                            "Pitcher": p.get("pitcher"),
+                            "Matchup": p.get("matchup"),
+                            "Line": p.get("line") or p.get("underdog_line"),
+                            "Line Source": p.get("line_source") or p.get("source"),
+                            "Lineup": p.get("lineup_status"),
+                            "Data Score": p.get("data_score"),
+                        })
+                if preview:
+                    st.markdown("#### Current board source preview")
+                    st.dataframe(pd.DataFrame(preview), use_container_width=True, hide_index=True)
+        except Exception:
+            pass
+
+def render_settings_visible_tab(board=None, dates=None):
+    st.markdown("### ⚙️ Settings")
+    st.caption("Current model gates and app settings. Display-only.")
+    settings = {
+        "MIN_BETTABLE_GAP_KS": globals().get("MIN_BETTABLE_GAP_KS", "—"),
+        "MIN_ELITE_DATA_SCORE": globals().get("MIN_ELITE_DATA_SCORE", "—"),
+        "MIN_BETTABLE_PROB": globals().get("MIN_BETTABLE_PROB", "—"),
+        "MIN_BETTABLE_EV": globals().get("MIN_BETTABLE_EV", "—"),
+        "MIN_OFFICIAL_SAVE_SCORE": globals().get("MIN_OFFICIAL_SAVE_SCORE", "—"),
+        "MAX_RECOMMENDED_KELLY": globals().get("MAX_RECOMMENDED_KELLY", "—"),
+        "WEATHER_FACTOR_MIN": globals().get("WEATHER_FACTOR_MIN", "—"),
+        "WEATHER_FACTOR_MAX": globals().get("WEATHER_FACTOR_MAX", "—"),
+        "UMPIRE_FACTOR_MIN": globals().get("UMPIRE_FACTOR_MIN", "—"),
+        "UMPIRE_FACTOR_MAX": globals().get("UMPIRE_FACTOR_MAX", "—"),
+        "APP_VERSION": globals().get("APP_VERSION", "—"),
+    }
+    st.dataframe(pd.DataFrame([{"Setting": k, "Value": v} for k, v in settings.items()]), use_container_width=True, hide_index=True)
+
+
 tab_kproj, tab_final_board, tab_moneyline_edge, tab_lineup_lock, tab_results_dash, tab_auto_results, tab_safe_vol, tab_pitch_ump, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     'K PROJ / UPSIDE',
     'FINAL BOARD',
@@ -8921,4 +9075,19 @@ with tab_safe_vol:
 
 with tab_pitch_ump:
     render_pitchtype_umpire_refinement_tab(board, dates)
+
+with tab2:
+    render_all_pitchers_visible_tab(board, dates)
+
+with tab3:
+    render_official_save_grade_visible_tab(board, dates)
+
+with tab4:
+    render_calibration_visible_tab(board, dates)
+
+with tab5:
+    render_source_log_visible_tab(board, dates)
+
+with tab6:
+    render_settings_visible_tab(board, dates)
 
