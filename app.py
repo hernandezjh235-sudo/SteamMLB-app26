@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -6182,6 +6182,335 @@ def kproj_recent_form_projection(p, expected_bf=None):
     cap = 10.25 if pk >= 0.300 or k9 >= 10.0 else 9.25 if pk >= 0.270 or k9 >= 9.0 else 8.25 if pk >= 0.245 else 7.15
     return round(float(clamp(blended, 0.0, cap)), 2)
 
+
+# =========================
+# LIGHT DYNAMIC LEASH / BF BOOST
+# Small workload-based BF adjustment only.
+# This is NOT a blanket +0.5 K boost.
+# It helps pitchers with strong recent workload / long leash profiles.
+# =========================
+DYNAMIC_LEASH_BF_ENABLED = True
+DYNAMIC_LEASH_BF_MAX_BOOST = 1.15
+DYNAMIC_LEASH_BF_MAX_CUT = -0.55
+
+def dynamic_leash_bf_adjustment(row=None):
+    if not DYNAMIC_LEASH_BF_ENABLED:
+        return 0.0, "OFF", "Dynamic leash disabled"
+
+    row = row or {}
+    adj = 0.0
+    notes = []
+
+    exp_bf = safe_float(row.get("expected_bf"), None)
+    ip_floor = safe_float(row.get("ip_floor") or row.get("IP Floor"), None)
+    recent_ip = safe_float(row.get("recent_ip") or row.get("avg_ip_l3") or row.get("avg_ip_l5"), None)
+    avg_pitches = safe_float(row.get("avg_pitches_l3") or row.get("avg_pitches_l5") or row.get("recent_pitches"), None)
+    role_score = safe_float(row.get("role_score") or row.get("Role Score"), None)
+    starter_score = safe_float(row.get("starter_score") or row.get("Starter Score"), None)
+
+    leash_text = str(row.get("leash_risk") or row.get("Pitch Alert") or row.get("pitch_alert") or "").upper()
+    bullpen_text = " ".join(str(row.get(k, "")) for k in [
+        "bullpen_status", "bullpen_note", "bullpen_risk", "bp_status",
+        "pen_status", "bullpen_fatigue", "bullpen_usage_note",
+        "light_bullpen_tax_label"
+    ]).upper()
+
+    if exp_bf is not None and exp_bf >= 24.0:
+        adj += 0.25
+        notes.append("strong BF path")
+    if exp_bf is not None and exp_bf >= 26.0:
+        adj += 0.20
+        notes.append("elite BF path")
+    if ip_floor is not None and ip_floor >= 5.3:
+        adj += 0.20
+        notes.append("solid IP floor")
+    if recent_ip is not None and recent_ip >= 5.8:
+        adj += 0.20
+        notes.append("recent length")
+    if avg_pitches is not None and avg_pitches >= 92:
+        adj += 0.25
+        notes.append("pitch-count leash")
+    if avg_pitches is not None and avg_pitches >= 98:
+        adj += 0.15
+        notes.append("deep pitch-count leash")
+    if role_score is not None and role_score >= 78:
+        adj += 0.15
+        notes.append("stable role")
+    if starter_score is not None and starter_score >= 78:
+        adj += 0.10
+        notes.append("starter confirmed")
+    if any(x in bullpen_text for x in ["TAXED", "TIRED", "FATIGUED", "HEAVY", "OVERUSED"]):
+        adj += 0.20
+        notes.append("bullpen supports length")
+
+    if exp_bf is not None and exp_bf <= 17.0:
+        adj -= 0.35
+        notes.append("low BF path")
+    if exp_bf is not None and exp_bf <= 14.5:
+        adj -= 0.25
+        notes.append("very low BF path")
+    if any(x in leash_text for x in ["SHORT", "STRICT", "LIMIT", "LOW_ALERT", "MEDIUM_ALERT", "LOW BF"]):
+        adj -= 0.25
+        notes.append("leash warning")
+    if avg_pitches is not None and avg_pitches <= 72:
+        adj -= 0.20
+        notes.append("low pitch-count trend")
+
+    adj = clamp(adj, DYNAMIC_LEASH_BF_MAX_CUT, DYNAMIC_LEASH_BF_MAX_BOOST)
+
+    if abs(adj) < 0.05:
+        return 0.0, "NEUTRAL", "No meaningful leash adjustment"
+
+    label = "LEASH_BOOST" if adj > 0 else "LEASH_CUT"
+    return round(float(adj), 2), label, " | ".join(notes[:4])
+
+def apply_dynamic_leash_to_expected_bf(expected_bf, row=None):
+    bf = safe_float(expected_bf, DEFAULT_BF) or DEFAULT_BF
+    adj, label, note = dynamic_leash_bf_adjustment(row)
+    smart_bf = smart_edge_bf_nudge(row)
+    new_bf = float(clamp(bf + adj + smart_bf, 14.0, 31.5))
+    if isinstance(row, dict):
+        row["dynamic_leash_bf_adj"] = adj
+        row["smart_bf_nudge"] = smart_bf
+        row["dynamic_leash_label"] = label
+        row["dynamic_leash_note"] = note
+        row["dynamic_leash_bf"] = round(new_bf, 2)
+    return new_bf
+
+
+
+# =========================
+# SMART EDGE UPGRADES PACK
+# Light additive modules:
+# 1) Miss-by-1 analytics fields
+# 2) Lineup strikeout pressure score
+# 3) Pitch count trend score
+# 4) True leash score
+# 5) Bullpen incentive score
+# 6) Umpire K environment score
+#
+# These are small confidence/BF/projection nudges only.
+# They do NOT replace the K engine and do NOT blanket boost overs.
+# =========================
+SMART_EDGE_UPGRADES_ENABLED = True
+SMART_EDGE_MAX_PROJ_NUDGE = 0.35
+SMART_EDGE_MAX_BF_NUDGE = 0.75
+
+def _num_list_from_any(x):
+    if x is None:
+        return []
+    if isinstance(x, (list, tuple)):
+        out = []
+        for v in x:
+            fv = safe_float(v, None)
+            if fv is not None:
+                out.append(fv)
+        return out
+    txt = str(x)
+    vals = []
+    for m in re.findall(r"-?\d+(?:\.\d+)?", txt):
+        fv = safe_float(m, None)
+        if fv is not None:
+            vals.append(fv)
+    return vals
+
+def smart_pitch_count_trend_score(row=None):
+    row = row or {}
+    vals = []
+    for key in ["recent_pitches_list", "last_pitches", "pitches_l3", "pitches_l5", "recent_pitches"]:
+        vals += _num_list_from_any(row.get(key))
+    vals = [v for v in vals if 20 <= v <= 125]
+    if not vals:
+        avg = safe_float(row.get("avg_pitches_l3") or row.get("avg_pitches_l5"), None)
+        vals = [avg] if avg is not None else []
+    if not vals:
+        return 50, "UNKNOWN_PITCH_COUNT", "No pitch-count trend"
+
+    use = vals[:5]
+    avg = sum(use) / len(use)
+    if avg >= 98:
+        return 88, "DEEP_PITCH_COUNT", f"Recent pitch count avg {avg:.1f}"
+    if avg >= 92:
+        return 76, "GOOD_PITCH_COUNT", f"Recent pitch count avg {avg:.1f}"
+    if avg >= 84:
+        return 60, "NORMAL_PITCH_COUNT", f"Recent pitch count avg {avg:.1f}"
+    if avg >= 74:
+        return 42, "LIGHT_PITCH_COUNT", f"Recent pitch count avg {avg:.1f}"
+    return 25, "LOW_PITCH_COUNT", f"Recent pitch count avg {avg:.1f}"
+
+def smart_lineup_k_pressure_score(row=None):
+    row = row or {}
+    # Use real lineup rows if available; otherwise fall back to opponent K%.
+    hitters = row.get("lineup_rows") or row.get("confirmed_lineup_rows") or row.get("projected_lineup_rows") or []
+    k_rates = []
+    if isinstance(hitters, list):
+        for h in hitters:
+            if isinstance(h, dict):
+                k = safe_float(h.get("k_rate") or h.get("K%") or h.get("k_pct") or h.get("strikeout_rate"), None)
+                if k is not None:
+                    if k > 1:
+                        k /= 100.0
+                    if 0.05 <= k <= 0.45:
+                        k_rates.append(k)
+    if k_rates:
+        high24 = sum(1 for k in k_rates if k >= 0.24)
+        high28 = sum(1 for k in k_rates if k >= 0.28)
+        low18 = sum(1 for k in k_rates if k <= 0.18)
+        avg = sum(k_rates) / len(k_rates)
+        score = 50 + (high24 * 4) + (high28 * 5) - (low18 * 4) + ((avg - 0.22) * 100)
+        score = int(clamp(score, 5, 95))
+        label = "HIGH_K_LINEUP" if score >= 70 else "LOW_K_LINEUP" if score <= 38 else "NEUTRAL_LINEUP_K"
+        return score, label, f"{high24} hitters 24%+ K, {high28} hitters 28%+ K, {low18} hitters <=18% K"
+
+    ok = safe_float(row.get("opp_k"), None)
+    if ok is not None:
+        if ok > 1:
+            ok /= 100.0
+        score = int(clamp(50 + ((ok - 0.22) * 160), 20, 85))
+        label = "HIGH_K_TEAM" if ok >= 0.245 else "LOW_K_TEAM" if ok <= 0.205 else "NEUTRAL_K_TEAM"
+        return score, label, f"Opponent K% fallback {ok*100:.1f}%"
+    return 50, "UNKNOWN_LINEUP_K", "No lineup K profile"
+
+def smart_true_leash_score(row=None):
+    row = row or {}
+    exp_bf = safe_float(row.get("expected_bf"), None)
+    ip_floor = safe_float(row.get("ip_floor") or row.get("IP Floor"), None)
+    role = safe_float(row.get("role_score") or row.get("Role Score"), 50) or 50
+    starter = safe_float(row.get("starter_score") or row.get("Starter Score"), 50) or 50
+    pitch_score, pitch_label, _ = smart_pitch_count_trend_score(row)
+
+    score = 45
+    if exp_bf is not None:
+        score += (exp_bf - 20.0) * 4.2
+    if ip_floor is not None:
+        score += (ip_floor - 4.5) * 7.0
+    score += (role - 50) * 0.12
+    score += (starter - 50) * 0.10
+    score += (pitch_score - 50) * 0.18
+
+    txt = str(row.get("leash_risk") or row.get("Pitch Alert") or row.get("pitch_alert") or "").upper()
+    if any(x in txt for x in ["STRICT", "SHORT", "LIMIT", "LOW BF", "MEDIUM_ALERT"]):
+        score -= 14
+    elif any(x in txt for x in ["CLEAR", "NO OBVIOUS"]):
+        score += 5
+
+    score = int(clamp(score, 5, 95))
+    label = "LONG_LEASH" if score >= 72 else "SHORT_LEASH" if score <= 38 else "NORMAL_LEASH"
+    return score, label, f"{label}; pitch trend {pitch_label}"
+
+def smart_bullpen_incentive_score(row=None):
+    row = row or {}
+    txt = " ".join(str(row.get(k, "")) for k in [
+        "bullpen_status", "bullpen_note", "bullpen_risk", "bp_status",
+        "pen_status", "bullpen_fatigue", "bullpen_usage_note",
+        "light_bullpen_tax_label"
+    ]).upper()
+    score = 50
+    label = "NEUTRAL_BP"
+    if any(x in txt for x in ["TAXED", "EXHAUSTED", "OVERUSED", "HEAVY"]):
+        score, label = 78, "BP_LENGTH_SUPPORT"
+    elif any(x in txt for x in ["TIRED", "FATIGUED", "BACK-TO-BACK", "B2B"]):
+        score, label = 65, "SLIGHT_BP_SUPPORT"
+    elif any(x in txt for x in ["FRESH", "RESTED"]):
+        score, label = 38, "QUICK_HOOK_RISK"
+    return score, label, label.replace("_", " ").title()
+
+def smart_umpire_k_environment_score(row=None):
+    row = row or {}
+    fac = safe_float(row.get("Advanced Umpire Factor") or row.get("umpire_factor") or row.get("ump_factor"), None)
+    label0 = str(row.get("Advanced Umpire Label") or row.get("umpire_label") or "").upper()
+    if fac is not None:
+        if fac >= 1.025:
+            return 68, "K_UMP_BOOST", f"Ump factor {fac:.3f}"
+        if fac <= 0.975:
+            return 32, "K_UMP_SUPPRESS", f"Ump factor {fac:.3f}"
+        return 50, "UMP_NEUTRAL", f"Ump factor {fac:.3f}"
+    if "BOOST" in label0 or "K_PLUS" in label0:
+        return 65, "K_UMP_BOOST", label0
+    if "SUPPRESS" in label0 or "K_MINUS" in label0:
+        return 35, "K_UMP_SUPPRESS", label0
+    return 50, "UMP_UNKNOWN_NEUTRAL", "No umpire K environment"
+
+def smart_edge_projection_nudge(row=None):
+    """Small projection nudge from lineup/leash/ump. Capped at +/-0.35 K."""
+    if not SMART_EDGE_UPGRADES_ENABLED:
+        return 0.0, "OFF", "Smart edge upgrades off"
+    row = row or {}
+
+    lineup_score, lineup_label, lineup_note = smart_lineup_k_pressure_score(row)
+    leash_score, leash_label, leash_note = smart_true_leash_score(row)
+    bp_score, bp_label, bp_note = smart_bullpen_incentive_score(row)
+    ump_score, ump_label, ump_note = smart_umpire_k_environment_score(row)
+    pitch_score, pitch_label, pitch_note = smart_pitch_count_trend_score(row)
+
+    nudge = 0.0
+    nudge += (lineup_score - 50) * 0.006
+    nudge += (leash_score - 50) * 0.005
+    nudge += (bp_score - 50) * 0.003
+    nudge += (ump_score - 50) * 0.003
+    nudge += (pitch_score - 50) * 0.003
+
+    # Do not over-boost pitchers already under low-BF warning.
+    exp_bf = safe_float(row.get("expected_bf"), None)
+    if exp_bf is not None and exp_bf <= 17 and nudge > 0:
+        nudge *= 0.35
+
+    nudge = float(clamp(nudge, -SMART_EDGE_MAX_PROJ_NUDGE, SMART_EDGE_MAX_PROJ_NUDGE))
+    label = "SMART_BOOST" if nudge >= 0.12 else "SMART_CUT" if nudge <= -0.12 else "SMART_NEUTRAL"
+
+    if isinstance(row, dict):
+        row["smart_lineup_k_score"] = lineup_score
+        row["smart_lineup_k_label"] = lineup_label
+        row["smart_leash_score"] = leash_score
+        row["smart_leash_label"] = leash_label
+        row["smart_bullpen_score"] = bp_score
+        row["smart_bullpen_label"] = bp_label
+        row["smart_umpire_score"] = ump_score
+        row["smart_umpire_label"] = ump_label
+        row["smart_pitch_count_score"] = pitch_score
+        row["smart_pitch_count_label"] = pitch_label
+        row["smart_edge_nudge"] = round(nudge, 2)
+        row["smart_edge_label"] = label
+        row["smart_edge_note"] = " | ".join([lineup_label, leash_label, bp_label, ump_label, pitch_label])
+
+    return round(nudge, 2), label, " | ".join([lineup_note, leash_note, bp_note, ump_note, pitch_note][:5])
+
+def smart_edge_bf_nudge(row=None):
+    """Small BF nudge from true leash/pitch-count/bullpen. Capped at +/-0.75 BF."""
+    if not SMART_EDGE_UPGRADES_ENABLED:
+        return 0.0
+    leash_score, _, _ = smart_true_leash_score(row)
+    bp_score, _, _ = smart_bullpen_incentive_score(row)
+    pitch_score, _, _ = smart_pitch_count_trend_score(row)
+    bf_nudge = (leash_score - 50) * 0.012 + (bp_score - 50) * 0.006 + (pitch_score - 50) * 0.008
+    return round(float(clamp(bf_nudge, -0.45, SMART_EDGE_MAX_BF_NUDGE)), 2)
+
+def miss_by_one_bucket(proj, line, actual=None, side=None):
+    proj = safe_float(proj, None)
+    line = safe_float(line, None)
+    actual = safe_float(actual, None)
+    if proj is None or line is None:
+        return "NO_LINE"
+    projected_edge = abs(proj - line)
+    if actual is None:
+        return "PENDING_CLOSE_EDGE" if projected_edge <= 1.0 else "PENDING_BIG_EDGE"
+    if side is None:
+        side = "OVER" if proj > line else "UNDER"
+    if side == "OVER":
+        diff = actual - line
+    else:
+        diff = line - actual
+    if diff >= 2:
+        return "WON_BY_2_PLUS"
+    if diff >= 1:
+        return "WON_BY_1_PLUS"
+    if diff >= 0:
+        return "WON_CLOSE"
+    if diff >= -1:
+        return "LOST_BY_1"
+    return "LOST_BY_2_PLUS"
+
+
 def kproj_upside_projection(p):
     """K UPSIDE TAB projection with recent-form weighted true-talent guard.
 
@@ -6208,6 +6537,8 @@ def kproj_upside_projection(p):
     historical_k9 = kproj_historical_k9(p)
 
     expected_bf = project_volume_and_efficiency(raw_bf, ppb, opp_ppa)
+    # Light dynamic leash/BF adjustment: workload only, capped, not a blanket K boost.
+    expected_bf = apply_dynamic_leash_to_expected_bf(expected_bf, p)
     talent_base = kproj_true_talent_baseline(p)
     recent_form_proj = kproj_recent_form_projection(p, expected_bf=expected_bf)
 
@@ -6276,6 +6607,10 @@ def kproj_upside_projection(p):
             proj += 0.24
         elif recent_max >= 7:
             proj += 0.12
+
+    # Smart edge upgrades: small capped projection confidence nudge.
+    smart_nudge, smart_label, smart_note = smart_edge_projection_nudge(p)
+    proj += smart_nudge
 
     # Risk stays, but it cannot erase true K skill unless ceiling risk is low.
     rd = str(p.get("run_damage_risk_level") or "").upper()
@@ -7001,6 +7336,13 @@ def build_kproj_table(board):
             "Role Score": d.get("role_score"),
             "Starter Score": d.get("starter_score"),
             "IP Floor": d.get("ip_floor"),
+            "Dynamic Leash": p.get("dynamic_leash_label"),
+            "Leash BF Adj": p.get("dynamic_leash_bf_adj"),
+            "Smart Edge": p.get("smart_edge_label"),
+            "Smart Nudge": p.get("smart_edge_nudge"),
+            "Leash Score": p.get("smart_leash_score"),
+            "Lineup K Pressure": p.get("smart_lineup_k_score"),
+            "Pitch Count Score": p.get("smart_pitch_count_score"),
             "Edge Gap": d.get("edge_gap"),
             "Main Engine Action": p.get("bet_action"),
         })
@@ -9022,6 +9364,10 @@ def render_settings_visible_tab(board=None, dates=None):
     st.caption("Current model gates and app settings. Display-only.")
     settings = {
         "MIN_BETTABLE_GAP_KS": globals().get("MIN_BETTABLE_GAP_KS", "—"),
+        "DYNAMIC_LEASH_BF_ENABLED": globals().get("DYNAMIC_LEASH_BF_ENABLED", "—"),
+        "SMART_EDGE_UPGRADES_ENABLED": globals().get("SMART_EDGE_UPGRADES_ENABLED", "—"),
+        "SMART_EDGE_MAX_PROJ_NUDGE": globals().get("SMART_EDGE_MAX_PROJ_NUDGE", "—"),
+        "DYNAMIC_LEASH_BF_MAX_BOOST": globals().get("DYNAMIC_LEASH_BF_MAX_BOOST", "—"),
         "MIN_ELITE_DATA_SCORE": globals().get("MIN_ELITE_DATA_SCORE", "—"),
         "MIN_BETTABLE_PROB": globals().get("MIN_BETTABLE_PROB", "—"),
         "MIN_BETTABLE_EV": globals().get("MIN_BETTABLE_EV", "—"),
