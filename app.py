@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -7304,11 +7304,102 @@ def display_kproj_truth(p):
     return None if safe_float((p or {}).get("projection"), None) is None else round(safe_float((p or {}).get("projection")), 2)
 
 
+
+# =========================
+# PROJECTION-FIRST CONFIDENCE / PASS LOOSENER
+# Clean confidence layer:
+# - Does NOT remove PASS
+# - Does NOT force picks
+# - Upgrades only good borderline PASS plays into MONITOR / LEAN
+# - Keeps strict PASS for low-BF, volatile, pitch-alert, tiny-edge plays
+# =========================
+PROJECTION_FIRST_CONFIDENCE_ENABLED = True
+PASS_OVER_UPGRADE_EDGE = 0.50
+PASS_UNDER_UPGRADE_EDGE = 0.70
+PASS_UPGRADE_MIN_CONF = 57.0
+PASS_UPGRADE_MIN_LEASH = 44
+PASS_UPGRADE_MIN_SAFETY_SCORE = 40
+
+def projection_first_confidence_label(row=None, base_decision=None, base_tier=None):
+    row = row or {}
+    if not PROJECTION_FIRST_CONFIDENCE_ENABLED:
+        return base_decision, base_tier, 0, "OFF", "Projection-first confidence disabled"
+
+    proj = safe_float(row.get("K PROJ") or row.get("Raw K PROJ") or row.get("projection") or row.get("k_proj"), None)
+    line = safe_float(row.get("line") or row.get("UD/Line") or row.get("Line") or row.get("underdog_line"), None)
+    if proj is None or line is None:
+        return base_decision, base_tier, 0, "NO_LINE", "No usable line/projection"
+
+    side = "OVER" if proj > line else "UNDER"
+    edge = abs(proj - line)
+
+    lineup = str(row.get("lineup_status") or row.get("Lineup") or "").upper()
+    pitch_alert = str(row.get("Pitch Alert") or row.get("pitch_alert") or "").upper()
+    safety_tag = str(row.get("Safety Tag") or row.get("safety_tag") or "").upper()
+    safety_score = safe_float(row.get("Safety Score") or row.get("safety_score"), 50) or 50
+    exp_bf = safe_float(row.get("expected_bf") or row.get("Exp BF"), None)
+    leash_score = safe_float(row.get("smart_leash_score") or row.get("Leash Score"), 50) or 50
+    smart_label = str(row.get("smart_edge_label") or "").upper()
+    smart_nudge = safe_float(row.get("smart_edge_nudge"), 0) or 0
+    conf = safe_float(row.get("Confidence %") or row.get("confidence"), None)
+    if conf is not None and conf <= 1:
+        conf *= 100
+
+    hard_risks = []
+    if exp_bf is not None and exp_bf <= 16.5:
+        hard_risks.append("LOW_BF")
+    if "VOLATILE" in safety_tag and safety_score < PASS_UPGRADE_MIN_SAFETY_SCORE:
+        hard_risks.append("VOLATILE_LOW_SCORE")
+    if any(x in pitch_alert for x in ["MEDIUM_ALERT", "HIGH_ALERT", "STRICT", "SHORT", "LIMIT"]):
+        hard_risks.append("PITCH_ALERT")
+    if "FALLBACK" in lineup and edge < 0.85:
+        hard_risks.append("FALLBACK_SMALL_EDGE")
+    if leash_score < PASS_UPGRADE_MIN_LEASH:
+        hard_risks.append("LOW_LEASH")
+
+    edge_need = PASS_OVER_UPGRADE_EDGE if side == "OVER" else PASS_UNDER_UPGRADE_EDGE
+    conf_ok = True if conf is None else conf >= PASS_UPGRADE_MIN_CONF
+    smart_ok = smart_nudge >= -0.10 and smart_label != "SMART_CUT"
+
+    if hard_risks:
+        return base_decision, base_tier, 0, "STRICT_PASS", " | ".join(hard_risks[:4])
+
+    if edge >= edge_need and conf_ok and smart_ok:
+        if edge >= edge_need + 0.35:
+            new_decision = f"✅ PROJECTION LEAN — {side}"
+            new_tier = "B" if base_tier in [None, "", "PASS"] else base_tier
+            return new_decision, new_tier, 8, "UPGRADED_LEAN", f"{side} edge {edge:.2f}; projection-first confidence"
+        new_decision = f"⚠️ MONITOR — {side}"
+        new_tier = "C" if base_tier in [None, "", "PASS"] else base_tier
+        return new_decision, new_tier, 5, "UPGRADED_MONITOR", f"{side} edge {edge:.2f}; monitor not forced"
+
+    return base_decision, base_tier, 0, "UNCHANGED", f"{side} edge {edge:.2f}; did not meet upgrade gate"
+
+def apply_projection_first_confidence_to_row(row):
+    if not isinstance(row, dict):
+        return row
+    base_decision = row.get("Decision") or row.get("decision") or row.get("bet_action") or row.get("Main Engine Action")
+    base_tier = row.get("Tier") or row.get("tier")
+    new_decision, new_tier, boost, label, note = projection_first_confidence_label(row, base_decision, base_tier)
+    row["Projection First Label"] = label
+    row["Projection First Note"] = note
+    row["Projection First Boost"] = boost
+    row["Projection First Decision"] = new_decision
+    row["Projection First Tier"] = new_tier
+    return row
+
+
 def build_kproj_table(board):
     rows = []
     for p in board or []:
         d = kproj_decision(p)
         dist = kproj_distribution_profile(d.get("projection"), d.get("line"), p)
+        p["K PROJ"] = d.get("projection")
+        p["line"] = d.get("line")
+        p["Confidence %"] = None if d.get("confidence") is None else round(d.get("confidence") * 100, 1)
+        p["Tier"] = d.get("tier")
+        p["Decision"] = d.get("decision")
+        apply_projection_first_confidence_to_row(p)
         rows.append({
             "Pitcher": p.get("pitcher"),
             "Matchup": p.get("matchup"),
@@ -7321,7 +7412,8 @@ def build_kproj_table(board):
             "Under Sim %": None if dist.get("under_prob") is None else round(dist.get("under_prob") * 100, 1),
             "UD/Line": d.get("line"),
             "Line Source": d.get("line_source"),
-            "Decision": d.get("decision"),
+            "Decision": p.get("Projection First Decision") or d.get("decision"),
+            "Base Decision": d.get("decision"),
             "Model Lean": d.get("lean_side"),
             "Lean Gap": d.get("lean_gap"),
             "Confidence %": None if d.get("confidence") is None else round(d.get("confidence") * 100, 1),
@@ -7332,7 +7424,10 @@ def build_kproj_table(board):
             "Putaway/Whiff": p.get("statcast_whiff") or p.get("statcast_csw"),
             "Lineup": p.get("lineup_status"),
             "Hit Rate %": None if d.get("hit_rate") is None else round(d.get("hit_rate") * 100, 1),
-            "Tier": d.get("tier"),
+            "Tier": p.get("Projection First Tier") or d.get("tier"),
+            "Confidence Mode": p.get("Projection First Label"),
+            "Confidence Note": p.get("Projection First Note"),
+            "Base Tier": d.get("tier"),
             "Role Score": d.get("role_score"),
             "Starter Score": d.get("starter_score"),
             "IP Floor": d.get("ip_floor"),
@@ -9366,6 +9461,9 @@ def render_settings_visible_tab(board=None, dates=None):
         "MIN_BETTABLE_GAP_KS": globals().get("MIN_BETTABLE_GAP_KS", "—"),
         "DYNAMIC_LEASH_BF_ENABLED": globals().get("DYNAMIC_LEASH_BF_ENABLED", "—"),
         "SMART_EDGE_UPGRADES_ENABLED": globals().get("SMART_EDGE_UPGRADES_ENABLED", "—"),
+        "PROJECTION_FIRST_CONFIDENCE_ENABLED": globals().get("PROJECTION_FIRST_CONFIDENCE_ENABLED", "—"),
+        "PASS_OVER_UPGRADE_EDGE": globals().get("PASS_OVER_UPGRADE_EDGE", "—"),
+        "PASS_UNDER_UPGRADE_EDGE": globals().get("PASS_UNDER_UPGRADE_EDGE", "—"),
         "SMART_EDGE_MAX_PROJ_NUDGE": globals().get("SMART_EDGE_MAX_PROJ_NUDGE", "—"),
         "DYNAMIC_LEASH_BF_MAX_BOOST": globals().get("DYNAMIC_LEASH_BF_MAX_BOOST", "—"),
         "MIN_ELITE_DATA_SCORE": globals().get("MIN_ELITE_DATA_SCORE", "—"),
