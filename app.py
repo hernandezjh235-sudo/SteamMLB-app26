@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + WORKLOAD LEASH 2.0 + ROTOWIRE PRELINEUP + TRUE PROJECTION PLUS + RESTORED SAFE" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + WORKLOAD LEASH 2.0 + ROTOWIRE PRELINEUP + TRUE PROJECTION PLUS + FIXED REFRESH FLOW" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -5901,21 +5901,17 @@ def render_pick_card(p):
     """, unsafe_allow_html=True)
 
 
-
-
 # =========================
-# TOMORROW ZERO-ROW EXPLANATION
-# Safe diagnostic only. Does not change projections.
-# Tomorrow board requires MLB probablePitcher rows; Underdog lines alone are not enough for full projection context.
+# ZERO ROW DIAGNOSTIC
+# Does not change projections; explains when MLB probables are unavailable.
 # =========================
 def tomorrow_zero_rows_explanation(day_mode, all_rows):
     try:
         if str(day_mode).lower().startswith("tomorrow") and not all_rows:
-            return "Tomorrow has 0 pitcher rows because MLB probablePitcher data is not posted/hydrated yet. Underdog can post lines before MLB probables. Try Today + Tomorrow, or refresh later when MLB posts probable pitchers."
+            return "0 pitchers means MLB probablePitcher data did not hydrate for this selected date. Underdog lines may be live before MLB probables. Try Today + Tomorrow or refresh later."
     except Exception:
         pass
     return ""
-
 
 # =========================
 # APP
