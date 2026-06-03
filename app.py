@@ -22,7 +22,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + OLD REFRESH + NEW PROJECTIONS" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + OLD REFRESH + NEW PROJECTIONS + ROTOWIRE BATTERS ONLY" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -1853,10 +1853,221 @@ def set_cached_lineup_rows(game_pk, opp_side, pitcher_hand, rows):
     cache[lineup_cache_key(game_pk, opp_side, pitcher_hand)] = {"saved_at": now_iso(), "rows": rows[:9]}
     save_json(LINEUP_CACHE_FILE, cache)
 
+# =========================
+# ROTOWIRE BATTER-LINEUP ONLY FALLBACK
+# IMPORTANT:
+# - Does NOT create pitcher rows
+# - Does NOT replace MLB probable pitchers
+# - Only helps opponent batter K% before MLB confirmed lineups post
+# =========================
+ROTOWIRE_PROJECTED_LINEUPS_ENABLED = True
+ROTOWIRE_LINEUPS_URL = "https://www.rotowire.com/baseball/daily-lineups.php"
+
+MLB_TEAM_ALIASES = {
+    "ARI": ["ARI", "ARZ", "DIAMONDBACKS", "ARIZONA"],
+    "ATL": ["ATL", "BRAVES", "ATLANTA"],
+    "BAL": ["BAL", "ORIOLES", "BALTIMORE"],
+    "BOS": ["BOS", "RED SOX", "BOSTON"],
+    "CHC": ["CHC", "CUBS", "CHICAGO CUBS"],
+    "CWS": ["CWS", "CHW", "WHITE SOX", "CHICAGO WHITE SOX"],
+    "CIN": ["CIN", "REDS", "CINCINNATI"],
+    "CLE": ["CLE", "GUARDIANS", "CLEVELAND"],
+    "COL": ["COL", "ROCKIES", "COLORADO"],
+    "DET": ["DET", "TIGERS", "DETROIT"],
+    "HOU": ["HOU", "ASTROS", "HOUSTON"],
+    "KC": ["KC", "KCR", "ROYALS", "KANSAS CITY"],
+    "LAA": ["LAA", "ANGELS", "LOS ANGELES ANGELS"],
+    "LAD": ["LAD", "DODGERS", "LOS ANGELES DODGERS"],
+    "MIA": ["MIA", "MARLINS", "MIAMI"],
+    "MIL": ["MIL", "BREWERS", "MILWAUKEE"],
+    "MIN": ["MIN", "TWINS", "MINNESOTA"],
+    "NYM": ["NYM", "METS", "NEW YORK METS"],
+    "NYY": ["NYY", "YANKEES", "NEW YORK YANKEES"],
+    "ATH": ["ATH", "OAK", "ATHLETICS", "OAKLAND", "A'S"],
+    "PHI": ["PHI", "PHILLIES", "PHILADELPHIA"],
+    "PIT": ["PIT", "PIRATES", "PITTSBURGH"],
+    "SD": ["SD", "SDP", "PADRES", "SAN DIEGO"],
+    "SEA": ["SEA", "MARINERS", "SEATTLE"],
+    "SF": ["SF", "SFG", "GIANTS", "SAN FRANCISCO"],
+    "STL": ["STL", "CARDINALS", "ST. LOUIS", "SAINT LOUIS"],
+    "TB": ["TB", "TBR", "RAYS", "TAMPA BAY"],
+    "TEX": ["TEX", "RANGERS", "TEXAS"],
+    "TOR": ["TOR", "BLUE JAYS", "TORONTO"],
+    "WSH": ["WSH", "WSN", "NATIONALS", "WASHINGTON"],
+}
+
+def _rw_team_key(x):
+    raw = normalize_name(x).upper()
+    raw2 = str(x or "").upper()
+    for abbr, aliases in MLB_TEAM_ALIASES.items():
+        for a in aliases:
+            if normalize_name(a).upper() == raw or f" {a.upper()} " in f" {raw2} ":
+                return abbr
+    return raw2[:3] if raw2 else ""
+
+def _rw_clean_text(s):
+    try:
+        s = html.unescape(str(s or ""))
+        s = re.sub(r"<[^>]+>", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+    except Exception:
+        return str(s or "").strip()
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_game_team_context_for_lineup(game_pk, opp_side):
+    try:
+        if not game_pk or not opp_side:
+            return {"abbr": None, "name": None, "key": None}
+        live = safe_get_json(f"{MLB_LIVE}/game/{game_pk}/feed/live", timeout=12)
+        box_team = (live or {}).get("gameData", {}).get("teams", {}).get(opp_side, {})
+        if not box_team:
+            box_team = (live or {}).get("liveData", {}).get("boxscore", {}).get("teams", {}).get(opp_side, {}).get("team", {})
+        abbr = box_team.get("abbreviation") or box_team.get("teamCode") or box_team.get("fileCode")
+        name = box_team.get("name") or box_team.get("clubName") or box_team.get("teamName")
+        return {"abbr": abbr, "name": name, "key": _rw_team_key(abbr or name)}
+    except Exception:
+        return {"abbr": None, "name": None, "key": None}
+
+@st.cache_data(ttl=900, show_spinner=False)
+def mlb_player_search_id_by_name(player_name):
+    nm = str(player_name or "").strip()
+    if not nm:
+        return None
+    try:
+        data = safe_get_json(f"{MLB_BASE}/people/search", params={"names": nm, "sportId": 1}, timeout=10)
+        people = (data or {}).get("people") or []
+        if people:
+            best = max(people, key=lambda p: name_score(nm, p.get("fullName")))
+            if name_score(nm, best.get("fullName")) >= 0.72:
+                return best.get("id")
+    except Exception:
+        pass
+    return None
+
+@st.cache_data(ttl=900, show_spinner=False)
+def rotowire_daily_lineups_raw_html():
+    if not ROTOWIRE_PROJECTED_LINEUPS_ENABLED:
+        return ""
+    try:
+        r = requests.get(
+            ROTOWIRE_LINEUPS_URL,
+            timeout=14,
+            headers={
+                "User-Agent": "Mozilla/5.0 MLBKPropEngine/RotowireBatterLineupOnly",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+        )
+        if r.status_code != 200:
+            log_source_request("Rotowire daily lineups", f"HTTP {r.status_code}", r.text[:200])
+            return ""
+        return r.text or ""
+    except Exception as e:
+        log_source_request("Rotowire daily lineups", "ERROR", str(e))
+        return ""
+
+def _rotowire_extract_team_blocks(html_text):
+    h = html_text or ""
+    if not h:
+        return {}
+    h2 = h.replace("\\u002F", "/").replace("\\/", "/")
+    out = {}
+    chunks = re.split(r'(?i)(?:lineup__box|lineup-card|lineup__main|lineup is-|mlb-lineups)', h2)
+    if len(chunks) < 5:
+        chunks = [h2[i:i+18000] for i in range(0, len(h2), 9000)]
+
+    for abbr, aliases in MLB_TEAM_ALIASES.items():
+        best_names = []
+        aliases_norm = [a.upper() for a in aliases]
+        for ch in chunks:
+            cup = ch.upper()
+            if not any(a in cup for a in aliases_norm):
+                continue
+            names = []
+            patterns = [
+                r'lineup__player[^>]*>\s*<a[^>]*>([^<]{3,45})</a>',
+                r'lineup__player[^>]*>\s*([^<]{3,45})<',
+                r'data-name="([^"]{3,45})"',
+                r'"name":"([^"]{3,45})"',
+                r'"playerName":"([^"]{3,45})"',
+            ]
+            for pat in patterns:
+                for m in re.findall(pat, ch, flags=re.I):
+                    name = _rw_clean_text(m)
+                    low = name.lower()
+                    if (
+                        len(name.split()) >= 2
+                        and not any(x in low for x in ["lineup", "weather", "pitcher", "confirmed", "projected", "batting", "throws"])
+                        and name not in names
+                    ):
+                        names.append(name)
+            if len(names) >= 5 and len(names) > len(best_names):
+                best_names = names[:9]
+        if best_names:
+            out[abbr] = best_names[:9]
+    return out
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_rotowire_projected_lineup_names(team_key):
+    if not ROTOWIRE_PROJECTED_LINEUPS_ENABLED:
+        return []
+    html_text = rotowire_daily_lineups_raw_html()
+    blocks = _rotowire_extract_team_blocks(html_text)
+    return blocks.get(_rw_team_key(team_key), [])
+
+def build_rotowire_projected_lineup_rows(team_key, pitcher_hand=None):
+    """Build hitter rows only. Never returns pitchers as player pool."""
+    names = get_rotowire_projected_lineup_names(team_key)
+    rows = []
+    for idx, name in enumerate(names[:9], start=1):
+        player_id = mlb_player_search_id_by_name(name)
+        season_k, season_so, season_pa = get_batter_season_k_rate(player_id) if player_id else (None, None, None)
+        split_k, split_so, split_pa, split_source = get_batter_k_rate_vs_pitcher_hand(player_id, pitcher_hand) if (player_id and pitcher_hand) else (None, None, None, "No split")
+        rolling = get_batter_rolling_k_rates(player_id, days_list=(14, 30)) if player_id else {}
+        rolling14 = rolling.get(14)
+        rolling30 = rolling.get(30)
+        used_k, used_source = blend_batter_k_inputs(
+            season_k,
+            split_k=split_k,
+            season_pa=season_pa,
+            split_pa=split_pa,
+            rolling14=rolling14,
+            rolling30=rolling30,
+        )
+        if used_k is None:
+            used_k = split_k if split_k is not None else season_k
+            used_source = split_source if split_k is not None else "Season batter K%"
+        rows.append({
+            "Order": idx,
+            "Batter": name,
+            "Player ID": player_id,
+            "Season K%": None if season_k is None else round(season_k * 100, 1),
+            "Split K%": None if split_k is None else round(split_k * 100, 1),
+            "Rolling 14d K%": None if rolling14 is None else round(rolling14 * 100, 1),
+            "Rolling 30d K%": None if rolling30 is None else round(rolling30 * 100, 1),
+            "Split PA/AB": split_pa,
+            "Used K%": None if used_k is None else round(used_k * 100, 1),
+            "K Source": f"Rotowire projected + {used_source}",
+            "SO": season_so,
+            "PA/AB": season_pa,
+            "Raw_K_Rate": used_k,
+            "Lineup Source": "ROTOWIRE_PROJECTED_BATTERS_ONLY",
+        })
+    valid = [r["Raw_K_Rate"] for r in rows if r.get("Raw_K_Rate") is not None]
+    if len(valid) >= 5:
+        return rows[:9]
+    return []
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def calculate_lineup_k_rate(game_pk, opp_side, pitcher_hand=None):
     box = safe_get_json(f"{MLB_BASE}/game/{game_pk}/boxscore")
     if not box:
+        team_ctx = get_game_team_context_for_lineup(game_pk, opp_side)
+        rw_rows = build_rotowire_projected_lineup_rows(team_ctx.get("key") or team_ctx.get("abbr") or team_ctx.get("name"), pitcher_hand)
+        valid_rw = [r.get("Raw_K_Rate") for r in rw_rows[:9] if r.get("Raw_K_Rate") is not None]
+        if len(valid_rw) >= 5:
+            return float(np.mean(valid_rw)), rw_rows[:9], "Rotowire projected batter lineup K%", False
         cached_rows = get_cached_lineup_rows(game_pk, opp_side, pitcher_hand)
         valid_cached = [r.get("Raw_K_Rate") for r in cached_rows[:9] if r.get("Raw_K_Rate") is not None]
         if len(valid_cached) >= 5:
@@ -1910,6 +2121,11 @@ def calculate_lineup_k_rate(game_pk, opp_side, pitcher_hand=None):
         split_count = sum(1 for r in rows[:9] if r.get("Split K%") is not None)
         msg = f"Posted lineup K%; splits for {split_count}/9 hitters"
         return lineup_k, rows[:9], msg, len(rows[:9]) >= 8
+    team_ctx = get_game_team_context_for_lineup(game_pk, opp_side)
+    rw_rows = build_rotowire_projected_lineup_rows(team_ctx.get("key") or team_ctx.get("abbr") or team_ctx.get("name"), pitcher_hand)
+    valid_rw = [r.get("Raw_K_Rate") for r in rw_rows[:9] if r.get("Raw_K_Rate") is not None]
+    if len(valid_rw) >= 5:
+        return float(np.mean(valid_rw)), rw_rows[:9], "Rotowire projected batter lineup K%", False
     cached_rows = get_cached_lineup_rows(game_pk, opp_side, pitcher_hand)
     valid_cached = [r.get("Raw_K_Rate") for r in cached_rows[:9] if r.get("Raw_K_Rate") is not None]
     if len(valid_cached) >= 5:
@@ -1954,6 +2170,8 @@ def confirmed_lineup_status(source_label, lineup_rows):
         return "CONFIRMED"
     if source_label == "CACHED LINEUP":
         return "CACHED"
+    if "ROTOWIRE" in str(source_label).upper() or any((r.get("Lineup Source") == "ROTOWIRE_PROJECTED_BATTERS_ONLY") for r in (lineup_rows or []) if isinstance(r, dict)):
+        return "ROTOWIRE BATTERS"
     return "FALLBACK"
 
 @st.cache_data(ttl=900, show_spinner=False)
