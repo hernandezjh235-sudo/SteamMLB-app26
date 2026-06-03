@@ -22,7 +22,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + OLD REFRESH + NEW PROJECTIONS" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + OLD REFRESH + NEW PROJECTIONS + MLB PROJECTED LINEUPS" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -1853,10 +1853,204 @@ def set_cached_lineup_rows(game_pk, opp_side, pitcher_hand, rows):
     cache[lineup_cache_key(game_pk, opp_side, pitcher_hand)] = {"saved_at": now_iso(), "rows": rows[:9]}
     save_json(LINEUP_CACHE_FILE, cache)
 
+# =========================
+# MLB-ONLY PROJECTED LINEUP BUILDER
+# Safe pre-lineup batter projection:
+# - Does NOT create pitcher rows
+# - Does NOT touch refresh flow
+# - Does NOT use Rotowire
+# - Uses MLB recent lineups / boxscores to estimate expected 1-9 hitters
+# =========================
+MLB_PROJECTED_LINEUPS_ENABLED = True
+MLB_PROJECTED_LINEUP_LOOKBACK_GAMES = 5
+MLB_PROJECTED_LINEUP_MIN_VALID_HITTERS = 5
+
+def _proj_lu_team_id_from_game(game_pk, opp_side):
+    try:
+        live = safe_get_json(f"{MLB_LIVE}/game/{game_pk}/feed/live", timeout=12)
+        box_team = (live or {}).get("liveData", {}).get("boxscore", {}).get("teams", {}).get(opp_side, {})
+        tid = (box_team.get("team") or {}).get("id")
+        if tid:
+            return tid
+        gd_team = (live or {}).get("gameData", {}).get("teams", {}).get(opp_side, {})
+        return gd_team.get("id")
+    except Exception:
+        return None
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _proj_lu_recent_team_games(team_id, before_date=None, n=5):
+    """Return recent completed gamePks for a team before target date."""
+    if not team_id:
+        return []
+    try:
+        if before_date:
+            end_dt = datetime.strptime(str(before_date), "%Y-%m-%d").date() - timedelta(days=1)
+        else:
+            end_dt = california_now().date() - timedelta(days=1)
+        start_dt = end_dt - timedelta(days=14)
+        sched = safe_get_json(
+            f"{MLB_BASE}/schedule",
+            params={
+                "sportId": 1,
+                "teamId": team_id,
+                "startDate": start_dt.strftime("%Y-%m-%d"),
+                "endDate": end_dt.strftime("%Y-%m-%d"),
+                "hydrate": "team",
+            },
+            timeout=14,
+        ) or {"dates": []}
+        games = []
+        for d in sched.get("dates", []):
+            for g in d.get("games", []):
+                state = (g.get("status") or {}).get("abstractGameState")
+                if state != "Final":
+                    continue
+                games.append((g.get("gameDate") or "", g.get("gamePk")))
+        games = [pk for _, pk in sorted(games, reverse=True) if pk]
+        return games[:int(n or 5)]
+    except Exception:
+        return []
+
+def _proj_lu_hitter_from_box_player(pid, pdata):
+    try:
+        stats = (pdata.get("stats") or {}).get("batting") or {}
+        bo = pdata.get("battingOrder")
+        pos = ((pdata.get("position") or {}).get("abbreviation") or "").upper()
+        name = (pdata.get("person") or {}).get("fullName")
+        # Exclude pitchers as hitters unless they actually batted. Modern MLB DH means usually no pitchers.
+        if pos == "P":
+            return None
+        ab = safe_float(stats.get("atBats"), 0) or 0
+        pa_signal = ab + (safe_float(stats.get("baseOnBalls"), 0) or 0) + (safe_float(stats.get("hitByPitch"), 0) or 0) + (safe_float(stats.get("sacFlies"), 0) or 0)
+        if not name or (bo is None and pa_signal <= 0):
+            return None
+        order = None
+        if bo:
+            try:
+                order = int(str(bo)[:1])
+            except Exception:
+                order = None
+        return {"id": safe_int(pid), "name": name, "order": order, "position": pos}
+    except Exception:
+        return None
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def build_mlb_projected_lineup_rows(team_id, pitcher_hand=None, before_date=None):
+    """Build projected batter rows from recent MLB starting lineups.
+
+    Score = recent start frequency + batting-order frequency + recency.
+    """
+    if not MLB_PROJECTED_LINEUPS_ENABLED or not team_id:
+        return []
+    game_pks = _proj_lu_recent_team_games(team_id, before_date, MLB_PROJECTED_LINEUP_LOOKBACK_GAMES)
+    if not game_pks:
+        return []
+
+    candidates = {}
+    for g_idx, gpk in enumerate(game_pks):
+        try:
+            live = safe_get_json(f"{MLB_LIVE}/game/{gpk}/feed/live", timeout=14)
+            teams = (live or {}).get("liveData", {}).get("boxscore", {}).get("teams", {})
+            side = None
+            for s in ["away", "home"]:
+                if ((teams.get(s) or {}).get("team") or {}).get("id") == team_id:
+                    side = s
+                    break
+            if not side:
+                continue
+            players = (teams.get(side) or {}).get("players") or {}
+            recency_weight = max(0.45, 1.0 - (g_idx * 0.12))
+            for k, pdata in players.items():
+                pid = str(k).replace("ID", "")
+                h = _proj_lu_hitter_from_box_player(pid, pdata)
+                if not h:
+                    continue
+                cid = str(h["id"] or normalize_name(h["name"]))
+                d = candidates.setdefault(cid, {
+                    "id": h["id"],
+                    "name": h["name"],
+                    "orders": [],
+                    "starts": 0.0,
+                    "positions": [],
+                    "last_seen_weight": 0.0,
+                })
+                d["starts"] += recency_weight
+                d["last_seen_weight"] = max(d["last_seen_weight"], recency_weight)
+                if h.get("order"):
+                    d["orders"].append(h["order"])
+                if h.get("position"):
+                    d["positions"].append(h["position"])
+        except Exception:
+            continue
+
+    if not candidates:
+        return []
+
+    ranked = []
+    for cid, d in candidates.items():
+        orders = [o for o in d.get("orders", []) if o]
+        avg_order = float(np.mean(orders)) if orders else 9.0
+        order_score = max(0, 10 - avg_order) * 0.20
+        start_score = d.get("starts", 0) * 1.25
+        recency_score = d.get("last_seen_weight", 0) * 0.65
+        score = start_score + order_score + recency_score
+        ranked.append((score, avg_order, d))
+
+    ranked = sorted(ranked, key=lambda x: (-x[0], x[1]))[:9]
+    projected = sorted(ranked, key=lambda x: x[1])
+    rows = []
+    for idx, (_, avg_order, d) in enumerate(projected, start=1):
+        player_id = d.get("id")
+        name = d.get("name")
+        season_k, season_so, season_pa = get_batter_season_k_rate(player_id) if player_id else (None, None, None)
+        split_k, split_so, split_pa, split_source = get_batter_k_rate_vs_pitcher_hand(player_id, pitcher_hand) if (player_id and pitcher_hand) else (None, None, None, "No split")
+        rolling = get_batter_rolling_k_rates(player_id, days_list=(14, 30)) if player_id else {}
+        rolling14 = rolling.get(14)
+        rolling30 = rolling.get(30)
+        used_k, used_source = blend_batter_k_inputs(
+            season_k,
+            split_k=split_k,
+            season_pa=season_pa,
+            split_pa=split_pa,
+            rolling14=rolling14,
+            rolling30=rolling30,
+        )
+        if used_k is None:
+            used_k = split_k if split_k is not None else season_k
+            used_source = split_source if split_k is not None else "Season batter K%"
+        rows.append({
+            "Order": idx,
+            "Batter": name,
+            "Player ID": player_id,
+            "Projected Order": round(float(avg_order), 2),
+            "Start Score": round(float(d.get("starts", 0)), 2),
+            "Season K%": None if season_k is None else round(season_k * 100, 1),
+            "Split K%": None if split_k is None else round(split_k * 100, 1),
+            "Rolling 14d K%": None if rolling14 is None else round(rolling14 * 100, 1),
+            "Rolling 30d K%": None if rolling30 is None else round(rolling30 * 100, 1),
+            "Split PA/AB": split_pa,
+            "Used K%": None if used_k is None else round(used_k * 100, 1),
+            "K Source": f"MLB projected lineup + {used_source}",
+            "SO": season_so,
+            "PA/AB": season_pa,
+            "Raw_K_Rate": used_k,
+            "Lineup Source": "MLB_PROJECTED_RECENT_LINEUP",
+        })
+    valid = [r.get("Raw_K_Rate") for r in rows if r.get("Raw_K_Rate") is not None]
+    if len(valid) >= MLB_PROJECTED_LINEUP_MIN_VALID_HITTERS:
+        return rows[:9]
+    return []
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def calculate_lineup_k_rate(game_pk, opp_side, pitcher_hand=None):
     box = safe_get_json(f"{MLB_BASE}/game/{game_pk}/boxscore")
     if not box:
+        team_id = _proj_lu_team_id_from_game(game_pk, opp_side)
+        proj_rows = build_mlb_projected_lineup_rows(team_id, pitcher_hand, before_date=None)
+        valid_proj = [r.get("Raw_K_Rate") for r in proj_rows[:9] if r.get("Raw_K_Rate") is not None]
+        if len(valid_proj) >= MLB_PROJECTED_LINEUP_MIN_VALID_HITTERS:
+            return float(np.mean(valid_proj)), proj_rows[:9], "MLB projected recent lineup K%", False
         cached_rows = get_cached_lineup_rows(game_pk, opp_side, pitcher_hand)
         valid_cached = [r.get("Raw_K_Rate") for r in cached_rows[:9] if r.get("Raw_K_Rate") is not None]
         if len(valid_cached) >= 5:
@@ -1910,6 +2104,11 @@ def calculate_lineup_k_rate(game_pk, opp_side, pitcher_hand=None):
         split_count = sum(1 for r in rows[:9] if r.get("Split K%") is not None)
         msg = f"Posted lineup K%; splits for {split_count}/9 hitters"
         return lineup_k, rows[:9], msg, len(rows[:9]) >= 8
+    team_id = _proj_lu_team_id_from_game(game_pk, opp_side)
+    proj_rows = build_mlb_projected_lineup_rows(team_id, pitcher_hand, before_date=None)
+    valid_proj = [r.get("Raw_K_Rate") for r in proj_rows[:9] if r.get("Raw_K_Rate") is not None]
+    if len(valid_proj) >= MLB_PROJECTED_LINEUP_MIN_VALID_HITTERS:
+        return float(np.mean(valid_proj)), proj_rows[:9], "MLB projected recent lineup K%", False
     cached_rows = get_cached_lineup_rows(game_pk, opp_side, pitcher_hand)
     valid_cached = [r.get("Raw_K_Rate") for r in cached_rows[:9] if r.get("Raw_K_Rate") is not None]
     if len(valid_cached) >= 5:
@@ -1954,6 +2153,8 @@ def confirmed_lineup_status(source_label, lineup_rows):
         return "CONFIRMED"
     if source_label == "CACHED LINEUP":
         return "CACHED"
+    if "PROJECTED RECENT" in str(source_label).upper() or any((r.get("Lineup Source") == "MLB_PROJECTED_RECENT_LINEUP") for r in (lineup_rows or []) if isinstance(r, dict)):
+        return "MLB PROJECTED"
     return "FALLBACK"
 
 @st.cache_data(ttl=900, show_spinner=False)
