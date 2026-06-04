@@ -22,7 +22,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + OLD REFRESH + NEW PROJECTIONS + MLB PROJECTED LINEUPS + ENV PITCHCOUNT UMPIRE + ENV UI CARDS" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + OLD REFRESH + NEW PROJECTIONS + MLB PROJECTED LINEUPS + ENV PITCHCOUNT UMPIRE + ENV UI CARDS + MULTI PROP TABS + VOLUME SAFETY + TRUE CALIBRATION" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -1211,29 +1211,6 @@ def apply_true_probability_calibration(fair_prob, context, calibration_profile, 
     note = f"True probability calibration {shift:+.1%} | reliability {reliability:.2f} | noise {noise_strength:.2f}"
     return final, {"active": abs(shift) >= 0.002, "shift": round(float(shift), 4), "note": note, "reliability": round(reliability, 3), "noise_strength": round(noise_strength, 3)}
 
-def build_true_calibration_dashboard(results):
-    profile = build_model_calibration_profile(results or [])
-    rows = []
-    for tag, b in (profile.get("bucket_stats") or {}).items():
-        rows.append({
-            "Bucket": tag,
-            "Samples": b.get("count"),
-            "Wins": b.get("wins"),
-            "Smoothed Win Rate": round((b.get("win_rate") or 0) * 100, 1),
-            "Raw Win Rate": round((b.get("raw_win_rate") or 0) * 100, 1),
-            "Avg Pred %": round((b.get("avg_pred") or 0) * 100, 1),
-            "Prob Delta %": round(((b.get("win_rate") or 0.5) - (b.get("avg_pred") or 0.5)) * 100, 1),
-            "Bias Ks": b.get("bias"),
-            "MAE Ks": b.get("mae"),
-        })
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.sort_values(["Samples", "Prob Delta %"], ascending=[False, False])
-    return profile, df
-
-# =========================
-# MLB DATA
-# =========================
 def target_dates(day_mode):
     now = california_now()
     today = now.strftime("%Y-%m-%d")
@@ -5875,6 +5852,142 @@ def render_pick_card(p):
     </div>
     """, unsafe_allow_html=True)
 
+
+
+
+# =========================
+# MULTI-PROP PITCHER TABS
+# UI/projection extension only. Does NOT change strikeout math.
+# =========================
+MULTI_PROP_TABS_ENABLED = True
+
+def _mp_avg(rows, key, n=5, default=None):
+    vals=[]
+    for r in (rows or [])[:n]:
+        if isinstance(r, dict):
+            v=safe_float(r.get(key))
+            if v is not None:
+                vals.append(v)
+    return float(np.mean(vals)) if vals else default
+
+def _mp_expected_bf(row):
+    for k in ["Exp BF","expected_bf","Expected BF","BF Projection"]:
+        v=safe_float((row or {}).get(k))
+        if v is not None:
+            return float(clamp(v, 10, 34))
+    rr=(row or {}).get("recent_rows") or (row or {}).get("Recent Rows") or []
+    return float(clamp(_mp_avg(rr,"BF",5,DEFAULT_BF) or DEFAULT_BF, 10, 34))
+
+def _mp_pitcher_rates(pid):
+    out={"bb":0.085,"hits":0.230,"er":0.105,"outs_bf":0.72,"source":"fallback"}
+    if not pid:
+        return out
+    data=safe_get_json(f"{MLB_BASE}/people/{pid}/stats", params={"stats":"season","group":"pitching"}, timeout=14)
+    try:
+        split=get_first_stat_split(data)
+        stt=(split or {}).get("stat",{})
+        bf=safe_float(stt.get("battersFaced"),0) or 0
+        ip=baseball_ip_to_float(stt.get("inningsPitched"))
+        if bf>0:
+            out["bb"]=clamp((safe_float(stt.get("baseOnBalls"),0) or 0)/bf,0.025,0.180)
+            out["hits"]=clamp((safe_float(stt.get("hits"),0) or 0)/bf,0.120,0.360)
+            out["er"]=clamp((safe_float(stt.get("earnedRuns"),0) or 0)/bf,0.030,0.210)
+        if bf>0 and ip:
+            out["outs_bf"]=clamp((ip*3.0)/bf,0.52,0.86)
+        out["source"]="season"
+    except Exception:
+        pass
+    return out
+
+def _mp_line(row, keys):
+    for k in keys:
+        v=safe_float((row or {}).get(k))
+        if v is not None:
+            return v
+    return None
+
+def multi_prop_project_pitcher(row, prop_type):
+    row=row or {}
+    pid=row.get("pitcher_id") or row.get("Pitcher ID")
+    rr=row.get("recent_rows") or row.get("Recent Rows") or []
+    ebf=_mp_expected_bf(row)
+    try:
+        dummy, ebf, _ = apply_pitch_count_trend_overlay(row, 0.0, ebf, rr)
+        dummy, ebf, _ = apply_weather_engine_upgrade_overlay(row, 0.0, ebf)
+    except Exception:
+        pass
+    rates=_mp_pitcher_rates(pid)
+
+    if prop_type=="Pitching Outs":
+        base=ebf*rates["outs_bf"]
+        recent=_mp_avg(rr,"IP_float",5,None)
+        recent=recent*3.0 if recent is not None else None
+        proj=base*0.62+recent*0.38 if recent is not None else base
+        proj=clamp(proj,3,27)
+        line=_mp_line(row,["Pitching Outs Line","Outs Line","outs_line","line_outs"])
+        note="Best secondary prop. Uses expected BF, outs/BF, recent IP, pitch trend, weather BF."
+    elif prop_type=="Walks Allowed":
+        base=ebf*rates["bb"]
+        recent=_mp_avg(rr,"BB",5,None)
+        proj=base*0.70+recent*0.30 if recent is not None else base
+        proj=clamp(proj,0.1,6.5)
+        line=_mp_line(row,["Walks Line","BB Line","walks_line","line_walks"])
+        note="Good secondary prop. Uses BB/BF, expected BF, and recent BB."
+    elif prop_type=="Earned Runs":
+        base=ebf*rates["er"]
+        recent=_mp_avg(rr,"ER",5,None)
+        proj=base*0.68+recent*0.32 if recent is not None else base
+        proj=clamp(proj,0.1,8)
+        line=_mp_line(row,["Earned Runs Line","ER Line","earned_runs_line","line_er"])
+        note="More volatile: sequencing, BABIP, defense and bullpen matter."
+    else:
+        base=ebf*rates["hits"]
+        recent=_mp_avg(rr,"H",5,None)
+        proj=base*0.68+recent*0.32 if recent is not None else base
+        proj=clamp(proj,0.5,12)
+        line=_mp_line(row,["Hits Allowed Line","Hits Line","hits_allowed_line","line_hits_allowed"])
+        note="More volatile than Ks/outs because BABIP and defense matter."
+
+    if line is None:
+        direction="NO LINE"; edge=None; decision="NO LINE"; tier="NO LINE"
+    else:
+        edge=round(proj-line,2)
+        direction="OVER" if edge>0 else "UNDER"
+        ae=abs(edge)
+        if prop_type in ["Pitching Outs","Walks Allowed"]:
+            if ae>=1.2: tier="A"; decision=f"🔥 {direction}"
+            elif ae>=0.75: tier="B"; decision=f"✅ {direction}"
+            elif ae>=0.35: tier="C"; decision=f"⚠️ {direction}"
+            else: tier="PASS"; decision=f"🚫 P{direction[0]}"
+        else:
+            if ae>=1.4: tier="B"; decision=f"✅ {direction}"
+            elif ae>=0.85: tier="C"; decision=f"⚠️ {direction}"
+            else: tier="PASS"; decision=f"🚫 P{direction[0]}"
+
+    return {"Pitcher":row.get("pitcher") or row.get("Pitcher"),"Matchup":row.get("matchup") or row.get("Matchup"),"Prop":prop_type,
+            "Projection":round(float(proj),2),"Line":line,"Edge":edge,"Pick":decision,"Tier":tier,
+            "Expected BF":round(float(ebf),2),"Pitch Trend":row.get("Pitch Trend Label"),
+            "Team Hook":row.get("Team Hook Label"),"Weather":row.get("Weather Upgrade Label"),"Note":note}
+
+def build_multi_prop_table(rows, prop_type):
+    data=[multi_prop_project_pitcher(r,prop_type) for r in (rows or []) if isinstance(r,dict)]
+    df=pd.DataFrame(data)
+    if not df.empty:
+        df["_line_sort"]=df["Line"].apply(lambda x:0 if pd.notna(x) else 1)
+        df["_edge_sort"]=df["Edge"].apply(lambda x:abs(safe_float(x,0) or 0))
+        df=df.sort_values(["_line_sort","_edge_sort"], ascending=[True,False]).drop(columns=["_line_sort","_edge_sort"])
+    return df
+
+def render_multi_prop_tab(rows, prop_type):
+    st.markdown(f"### {prop_type}")
+    st.caption("Uses the same refreshed pitchers/workload context. Lines show if that prop line is available or mapped into the row.")
+    df=build_multi_prop_table(rows, prop_type)
+    if df.empty:
+        st.info("Refresh the live board first.")
+    else:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+
 # =========================
 # APP
 # =========================
@@ -6842,6 +6955,18 @@ def kproj_upside_projection(p):
     proj, expected_bf, pitch_trend_prof = apply_pitch_count_trend_overlay(p, proj, expected_bf, recent_rows_micro)
     proj, umpire_micro_prof = apply_umpire_micro_overlay(p, proj)
     proj, expected_bf, weather_upgrade_prof = apply_weather_engine_upgrade_overlay(p, proj, expected_bf)
+    active_line_for_volume = safe_float(p.get("line") or p.get("Line") or p.get("UD/Line") or p.get("active_line"))
+    proj, volume_safety_prof = apply_high_projection_volume_safety(p, proj, active_line_for_volume, expected_bf)
+    pid_for_learning = p.get("pitcher_id") or p.get("Pitcher ID")
+    proj, controlled_scale, controlled_learning_info = apply_controlled_learning(pid_for_learning, proj)
+    active_line_for_cal = safe_float(p.get("line") or p.get("Line") or p.get("UD/Line") or p.get("active_line"))
+    cal_ctx = current_calibration_context(p, proj, active_line_for_cal)
+    proj, true_cal_info = apply_true_projection_calibration(proj, active_line_for_cal, cal_ctx, load_json(RESULT_LOG, []))
+    p["Controlled Learning Scale"] = round(float(controlled_scale), 3)
+    p["Controlled Learning Note"] = controlled_learning_info.get("note")
+    p["True Calibration Active"] = true_cal_info.get("active")
+    p["True Calibration Shift"] = true_cal_info.get("shift")
+    p["True Calibration Note"] = true_cal_info.get("message")
     return round(float(clamp(proj, 0.0, 15.0)), 2)
 
 # =========================
@@ -7497,7 +7622,7 @@ def render_environment_mobile_panel(p):
         <div class="small-muted">
             <b>Pitch Trend:</b> {pitch_note}<br>
             <b>Weather:</b> {weather_note}<br>
-            <b>Umpire:</b> {ump_note}
+            <b>Umpire:</b> {ump_note}<br>\n            <b>Volume:</b> {p.get("Volume Safety Note") or "Volume safety clear."}<br>\n            <b>Needs 7+ Innings:</b> {p.get("Needs 7+ Innings Flag") or "NO"}
         </div>
         """, unsafe_allow_html=True)
 
@@ -8285,6 +8410,145 @@ def apply_weather_engine_upgrade_overlay(row=None, projection=None, expected_bf=
     return proj, bf, {"label": label, "k_nudge": k_nudge, "bf_adj": bf_adj}
 
 
+
+
+
+# =========================
+# HIGH-PROJECTION VOLUME SAFETY TWEAK
+# Small capped overlay only:
+# - Does NOT flip strong overs to unders
+# - Mainly downgrades fragile high-projection overs to B/C/PASS
+# - Adds "Needs 7+ Innings" warning flag
+# =========================
+HIGH_PROJ_VOLUME_SAFETY_ENABLED = True
+HIGH_PROJ_VOLUME_TAX_MAX_K = 0.38
+HIGH_PROJ_VOLUME_TAX_START = 7.45
+HIGH_PROJ_PASS_EDGE_MIN = 0.65
+
+def high_projection_volume_safety_profile(row=None, projection=None, line=None, expected_bf=None):
+    row = row or {}
+    proj = safe_float(projection, None)
+    ln = safe_float(line, None)
+    bf = safe_float(expected_bf, None)
+
+    wl2_score = safe_float(row.get("WL2 Leash Score"), None)
+    wl2_label = str(row.get("WL2 Label") or "").upper()
+    pitch_trend = str(row.get("Pitch Trend Label") or "").upper()
+    team_hook = str(row.get("Team Hook Label") or "").upper()
+
+    active = False
+    tax = 0.0
+    flags = []
+    needs_deep = False
+    pass_tighten = False
+
+    if not HIGH_PROJ_VOLUME_SAFETY_ENABLED or proj is None:
+        return {
+            "active": False,
+            "tax": 0.0,
+            "needs_deep": False,
+            "pass_tighten": False,
+            "label": "VOLUME_SAFETY_OFF_OR_NO_PROJ",
+            "flags": [],
+        }
+
+    edge = None if ln is None else proj - ln
+
+    wl2_elite = (wl2_score is not None and wl2_score >= 76) or any(x in wl2_label for x in ["ELITE", "STRONG"])
+    pitch_up = "UP" in pitch_trend and "DOWN" not in pitch_trend
+    quick_hook = any(x in team_hook for x in ["QUICK", "SHORT", "HOOK"])
+
+    # Deep-start warning. This is mostly UI/decision context.
+    if proj >= 7.25 or (bf is not None and bf >= 27.0):
+        needs_deep = True
+        flags.append("NEEDS_7_PLUS_INNINGS")
+
+    # Small tax only for very high projections that do not have elite volume support.
+    if proj >= HIGH_PROJ_VOLUME_TAX_START and not (wl2_elite and pitch_up):
+        active = True
+        base_tax = 0.16
+        if proj >= 8.0:
+            base_tax += 0.08
+        if proj >= 8.5:
+            base_tax += 0.06
+        if wl2_score is not None and wl2_score < 60:
+            base_tax += 0.08
+        if not pitch_up:
+            base_tax += 0.05
+        if quick_hook:
+            base_tax += 0.08
+        tax = clamp(base_tax, 0.0, HIGH_PROJ_VOLUME_TAX_MAX_K)
+        flags.append("HIGH_PROJ_VOLUME_TAX")
+
+    # Tighten small-edge overs unless workload support is clearly strong.
+    if ln is not None and edge is not None and edge > 0:
+        if edge < HIGH_PROJ_PASS_EDGE_MIN and not wl2_elite:
+            pass_tighten = True
+            flags.append("SMALL_EDGE_PASS_TIGHTEN")
+
+    if needs_deep and not wl2_elite:
+        flags.append("DEEP_START_NOT_ELITE_CONFIRMED")
+
+    if active:
+        label = "VOLUME_TAX_ACTIVE"
+    elif pass_tighten:
+        label = "PASS_TIGHTEN_ACTIVE"
+    elif needs_deep:
+        label = "NEEDS_DEEP_START_FLAG"
+    else:
+        label = "VOLUME_SAFETY_CLEAR"
+
+    return {
+        "active": active,
+        "tax": round(float(tax), 2),
+        "needs_deep": needs_deep,
+        "pass_tighten": pass_tighten,
+        "label": label,
+        "flags": flags,
+    }
+
+def apply_high_projection_volume_safety(row=None, projection=None, line=None, expected_bf=None):
+    row = row or {}
+    prof = high_projection_volume_safety_profile(row, projection, line, expected_bf)
+    proj = safe_float(projection, None)
+    tax = safe_float(prof.get("tax"), 0) or 0
+    if proj is not None and tax > 0:
+        proj = round(float(clamp(proj - tax, 0, 18)), 3)
+
+    row["Volume Safety Label"] = prof.get("label")
+    row["Volume Safety Tax"] = tax
+    row["Needs 7+ Innings Flag"] = "YES" if prof.get("needs_deep") else "NO"
+    row["Pass Tighten Flag"] = "YES" if prof.get("pass_tighten") else "NO"
+    row["Volume Safety Note"] = f"{prof.get('label')} | tax -{tax:.2f} | {'/'.join(prof.get('flags') or [])}"
+    return proj, prof
+
+def apply_volume_safety_classification(row=None):
+    row = row or {}
+    if row.get("Pass Tighten Flag") == "YES":
+        decision = str(row.get("WL2 Decision") or row.get("Ace Ceiling Decision") or row.get("Projection First Decision") or row.get("Decision") or "")
+        tier = str(row.get("WL2 Tier") or row.get("Ace Ceiling Tier") or row.get("Projection First Tier") or row.get("Tier") or "")
+        # Only soften OVERs; never flip to under.
+        if "O" in decision.upper() or "OVER" in decision.upper():
+            row["Volume Safety Decision"] = "🚫 PO"
+            row["Volume Safety Tier"] = "PASS"
+        else:
+            row["Volume Safety Decision"] = decision
+            row["Volume Safety Tier"] = tier
+    elif row.get("Volume Safety Label") == "VOLUME_TAX_ACTIVE":
+        decision = str(row.get("WL2 Decision") or row.get("Ace Ceiling Decision") or row.get("Projection First Decision") or row.get("Decision") or "")
+        tier = str(row.get("WL2 Tier") or row.get("Ace Ceiling Tier") or row.get("Projection First Tier") or row.get("Tier") or "")
+        if "A" in tier and ("O" in decision.upper() or "OVER" in decision.upper()):
+            row["Volume Safety Decision"] = decision.replace("🔥", "✅")
+            row["Volume Safety Tier"] = "B"
+        elif "B" in tier and ("O" in decision.upper() or "OVER" in decision.upper()):
+            row["Volume Safety Decision"] = decision.replace("🔥", "⚠️").replace("✅", "⚠️")
+            row["Volume Safety Tier"] = "C"
+        else:
+            row["Volume Safety Decision"] = decision
+            row["Volume Safety Tier"] = tier
+    return row
+
+
 def build_kproj_table(board):
     rows = []
     for p in board or []:
@@ -8299,6 +8563,7 @@ def build_kproj_table(board):
         apply_ace_ceiling_protection_to_row(p)
         apply_workload_leash_2_classification(p)
         final_true_projection_quality_gate(p)
+        apply_volume_safety_classification(p)
         rows.append({
             "Pitcher": p.get("pitcher"),
             "Matchup": p.get("matchup"),
@@ -8311,7 +8576,7 @@ def build_kproj_table(board):
             "Under Sim %": None if dist.get("under_prob") is None else round(dist.get("under_prob") * 100, 1),
             "UD/Line": d.get("line"),
             "Line Source": d.get("line_source"),
-            "Decision": p.get("WL2 Decision") or p.get("Ace Ceiling Decision") or p.get("Projection First Decision") or d.get("decision"),
+            "Decision": p.get("Volume Safety Decision") or p.get("WL2 Decision") or p.get("Ace Ceiling Decision") or p.get("Projection First Decision") or d.get("decision"),
             "Base Decision": d.get("decision"),
             "Model Lean": d.get("lean_side"),
             "Lean Gap": d.get("lean_gap"),
@@ -8323,7 +8588,7 @@ def build_kproj_table(board):
             "Putaway/Whiff": p.get("statcast_whiff") or p.get("statcast_csw"),
             "Lineup": p.get("lineup_status"),
             "Hit Rate %": None if d.get("hit_rate") is None else round(d.get("hit_rate") * 100, 1),
-            "Tier": p.get("WL2 Tier") or p.get("Ace Ceiling Tier") or p.get("Projection First Tier") or d.get("tier"),
+            "Tier": p.get("Volume Safety Tier") or p.get("WL2 Tier") or p.get("Ace Ceiling Tier") or p.get("Projection First Tier") or d.get("tier"),
             "Confidence Mode": p.get("Projection First Label"),
             "Confidence Note": p.get("Projection First Note"),
             "Ace Ceiling Label": p.get("Ace Ceiling Label"),
@@ -8347,6 +8612,16 @@ def build_kproj_table(board):
             "Weather Upgrade Label": p.get("Weather Upgrade Label"),
             "Weather Upgrade K Nudge": p.get("Weather Upgrade K Nudge"),
             "Weather Upgrade BF Adj": p.get("Weather Upgrade BF Adj"),
+            "Volume Safety Label": p.get("Volume Safety Label"),
+            "Volume Safety Tax": p.get("Volume Safety Tax"),
+            "Needs 7+ Innings": p.get("Needs 7+ Innings Flag"),
+            "Pass Tighten": p.get("Pass Tighten Flag"),
+            "Volume Safety Note": p.get("Volume Safety Note"),
+            "True Calibration Active": p.get("True Calibration Active"),
+            "True Calibration Shift": p.get("True Calibration Shift"),
+            "True Calibration Note": p.get("True Calibration Note"),
+            "Controlled Learning Scale": p.get("Controlled Learning Scale"),
+            "Controlled Learning Note": p.get("Controlled Learning Note"),
             "Base Tier": d.get("tier"),
             "Role Score": d.get("role_score"),
             "Starter Score": d.get("starter_score"),
@@ -10543,7 +10818,7 @@ def inject_mobile_k_card_fix():
     """, unsafe_allow_html=True)
 
 
-tab_kproj, tab_final_board, tab_moneyline_edge, tab_lineup_lock, tab_results_dash, tab_auto_results, tab_safe_vol, tab_pitch_ump, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab_kproj, tab_final_board, tab_moneyline_edge, tab_lineup_lock, tab_results_dash, tab_auto_results, tab_safe_vol, tab_pitch_ump, tab2, tab3, tab4, tab5, tab6, tab_pitching_outs, tab_walks_allowed, tab_earned_runs, tab_hits_allowed, tab_true_calibration= st.tabs([
     'K PROJ / UPSIDE',
     'FINAL BOARD',
     'MONEYLINE EDGE',
@@ -10556,8 +10831,9 @@ tab_kproj, tab_final_board, tab_moneyline_edge, tab_lineup_lock, tab_results_das
     'OFFICIAL SAVE / GRADE',
     'CALIBRATION',
     'SOURCE LOG',
-    'SETTINGS'
-])
+    'SETTINGS',
+    "Pitching Outs", "Walks Allowed", "Earned Runs", "Hits Allowed",
+    "🧠 Calibration"])
 
 with tab_kproj:
     render_kproj_tab(board)
@@ -10597,3 +10873,112 @@ with tab5:
 
 with tab6:
     render_settings_visible_tab(board, dates)
+# =========================
+# MULTI-PROP TAB RENDERERS
+# =========================
+try:
+    _multi_prop_rows = st.session_state.get("projections", [])
+    with tab_pitching_outs:
+        render_multi_prop_tab(_multi_prop_rows, "Pitching Outs")
+    with tab_walks_allowed:
+        render_multi_prop_tab(_multi_prop_rows, "Walks Allowed")
+    with tab_earned_runs:
+        render_multi_prop_tab(_multi_prop_rows, "Earned Runs")
+    with tab_hits_allowed:
+        render_multi_prop_tab(_multi_prop_rows, "Hits Allowed")
+except NameError:
+    pass
+
+
+
+
+# =========================
+# TRUE CALIBRATION DASHBOARD + CONTROLLED LEARNING FALLBACKS
+# Added if missing from patch path.
+# =========================
+def apply_controlled_learning(pid, projection):
+    if not globals().get("CONTROLLED_LEARNING_ENABLED", True) or not pid:
+        return projection, 1.0, {"active": False, "note": "Controlled learning off/no pitcher"}
+    data = load_json(LEARN_FILE, {})
+    scale = safe_float(data.get(str(pid)), 1.0) or 1.0
+    proj = safe_float(projection)
+    if proj is None:
+        return projection, scale, {"active": False, "note": "No projection"}
+    return round(float(clamp(proj * scale, 0, 18)), 3), scale, {"active": abs(scale - 1.0) >= 0.005, "note": f"Controlled scale {scale:.3f}"}
+
+def controlled_learning_sample_count(pid):
+    results = load_json(RESULT_LOG, [])
+    total = 0
+    for r in results:
+        if str(r.get("pitcher_id") or r.get("Pitcher ID")) == str(pid):
+            actual = safe_float(r.get("actual") or r.get("Actual") or r.get("actual_ks") or r.get("Actual Ks"))
+            proj = safe_float(r.get("projection") or r.get("K PROJ") or r.get("Projection") or r.get("proj"))
+            if actual is not None and proj is not None:
+                total += 1
+    return total
+
+def update_controlled_learning(pid, projected, actual):
+    if not globals().get("CONTROLLED_LEARNING_ENABLED", True) or not pid:
+        return None
+    projected = safe_float(projected)
+    actual = safe_float(actual)
+    if projected is None or actual is None or projected <= 0:
+        return None
+    prior = controlled_learning_sample_count(pid)
+    data = load_json(LEARN_FILE, {})
+    current = safe_float(data.get(str(pid)), 1.0) or 1.0
+    min_starts = globals().get("CONTROLLED_LEARNING_MIN_PRIOR_STARTS", 5)
+    if prior < min_starts:
+        data[str(pid)] = current
+        save_json(LEARN_FILE, data)
+        return current
+    rate = globals().get("CONTROLLED_LEARNING_RATE", 0.035)
+    lo = globals().get("CONTROLLED_LEARNING_SCALE_MIN", 0.94)
+    hi = globals().get("CONTROLLED_LEARNING_SCALE_MAX", 1.06)
+    err = clamp((actual - projected) / max(1.0, projected), -0.35, 0.35)
+    new_scale = clamp(current * (1 + rate * err), lo, hi)
+    data[str(pid)] = round(float(new_scale), 4)
+    save_json(LEARN_FILE, data)
+    return new_scale
+
+def build_true_calibration_dashboard(results=None):
+    profile = build_true_calibration_profile(results or load_json(RESULT_LOG, []))
+    rows = []
+    for tag, b in (profile.get("bucket_stats") or {}).items():
+        rows.append({
+            "Bucket": tag,
+            "Samples": b.get("count"),
+            "Wins": b.get("wins"),
+            "Smoothed Win Rate": round((b.get("win_rate") or 0) * 100, 1),
+            "Raw Win Rate": round((b.get("raw_win_rate") or 0) * 100, 1),
+            "Avg Pred %": round((b.get("avg_pred") or 0) * 100, 1),
+            "Bias Ks": b.get("bias"),
+            "MAE Ks": b.get("mae"),
+        })
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+def render_true_calibration_tab():
+    st.markdown("### 🧠 True Calibration Engine")
+    st.caption("Audits model bias by side/source/probability/edge/line buckets. Small capped shifts only after enough graded samples.")
+    results = load_json(RESULT_LOG, [])
+    profile = build_true_calibration_profile(results)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Samples", profile.get("samples", 0))
+    c2.metric("MAE Ks", profile.get("mae") if profile.get("mae") is not None else "—")
+    c3.metric("Bias Ks", profile.get("bias") if profile.get("bias") is not None else "—")
+    c4.metric("Quality", profile.get("quality_score", 50))
+    df = build_true_calibration_dashboard(results)
+    if df.empty:
+        st.info("Needs graded results before calibration buckets populate.")
+    else:
+        st.dataframe(df.sort_values("Samples", ascending=False), use_container_width=True, hide_index=True)
+
+
+# =========================
+# TRUE CALIBRATION TAB RENDERER
+# =========================
+try:
+    with tab_true_calibration:
+        render_true_calibration_tab()
+except NameError:
+    pass
