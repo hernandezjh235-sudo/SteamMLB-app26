@@ -22,7 +22,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + OLD REFRESH + NEW PROJECTIONS + MLB PROJECTED LINEUPS + ENV PITCHCOUNT UMPIRE + ENV UI CARDS + MULTI PROP TABS + VOLUME SAFETY + TRUE CALIBRATION" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + OLD REFRESH + NEW PROJECTIONS + MLB PROJECTED LINEUPS + ENV PITCHCOUNT UMPIRE + ENV UI CARDS + MULTI PROP TABS + VOLUME SAFETY + TRUE CALIBRATION + CALIBRATION FIXED ORDER" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -937,53 +937,6 @@ def calibration_line_source_group(source):
         return "sportsgameodds"
     return "other"
 
-def calibration_bucket(value, cuts, labels):
-    v = safe_float(value)
-    if v is None:
-        return "unknown"
-    for cut, label in zip(cuts, labels):
-        if v <= cut:
-            return label
-    return labels[-1] if labels else "unknown"
-
-def calibration_tags_from_row(row):
-    side = str(row.get("pick_side") or "UNKNOWN").upper()
-    src_group = calibration_line_source_group(row.get("line_source"))
-    prob = safe_float(row.get("fair_probability"))
-    edge = safe_float(row.get("abs_edge"))
-    line = safe_float(row.get("line"))
-    score = safe_float(row.get("data_score"))
-    risk = str(row.get("risk_label") or "UNKNOWN").upper()
-    lineup = "locked" if row.get("lineup_locked") else "fallback"
-    price = "real_price" if row.get("price_is_real") else "estimated_price"
-
-    bullpen_status = str(row.get("bullpen_status") or "UNKNOWN").upper()
-    umpire_name = normalize_name(row.get("umpire") or "Unknown").replace(" ", "_")
-    manager_hook = str(row.get("manager_hook_status") or row.get("manager_hook") or "UNKNOWN").upper()
-    weather_factor = safe_float(row.get("weather_factor"))
-    ump_factor = safe_float(row.get("ump_factor"))
-    bf_factor = safe_float(row.get("bullpen_bf_factor"))
-
-    return [
-        f"prop={calibration_prop_type(row)}",
-        f"side={side}",
-        f"source={src_group}",
-        f"side_source={side}_{src_group}",
-        f"prob_bucket={calibration_bucket(prob, [0.54,0.58,0.62,0.66,0.70,0.76], ['p<=54','p55-58','p59-62','p63-66','p67-70','p71-76','p77+'])}",
-        f"edge_bucket={calibration_bucket(edge, [0.49,0.99,1.49,1.99,2.49], ['e<0.5','e0.5-1.0','e1.0-1.5','e1.5-2.0','e2.0-2.5','e2.5+'])}",
-        f"line_bucket={calibration_bucket(line, [3.5,4.5,5.5,6.5], ['l<=3.5','l4.5','l5.5','l6.5','l7+'])}",
-        f"score_bucket={calibration_bucket(score, [69,79,87,92,96], ['s<70','s70s','s80-87','s88-92','s93-96','s97+'])}",
-        f"risk={risk}",
-        f"lineup={lineup}",
-        f"price={price}",
-        f"bullpen={bullpen_status}",
-        f"manager_hook={manager_hook}",
-        f"umpire={umpire_name}",
-        f"weather_bucket={calibration_bucket(weather_factor, [0.975,0.995,1.005,1.025], ['weather_low','weather_slight_low','weather_neutral','weather_slight_high','weather_high'])}",
-        f"ump_factor_bucket={calibration_bucket(ump_factor, [0.985,0.995,1.005,1.015], ['ump_low','ump_slight_low','ump_neutral','ump_slight_high','ump_high'])}",
-        f"bullpen_factor_bucket={calibration_bucket(bf_factor, [0.975,0.995,1.005,1.025], ['bp_cut','bp_slight_cut','bp_neutral','bp_slight_boost','bp_boost'])}",
-    ]
-
 def build_model_calibration_profile(results):
     finished = [r for r in (results or [])[-CALIBRATION_RECENT_LIMIT:] if r.get("actual") is not None and r.get("projection") is not None]
     finished = [r for r in finished if r.get("graded_result") in ["WIN", "LOSS"] or r.get("win") is not None]
@@ -1070,35 +1023,6 @@ def build_model_calibration_profile(results):
         pass
     return profile
 
-def current_calibration_context(row, mean, active_line, active_source, fair_probability=None, price_is_real=False, score=None, risk_label=None, p10=None, p90=None):
-    line = safe_float(active_line)
-    proj = safe_float(mean)
-    side = "NO LINE"
-    if line is not None and proj is not None:
-        side = "OVER" if proj > line else "UNDER"
-    gap = None if line is None or proj is None else abs(proj - line)
-    return {
-        "prop_type": "pitcher_ks",
-        "pick_side": side,
-        "line_source": active_source,
-        "line": line,
-        "projection": proj,
-        "abs_edge": gap,
-        "fair_probability": fair_probability,
-        "price_is_real": price_is_real,
-        "data_score": score,
-        "risk_label": risk_label,
-        "lineup_locked": bool(row.get("lineup_locked")) if isinstance(row, dict) else False,
-        "bullpen_status": row.get("bullpen_status") if isinstance(row, dict) else None,
-        "bullpen_bf_factor": row.get("bullpen_bf_factor") if isinstance(row, dict) else None,
-        "manager_hook_status": row.get("manager_hook_status") or row.get("manager_hook") if isinstance(row, dict) else None,
-        "umpire": row.get("umpire") if isinstance(row, dict) else None,
-        "ump_factor": row.get("ump_factor") if isinstance(row, dict) else None,
-        "weather_factor": row.get("weather_factor") if isinstance(row, dict) else None,
-        "p10": p10,
-        "p90": p90,
-    }
-
 def calibration_weighted_bucket_blend(profile, context, mode="bias"):
     if not profile or profile.get("samples", 0) <= 0:
         return None
@@ -1144,72 +1068,6 @@ def apply_calibration_adjustment(k_rate, calibration_profile, enabled=True):
     confidence = clamp((quality - 45) / 55, 0.15, 0.85)
     factor = clamp(1 + (bias * 0.006 * confidence), 0.975, 1.025)
     return clamp(k_rate * factor, 0.08, 0.50), f"True calibration K-rate n={calibration_profile.get('samples')} x{factor:.3f}"
-
-def apply_true_projection_calibration(mean, sims, context, calibration_profile, enabled=True):
-    if not enabled:
-        return mean, sims, {"active": False, "shift": 0.0, "note": "True calibration disabled"}
-    if not calibration_profile or calibration_profile.get("samples", 0) < CALIBRATION_MIN_GLOBAL_SAMPLES:
-        n = 0 if not calibration_profile else calibration_profile.get("samples", 0)
-        return mean, sims, {"active": False, "shift": 0.0, "note": f"True calibration warming up ({n}/{CALIBRATION_MIN_GLOBAL_SAMPLES})"}
-
-    global_bias = safe_float(calibration_profile.get("bias"), 0.0) or 0.0
-    blend = calibration_weighted_bucket_blend(calibration_profile, context, mode="bias")
-    bucket_bias = safe_float(blend.get("value")) if blend else None
-    if bucket_bias is None:
-        raw_shift = global_bias * 0.45
-        used = "global"
-        sample_strength = calibration_profile.get("samples", 0)
-    else:
-        raw_shift = (global_bias * 0.30) + (bucket_bias * 0.70)
-        used = "bucket+global"
-        sample_strength = blend.get("sample_strength", 0)
-
-    quality = safe_float(calibration_profile.get("quality_score"), 50) or 50
-    strength = clamp((quality / 100.0) * (sample_strength / (sample_strength + 80.0)), 0.10, 0.85)
-    shift = clamp(raw_shift * strength, -CALIBRATION_MAX_PROJ_SHIFT_KS, CALIBRATION_MAX_PROJ_SHIFT_KS)
-    if abs(shift) < 0.01:
-        return mean, sims, {"active": False, "shift": 0.0, "note": f"True calibration neutral ({used})"}
-    new_sims = np.clip(np.asarray(sims, dtype=float) + shift, 0, None)
-    new_mean = float(np.mean(new_sims))
-    return new_mean, new_sims, {
-        "active": True,
-        "shift": round(float(shift), 3),
-        "note": f"True calibration projection shift {shift:+.2f} Ks ({used}, q={int(quality)}, n={calibration_profile.get('samples')})"
-    }
-
-def apply_true_probability_calibration(fair_prob, context, calibration_profile, enabled=True):
-    p = safe_float(fair_prob)
-    if p is None:
-        return fair_prob, {"active": False, "shift": 0.0, "note": "No probability to calibrate"}
-    if not enabled:
-        return clamp(p, 0.01, 0.99), {"active": False, "shift": 0.0, "note": "True probability calibration disabled"}
-    if not calibration_profile or calibration_profile.get("samples", 0) < CALIBRATION_MIN_GLOBAL_SAMPLES:
-        n = 0 if not calibration_profile else calibration_profile.get("samples", 0)
-        return clamp(p, 0.01, 0.99), {"active": False, "shift": 0.0, "note": f"Probability calibration warming up ({n}/{CALIBRATION_MIN_GLOBAL_SAMPLES})"}
-
-    blend = calibration_weighted_bucket_blend(calibration_profile, context, mode="prob_delta")
-    delta = safe_float(blend.get("value")) if blend else 0.0
-    sample_strength = blend.get("sample_strength", 0) if blend else 0
-    quality = safe_float(calibration_profile.get("quality_score"), 50) or 50
-    reliability = clamp((quality / 100.0) * (sample_strength / (sample_strength + 70.0)), 0.0, 0.75)
-
-    # Noise dampening: wide simulation intervals, weak data, fallback lineups, and estimated odds get pulled toward 50%.
-    p10 = safe_float((context or {}).get("p10"))
-    p90 = safe_float((context or {}).get("p90"))
-    range_width = (p90 - p10) if p10 is not None and p90 is not None else None
-    volatility = clamp((range_width or 3.5) / CALIBRATION_NOISE_RANGE_SOFT_CAP, 0.65, 1.35)
-    score = safe_float((context or {}).get("data_score"), 80) or 80
-    score_shrink = clamp((score - 55) / 45.0, 0.35, 1.0)
-    lineup_shrink = 1.0 if (context or {}).get("lineup_locked") else 0.82
-    price_shrink = 1.0 if (context or {}).get("price_is_real") else 0.92
-    noise_strength = clamp(score_shrink * lineup_shrink * price_shrink / volatility, 0.38, 1.0)
-
-    shifted = p + clamp(delta * reliability, -CALIBRATION_MAX_PROB_SHIFT, CALIBRATION_MAX_PROB_SHIFT)
-    damped = 0.50 + ((shifted - 0.50) * noise_strength)
-    final = clamp(damped, 0.01, 0.99)
-    shift = final - p
-    note = f"True probability calibration {shift:+.1%} | reliability {reliability:.2f} | noise {noise_strength:.2f}"
-    return final, {"active": abs(shift) >= 0.002, "shift": round(float(shift), 4), "note": note, "reliability": round(reliability, 3), "noise_strength": round(noise_strength, 3)}
 
 def target_dates(day_mode):
     now = california_now()
@@ -6826,6 +6684,273 @@ def miss_by_one_bucket(proj, line, actual=None, side=None):
     return "LOST_BY_2_PLUS"
 
 
+
+# =========================
+# TRUE CALIBRATION + CONTROLLED LEARNING LAYER
+# Safe learning layer. Defined before K projection.
+# =========================
+TRUE_CALIBRATION_ENABLED = globals().get("TRUE_CALIBRATION_ENABLED", True)
+CONTROLLED_LEARNING_ENABLED = globals().get("CONTROLLED_LEARNING_ENABLED", True)
+CALIBRATION_ENGINE_FILE = globals().get("CALIBRATION_ENGINE_FILE", os.path.join(STORAGE_DIR, "true_calibration_engine.json"))
+CALIBRATION_MIN_GLOBAL_SAMPLES = globals().get("CALIBRATION_MIN_GLOBAL_SAMPLES", 25)
+CALIBRATION_MIN_BUCKET_SAMPLES = globals().get("CALIBRATION_MIN_BUCKET_SAMPLES", 8)
+CALIBRATION_MAX_PROJ_SHIFT_KS = globals().get("CALIBRATION_MAX_PROJ_SHIFT_KS", 0.25)
+CALIBRATION_MAX_PROB_SHIFT = globals().get("CALIBRATION_MAX_PROB_SHIFT", 0.06)
+CALIBRATION_PRIOR_STRENGTH = globals().get("CALIBRATION_PRIOR_STRENGTH", 18)
+CALIBRATION_RECENT_LIMIT = globals().get("CALIBRATION_RECENT_LIMIT", 2500)
+CONTROLLED_LEARNING_MIN_PRIOR_STARTS = globals().get("CONTROLLED_LEARNING_MIN_PRIOR_STARTS", 5)
+CONTROLLED_LEARNING_RATE = globals().get("CONTROLLED_LEARNING_RATE", 0.035)
+CONTROLLED_LEARNING_SCALE_MIN = globals().get("CONTROLLED_LEARNING_SCALE_MIN", 0.94)
+CONTROLLED_LEARNING_SCALE_MAX = globals().get("CONTROLLED_LEARNING_SCALE_MAX", 1.06)
+
+def calibration_bucket(value, cuts, labels):
+    v = safe_float(value)
+    if v is None:
+        return "unknown"
+    for cut, label in zip(cuts, labels):
+        if v <= cut:
+            return label
+    return labels[-1] if labels else "unknown"
+
+
+
+def calibration_tags_from_row(row):
+    side = str(row.get("pick_side") or "UNKNOWN").upper()
+    src_group = calibration_line_source_group(row.get("line_source"))
+    prob = safe_float(row.get("fair_probability"))
+    edge = safe_float(row.get("abs_edge"))
+    line = safe_float(row.get("line"))
+    score = safe_float(row.get("data_score"))
+    risk = str(row.get("risk_label") or "UNKNOWN").upper()
+    lineup = "locked" if row.get("lineup_locked") else "fallback"
+    price = "real_price" if row.get("price_is_real") else "estimated_price"
+
+    bullpen_status = str(row.get("bullpen_status") or "UNKNOWN").upper()
+    umpire_name = normalize_name(row.get("umpire") or "Unknown").replace(" ", "_")
+    manager_hook = str(row.get("manager_hook_status") or row.get("manager_hook") or "UNKNOWN").upper()
+    weather_factor = safe_float(row.get("weather_factor"))
+    ump_factor = safe_float(row.get("ump_factor"))
+    bf_factor = safe_float(row.get("bullpen_bf_factor"))
+
+    return [
+        f"prop={calibration_prop_type(row)}",
+        f"side={side}",
+        f"source={src_group}",
+        f"side_source={side}_{src_group}",
+        f"prob_bucket={calibration_bucket(prob, [0.54,0.58,0.62,0.66,0.70,0.76], ['p<=54','p55-58','p59-62','p63-66','p67-70','p71-76','p77+'])}",
+        f"edge_bucket={calibration_bucket(edge, [0.49,0.99,1.49,1.99,2.49], ['e<0.5','e0.5-1.0','e1.0-1.5','e1.5-2.0','e2.0-2.5','e2.5+'])}",
+        f"line_bucket={calibration_bucket(line, [3.5,4.5,5.5,6.5], ['l<=3.5','l4.5','l5.5','l6.5','l7+'])}",
+        f"score_bucket={calibration_bucket(score, [69,79,87,92,96], ['s<70','s70s','s80-87','s88-92','s93-96','s97+'])}",
+        f"risk={risk}",
+        f"lineup={lineup}",
+        f"price={price}",
+        f"bullpen={bullpen_status}",
+        f"manager_hook={manager_hook}",
+        f"umpire={umpire_name}",
+        f"weather_bucket={calibration_bucket(weather_factor, [0.975,0.995,1.005,1.025], ['weather_low','weather_slight_low','weather_neutral','weather_slight_high','weather_high'])}",
+        f"ump_factor_bucket={calibration_bucket(ump_factor, [0.985,0.995,1.005,1.015], ['ump_low','ump_slight_low','ump_neutral','ump_slight_high','ump_high'])}",
+        f"bullpen_factor_bucket={calibration_bucket(bf_factor, [0.975,0.995,1.005,1.025], ['bp_cut','bp_slight_cut','bp_neutral','bp_slight_boost','bp_boost'])}",
+    ]
+
+
+
+def current_calibration_context(row, mean, active_line, active_source, fair_probability=None, price_is_real=False, score=None, risk_label=None, p10=None, p90=None):
+    line = safe_float(active_line)
+    proj = safe_float(mean)
+    side = "NO LINE"
+    if line is not None and proj is not None:
+        side = "OVER" if proj > line else "UNDER"
+    gap = None if line is None or proj is None else abs(proj - line)
+    return {
+        "prop_type": "pitcher_ks",
+        "pick_side": side,
+        "line_source": active_source,
+        "line": line,
+        "projection": proj,
+        "abs_edge": gap,
+        "fair_probability": fair_probability,
+        "price_is_real": price_is_real,
+        "data_score": score,
+        "risk_label": risk_label,
+        "lineup_locked": bool(row.get("lineup_locked")) if isinstance(row, dict) else False,
+        "bullpen_status": row.get("bullpen_status") if isinstance(row, dict) else None,
+        "bullpen_bf_factor": row.get("bullpen_bf_factor") if isinstance(row, dict) else None,
+        "manager_hook_status": row.get("manager_hook_status") or row.get("manager_hook") if isinstance(row, dict) else None,
+        "umpire": row.get("umpire") if isinstance(row, dict) else None,
+        "ump_factor": row.get("ump_factor") if isinstance(row, dict) else None,
+        "weather_factor": row.get("weather_factor") if isinstance(row, dict) else None,
+        "p10": p10,
+        "p90": p90,
+    }
+
+
+
+def apply_true_projection_calibration(mean, sims, context, calibration_profile, enabled=True):
+    if not enabled:
+        return mean, sims, {"active": False, "shift": 0.0, "note": "True calibration disabled"}
+    if not calibration_profile or calibration_profile.get("samples", 0) < CALIBRATION_MIN_GLOBAL_SAMPLES:
+        n = 0 if not calibration_profile else calibration_profile.get("samples", 0)
+        return mean, sims, {"active": False, "shift": 0.0, "note": f"True calibration warming up ({n}/{CALIBRATION_MIN_GLOBAL_SAMPLES})"}
+
+    global_bias = safe_float(calibration_profile.get("bias"), 0.0) or 0.0
+    blend = calibration_weighted_bucket_blend(calibration_profile, context, mode="bias")
+    bucket_bias = safe_float(blend.get("value")) if blend else None
+    if bucket_bias is None:
+        raw_shift = global_bias * 0.45
+        used = "global"
+        sample_strength = calibration_profile.get("samples", 0)
+    else:
+        raw_shift = (global_bias * 0.30) + (bucket_bias * 0.70)
+        used = "bucket+global"
+        sample_strength = blend.get("sample_strength", 0)
+
+    quality = safe_float(calibration_profile.get("quality_score"), 50) or 50
+    strength = clamp((quality / 100.0) * (sample_strength / (sample_strength + 80.0)), 0.10, 0.85)
+    shift = clamp(raw_shift * strength, -CALIBRATION_MAX_PROJ_SHIFT_KS, CALIBRATION_MAX_PROJ_SHIFT_KS)
+    if abs(shift) < 0.01:
+        return mean, sims, {"active": False, "shift": 0.0, "note": f"True calibration neutral ({used})"}
+    new_sims = np.clip(np.asarray(sims, dtype=float) + shift, 0, None)
+    new_mean = float(np.mean(new_sims))
+    return new_mean, new_sims, {
+        "active": True,
+        "shift": round(float(shift), 3),
+        "note": f"True calibration projection shift {shift:+.2f} Ks ({used}, q={int(quality)}, n={calibration_profile.get('samples')})"
+    }
+
+
+
+def apply_true_probability_calibration(fair_prob, context, calibration_profile, enabled=True):
+    p = safe_float(fair_prob)
+    if p is None:
+        return fair_prob, {"active": False, "shift": 0.0, "note": "No probability to calibrate"}
+    if not enabled:
+        return clamp(p, 0.01, 0.99), {"active": False, "shift": 0.0, "note": "True probability calibration disabled"}
+    if not calibration_profile or calibration_profile.get("samples", 0) < CALIBRATION_MIN_GLOBAL_SAMPLES:
+        n = 0 if not calibration_profile else calibration_profile.get("samples", 0)
+        return clamp(p, 0.01, 0.99), {"active": False, "shift": 0.0, "note": f"Probability calibration warming up ({n}/{CALIBRATION_MIN_GLOBAL_SAMPLES})"}
+
+    blend = calibration_weighted_bucket_blend(calibration_profile, context, mode="prob_delta")
+    delta = safe_float(blend.get("value")) if blend else 0.0
+    sample_strength = blend.get("sample_strength", 0) if blend else 0
+    quality = safe_float(calibration_profile.get("quality_score"), 50) or 50
+    reliability = clamp((quality / 100.0) * (sample_strength / (sample_strength + 70.0)), 0.0, 0.75)
+
+    # Noise dampening: wide simulation intervals, weak data, fallback lineups, and estimated odds get pulled toward 50%.
+    p10 = safe_float((context or {}).get("p10"))
+    p90 = safe_float((context or {}).get("p90"))
+    range_width = (p90 - p10) if p10 is not None and p90 is not None else None
+    volatility = clamp((range_width or 3.5) / CALIBRATION_NOISE_RANGE_SOFT_CAP, 0.65, 1.35)
+    score = safe_float((context or {}).get("data_score"), 80) or 80
+    score_shrink = clamp((score - 55) / 45.0, 0.35, 1.0)
+    lineup_shrink = 1.0 if (context or {}).get("lineup_locked") else 0.82
+    price_shrink = 1.0 if (context or {}).get("price_is_real") else 0.92
+    noise_strength = clamp(score_shrink * lineup_shrink * price_shrink / volatility, 0.38, 1.0)
+
+    shifted = p + clamp(delta * reliability, -CALIBRATION_MAX_PROB_SHIFT, CALIBRATION_MAX_PROB_SHIFT)
+    damped = 0.50 + ((shifted - 0.50) * noise_strength)
+    final = clamp(damped, 0.01, 0.99)
+    shift = final - p
+    note = f"True probability calibration {shift:+.1%} | reliability {reliability:.2f} | noise {noise_strength:.2f}"
+    return final, {"active": abs(shift) >= 0.002, "shift": round(float(shift), 4), "note": note, "reliability": round(reliability, 3), "noise_strength": round(noise_strength, 3)}
+
+
+
+def apply_controlled_learning(pid, projection):
+    if not globals().get("CONTROLLED_LEARNING_ENABLED", True) or not pid:
+        return projection, 1.0, {"active": False, "note": "Controlled learning off/no pitcher"}
+    data = load_json(LEARN_FILE, {})
+    scale = safe_float(data.get(str(pid)), 1.0) or 1.0
+    proj = safe_float(projection)
+    if proj is None:
+        return projection, scale, {"active": False, "note": "No projection"}
+    return round(float(clamp(proj * scale, 0, 18)), 3), scale, {"active": abs(scale - 1.0) >= 0.005, "note": f"Controlled scale {scale:.3f}"}
+
+
+
+def controlled_learning_sample_count(pid):
+    results = load_json(RESULT_LOG, [])
+    total = 0
+    for r in results:
+        if str(r.get("pitcher_id") or r.get("Pitcher ID")) == str(pid):
+            actual = safe_float(r.get("actual") or r.get("Actual") or r.get("actual_ks") or r.get("Actual Ks"))
+            proj = safe_float(r.get("projection") or r.get("K PROJ") or r.get("Projection") or r.get("proj"))
+            if actual is not None and proj is not None:
+                total += 1
+    return total
+
+
+
+def update_controlled_learning(pid, projected, actual):
+    if not globals().get("CONTROLLED_LEARNING_ENABLED", True) or not pid:
+        return None
+    projected = safe_float(projected)
+    actual = safe_float(actual)
+    if projected is None or actual is None or projected <= 0:
+        return None
+    prior = controlled_learning_sample_count(pid)
+    data = load_json(LEARN_FILE, {})
+    current = safe_float(data.get(str(pid)), 1.0) or 1.0
+    min_starts = globals().get("CONTROLLED_LEARNING_MIN_PRIOR_STARTS", 5)
+    if prior < min_starts:
+        data[str(pid)] = current
+        save_json(LEARN_FILE, data)
+        return current
+    rate = globals().get("CONTROLLED_LEARNING_RATE", 0.035)
+    lo = globals().get("CONTROLLED_LEARNING_SCALE_MIN", 0.94)
+    hi = globals().get("CONTROLLED_LEARNING_SCALE_MAX", 1.06)
+    err = clamp((actual - projected) / max(1.0, projected), -0.35, 0.35)
+    new_scale = clamp(current * (1 + rate * err), lo, hi)
+    data[str(pid)] = round(float(new_scale), 4)
+    save_json(LEARN_FILE, data)
+    return new_scale
+
+
+
+def build_true_calibration_dashboard(results=None):
+    profile = build_true_calibration_profile(results or load_json(RESULT_LOG, []))
+    rows = []
+    for tag, b in (profile.get("bucket_stats") or {}).items():
+        rows.append({
+            "Bucket": tag,
+            "Samples": b.get("count"),
+            "Wins": b.get("wins"),
+            "Smoothed Win Rate": round((b.get("win_rate") or 0) * 100, 1),
+            "Raw Win Rate": round((b.get("raw_win_rate") or 0) * 100, 1),
+            "Avg Pred %": round((b.get("avg_pred") or 0) * 100, 1),
+            "Bias Ks": b.get("bias"),
+            "MAE Ks": b.get("mae"),
+        })
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+
+def render_true_calibration_tab():
+    st.markdown("### 🧠 True Calibration Engine")
+    st.caption("Audits model bias by side/source/probability/edge/line buckets. Small capped shifts only after enough graded samples.")
+    results = load_json(RESULT_LOG, [])
+    profile = build_true_calibration_profile(results)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Samples", profile.get("samples", 0))
+    c2.metric("MAE Ks", profile.get("mae") if profile.get("mae") is not None else "—")
+    c3.metric("Bias Ks", profile.get("bias") if profile.get("bias") is not None else "—")
+    c4.metric("Quality", profile.get("quality_score", 50))
+    df = build_true_calibration_dashboard(results)
+    if df.empty:
+        st.info("Needs graded results before calibration buckets populate.")
+    else:
+        st.dataframe(df.sort_values("Samples", ascending=False), use_container_width=True, hide_index=True)
+
+
+# =========================
+# TRUE CALIBRATION TAB RENDERER
+# =========================
+try:
+    with tab_true_calibration:
+        render_true_calibration_tab()
+except NameError:
+    pass
+
+
 def kproj_upside_projection(p):
     """K UPSIDE TAB projection with recent-form weighted true-talent guard.
 
@@ -10896,89 +11021,3 @@ except NameError:
 # TRUE CALIBRATION DASHBOARD + CONTROLLED LEARNING FALLBACKS
 # Added if missing from patch path.
 # =========================
-def apply_controlled_learning(pid, projection):
-    if not globals().get("CONTROLLED_LEARNING_ENABLED", True) or not pid:
-        return projection, 1.0, {"active": False, "note": "Controlled learning off/no pitcher"}
-    data = load_json(LEARN_FILE, {})
-    scale = safe_float(data.get(str(pid)), 1.0) or 1.0
-    proj = safe_float(projection)
-    if proj is None:
-        return projection, scale, {"active": False, "note": "No projection"}
-    return round(float(clamp(proj * scale, 0, 18)), 3), scale, {"active": abs(scale - 1.0) >= 0.005, "note": f"Controlled scale {scale:.3f}"}
-
-def controlled_learning_sample_count(pid):
-    results = load_json(RESULT_LOG, [])
-    total = 0
-    for r in results:
-        if str(r.get("pitcher_id") or r.get("Pitcher ID")) == str(pid):
-            actual = safe_float(r.get("actual") or r.get("Actual") or r.get("actual_ks") or r.get("Actual Ks"))
-            proj = safe_float(r.get("projection") or r.get("K PROJ") or r.get("Projection") or r.get("proj"))
-            if actual is not None and proj is not None:
-                total += 1
-    return total
-
-def update_controlled_learning(pid, projected, actual):
-    if not globals().get("CONTROLLED_LEARNING_ENABLED", True) or not pid:
-        return None
-    projected = safe_float(projected)
-    actual = safe_float(actual)
-    if projected is None or actual is None or projected <= 0:
-        return None
-    prior = controlled_learning_sample_count(pid)
-    data = load_json(LEARN_FILE, {})
-    current = safe_float(data.get(str(pid)), 1.0) or 1.0
-    min_starts = globals().get("CONTROLLED_LEARNING_MIN_PRIOR_STARTS", 5)
-    if prior < min_starts:
-        data[str(pid)] = current
-        save_json(LEARN_FILE, data)
-        return current
-    rate = globals().get("CONTROLLED_LEARNING_RATE", 0.035)
-    lo = globals().get("CONTROLLED_LEARNING_SCALE_MIN", 0.94)
-    hi = globals().get("CONTROLLED_LEARNING_SCALE_MAX", 1.06)
-    err = clamp((actual - projected) / max(1.0, projected), -0.35, 0.35)
-    new_scale = clamp(current * (1 + rate * err), lo, hi)
-    data[str(pid)] = round(float(new_scale), 4)
-    save_json(LEARN_FILE, data)
-    return new_scale
-
-def build_true_calibration_dashboard(results=None):
-    profile = build_true_calibration_profile(results or load_json(RESULT_LOG, []))
-    rows = []
-    for tag, b in (profile.get("bucket_stats") or {}).items():
-        rows.append({
-            "Bucket": tag,
-            "Samples": b.get("count"),
-            "Wins": b.get("wins"),
-            "Smoothed Win Rate": round((b.get("win_rate") or 0) * 100, 1),
-            "Raw Win Rate": round((b.get("raw_win_rate") or 0) * 100, 1),
-            "Avg Pred %": round((b.get("avg_pred") or 0) * 100, 1),
-            "Bias Ks": b.get("bias"),
-            "MAE Ks": b.get("mae"),
-        })
-    return pd.DataFrame(rows) if rows else pd.DataFrame()
-
-def render_true_calibration_tab():
-    st.markdown("### 🧠 True Calibration Engine")
-    st.caption("Audits model bias by side/source/probability/edge/line buckets. Small capped shifts only after enough graded samples.")
-    results = load_json(RESULT_LOG, [])
-    profile = build_true_calibration_profile(results)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Samples", profile.get("samples", 0))
-    c2.metric("MAE Ks", profile.get("mae") if profile.get("mae") is not None else "—")
-    c3.metric("Bias Ks", profile.get("bias") if profile.get("bias") is not None else "—")
-    c4.metric("Quality", profile.get("quality_score", 50))
-    df = build_true_calibration_dashboard(results)
-    if df.empty:
-        st.info("Needs graded results before calibration buckets populate.")
-    else:
-        st.dataframe(df.sort_values("Samples", ascending=False), use_container_width=True, hide_index=True)
-
-
-# =========================
-# TRUE CALIBRATION TAB RENDERER
-# =========================
-try:
-    with tab_true_calibration:
-        render_true_calibration_tab()
-except NameError:
-    pass
