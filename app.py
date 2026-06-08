@@ -218,7 +218,9 @@ def get_secret(key, default=""):
     except Exception:
         return os.getenv(key, default)
 
-ODDS_API_KEY = get_secret("ODDS_API_KEY", "")
+# The Odds API key is intentionally hardcoded ONLY for the pitcher-K market/sharp odds feed.
+# Projection, BF/IP, pitch count, lineup, sabermetric, and DIPS engines do not use this key.
+ODDS_API_KEY = "9dc242dd0bdc503a59ab3052a173cc9c"
 SPORTSGAMEODDS_API_KEY = get_secret("SPORTSGAMEODDS_API_KEY", "")
 OPTICODDS_API_KEY = get_secret("OPTICODDS_API_KEY", "")
 
@@ -5267,6 +5269,145 @@ def get_odds_events():
     data = safe_get_json(f"{ODDS_BASE}/sports/baseball_mlb/events", params={"apiKey": ODDS_API_KEY}, timeout=16)
     return data if isinstance(data, list) else []
 
+
+# =========================
+# THE ODDS API — MARKET ODDS ONLY
+# =========================
+# This layer is intentionally isolated from the projection engine. It only feeds:
+#   Market card, Sharp card, market agreement score, trap/disagreement warnings.
+# It should NOT directly change K projection, BF, IP, pitch count, or lineup logic.
+MLB_TEAM_ALIASES = {
+    "ARI": ["arizona diamondbacks", "diamondbacks", "ari", "arizona"],
+    "ATL": ["atlanta braves", "braves", "atl", "atlanta"],
+    "BAL": ["baltimore orioles", "orioles", "bal", "baltimore"],
+    "BOS": ["boston red sox", "red sox", "bos", "boston"],
+    "CHC": ["chicago cubs", "cubs", "chc"],
+    "CWS": ["chicago white sox", "white sox", "cws", "chw"],
+    "CIN": ["cincinnati reds", "reds", "cin", "cincinnati"],
+    "CLE": ["cleveland guardians", "guardians", "cle", "cleveland"],
+    "COL": ["colorado rockies", "rockies", "col", "colorado"],
+    "DET": ["detroit tigers", "tigers", "det", "detroit"],
+    "HOU": ["houston astros", "astros", "hou", "houston"],
+    "KC": ["kansas city royals", "royals", "kc", "kcr", "kansas city"],
+    "LAA": ["los angeles angels", "angels", "laa", "anaheim"],
+    "LAD": ["los angeles dodgers", "dodgers", "lad", "la dodgers"],
+    "MIA": ["miami marlins", "marlins", "mia", "miami"],
+    "MIL": ["milwaukee brewers", "brewers", "mil", "milwaukee"],
+    "MIN": ["minnesota twins", "twins", "min", "minnesota"],
+    "NYM": ["new york mets", "mets", "nym"],
+    "NYY": ["new york yankees", "yankees", "nyy"],
+    "ATH": ["athletics", "oakland athletics", "a's", "ath", "oakland", "sacramento athletics"],
+    "OAK": ["athletics", "oakland athletics", "a's", "ath", "oakland", "sacramento athletics"],
+    "PHI": ["philadelphia phillies", "phillies", "phi", "philadelphia"],
+    "PIT": ["pittsburgh pirates", "pirates", "pit", "pittsburgh"],
+    "SD": ["san diego padres", "padres", "sd", "sdp", "san diego"],
+    "SF": ["san francisco giants", "giants", "sf", "sfg", "san francisco"],
+    "SEA": ["seattle mariners", "mariners", "sea", "seattle"],
+    "STL": ["st louis cardinals", "st. louis cardinals", "cardinals", "stl", "st louis"],
+    "TB": ["tampa bay rays", "rays", "tb", "tbr", "tampa bay"],
+    "TEX": ["texas rangers", "rangers", "tex", "texas"],
+    "TOR": ["toronto blue jays", "blue jays", "tor", "toronto"],
+    "WSH": ["washington nationals", "nationals", "wsh", "was", "washington"],
+}
+
+def _team_alias_set(team):
+    raw = str(team or "").strip()
+    if not raw:
+        return set()
+    n = normalize_name(raw)
+    up = raw.upper().replace(".", "")
+    vals = {n, normalize_name(up)}
+    if up in MLB_TEAM_ALIASES:
+        vals.update(normalize_name(x) for x in MLB_TEAM_ALIASES[up])
+    for abbr, aliases in MLB_TEAM_ALIASES.items():
+        if n in {normalize_name(x) for x in aliases}:
+            vals.add(normalize_name(abbr))
+            vals.update(normalize_name(x) for x in aliases)
+    return {v for v in vals if v}
+
+def _odds_event_matches_game(event_obj, game_home, game_away):
+    home_aliases = _team_alias_set(game_home)
+    away_aliases = _team_alias_set(game_away)
+    target = home_aliases | away_aliases
+    ev_home = _team_alias_set(event_obj.get("home_team"))
+    ev_away = _team_alias_set(event_obj.get("away_team"))
+    if not target or not ev_home or not ev_away:
+        return False
+    # Require one event side to match each scheduled side when possible.
+    return bool(home_aliases & ev_home and away_aliases & ev_away) or bool(home_aliases & ev_away and away_aliases & ev_home) or bool(target & ev_home and target & ev_away)
+
+def _parse_oddsapi_pitcher_k_event(data, player_name, game_home=None, game_away=None):
+    rows = []
+    if not isinstance(data, dict):
+        return rows
+    if game_home or game_away:
+        if data.get("home_team") or data.get("away_team"):
+            if not _odds_event_matches_game(data, game_home, game_away):
+                return rows
+    for book in data.get("bookmakers", []) or []:
+        book_name = book.get("title") or book.get("key") or "Sportsbook"
+        for market in book.get("markets", []) or []:
+            if market.get("key") not in SPORTSBOOK_PITCHER_K_MARKETS:
+                continue
+            for outcome in market.get("outcomes", []) or []:
+                desc = outcome.get("description") or outcome.get("player") or outcome.get("participant") or outcome.get("name") or ""
+                score = name_score(player_name, desc)
+                if score < 0.80:
+                    continue
+                point = safe_float(outcome.get("point"))
+                if point is None:
+                    continue
+                side = str(outcome.get("name", "")).upper()
+                # The Odds API usually has name = Over/Under and description = player.
+                if "OVER" not in side and "UNDER" not in side:
+                    blob = " ".join(str(outcome.get(k, "")) for k in ["name", "description", "label"])
+                    side = "OVER" if "over" in blob.lower() else "UNDER" if "under" in blob.lower() else side
+                rows.append({
+                    "Source": "OddsAPI",
+                    "Provider": book_name,
+                    "Player": player_name,
+                    "Matched Name": desc,
+                    "Match Score": round(score, 3),
+                    "Market": market.get("key"),
+                    "Line": point,
+                    "Side": side,
+                    "Price": outcome.get("price"),
+                    "Last Update": market.get("last_update") or book.get("last_update"),
+                    "Event": f"{data.get('away_team','')} @ {data.get('home_team','')}",
+                })
+    return rows
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_oddsapi_all_pitcher_k_lines(player_name, game_home=None, game_away=None):
+    """Fallback Odds API call for pitcher K markets across the slate.
+
+    This is market-only and intentionally does not alter the projection. It exists to
+    stop the Market/Sharp boxes from showing NO_MARKET when the event-id match misses
+    due to team-name differences like ATH/OAK/Sacramento Athletics.
+    """
+    if not ODDS_API_KEY:
+        return source_result("Sportsbook", "DISABLED", rows=[], message="Add ODDS_API_KEY to Streamlit secrets or environment")
+    data = safe_get_json(
+        f"{ODDS_BASE}/sports/baseball_mlb/odds",
+        params={
+            "apiKey": ODDS_API_KEY,
+            "regions": "us",
+            "markets": ",".join(SPORTSBOOK_PITCHER_K_MARKETS),
+            "oddsFormat": "american",
+        },
+        timeout=20,
+    )
+    if not isinstance(data, list):
+        return source_result("Sportsbook", "FAILED", rows=[], message="Odds API all-slate pitcher-K call failed or plan has no player props")
+    rows = []
+    for ev in data:
+        rows.extend(_parse_oddsapi_pitcher_k_event(ev, player_name, game_home, game_away))
+    if not rows:
+        return source_result("Sportsbook", "NO MATCH", rows=[], message="No Odds API pitcher-K market matched this pitcher/game")
+    line_vals = [safe_float(r.get("Line")) for r in rows if safe_float(r.get("Line")) is not None]
+    consensus = float(np.median(line_vals)) if line_vals else None
+    return source_result("Sportsbook", "FOUND", line=consensus, rows=rows, message=f"Found {len(rows)} Odds API outcomes from all-slate prop search")
+
 @st.cache_data(ttl=600, show_spinner=False)
 def get_sportsbook_event_pitcher_k_lines(event_id, player_name):
     if not event_id:
@@ -5278,21 +5419,7 @@ def get_sportsbook_event_pitcher_k_lines(event_id, player_name):
     )
     if not data or (isinstance(data, dict) and data.get("message")):
         return source_result("Sportsbook", "FAILED", rows=[], message="Event odds call failed or plan has no player props")
-    rows = []
-    for book in data.get("bookmakers", []):
-        book_name = book.get("title") or book.get("key") or "Sportsbook"
-        for market in book.get("markets", []):
-            if market.get("key") not in SPORTSBOOK_PITCHER_K_MARKETS:
-                continue
-            for outcome in market.get("outcomes", []):
-                desc = outcome.get("description") or outcome.get("player") or outcome.get("participant") or outcome.get("name") or ""
-                score = name_score(player_name, desc)
-                if score < 0.80:
-                    continue
-                point = safe_float(outcome.get("point"))
-                if point is None:
-                    continue
-                rows.append({"Source": "OddsAPI", "Provider": book_name, "Player": player_name, "Matched Name": desc, "Match Score": round(score, 3), "Market": market.get("key"), "Line": point, "Side": str(outcome.get("name", "")).upper(), "Price": outcome.get("price"), "Last Update": market.get("last_update") or book.get("last_update")})
+    rows = _parse_oddsapi_pitcher_k_event(data, player_name)
     if not rows:
         return source_result("Sportsbook", "NO MATCH", rows=[], message="No sportsbook K prop matched this pitcher")
     line_vals = [safe_float(r["Line"]) for r in rows if safe_float(r.get("Line")) is not None]
@@ -5300,16 +5427,30 @@ def get_sportsbook_event_pitcher_k_lines(event_id, player_name):
     return source_result("Sportsbook", "FOUND", line=consensus, rows=rows, message=f"Found {len(rows)} sportsbook outcomes")
 
 def get_sportsbook_k_data(game_home, game_away, player_name):
+    """Return real sportsbook K odds from The Odds API for market/sharp only.
+
+    Projection independence rule: this source is never used to change pitcher skill,
+    BF, IP, pitch count, or lineup. It only fills Market / Sharp / agreement cards.
+    """
+    if not ODDS_API_KEY:
+        return source_result("Sportsbook", "DISABLED", rows=[], message="Add ODDS_API_KEY to enable Market/Sharp odds")
+
     events = get_odds_events()
     event_id = None
-    target_teams = {normalize_name(game_home), normalize_name(game_away)}
     for ev in events:
-        home = normalize_name(ev.get("home_team"))
-        away = normalize_name(ev.get("away_team"))
-        if {home, away} == target_teams or (home in target_teams and away in target_teams):
+        if _odds_event_matches_game(ev, game_home, game_away):
             event_id = ev.get("id")
             break
-    return get_sportsbook_event_pitcher_k_lines(event_id, player_name)
+
+    # Primary: event-specific call when we matched the game.
+    if event_id:
+        event_res = get_sportsbook_event_pitcher_k_lines(event_id, player_name)
+        if event_res.get("rows"):
+            return event_res
+
+    # Fallback: all-slate pitcher-K prop search, filtered back to this game/player.
+    # This catches team naming issues like ATH/OAK/Sacramento Athletics.
+    return get_oddsapi_all_pitcher_k_lines(player_name, game_home, game_away)
 
 @st.cache_data(ttl=600, show_spinner=False)
 def get_prizepicks_k_data(player_name):
