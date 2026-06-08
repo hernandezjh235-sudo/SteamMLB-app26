@@ -1454,6 +1454,77 @@ def build_pitch_count_module(recent_rows):
         "note": note,
     }
 
+
+def build_innings_outcome_module(recent_rows, expected_bf, ppb=None, pitch_count_profile=None, manager_hook_status=None, game_script_risk=None):
+    """Project starter innings outcome and early-pull risk from real recent IP/BF/pitch-count data."""
+    rows = list(recent_rows or [])
+    ip_vals, bf_vals, bf_per_ip_vals = [], [], []
+    for r in rows[:10]:
+        ip = safe_float(r.get("IP_float"), None)
+        bf0 = safe_float(r.get("BF"), None)
+        if ip is not None and ip > 0:
+            ip_vals.append(float(ip))
+        if bf0 is not None and bf0 > 0:
+            bf_vals.append(float(bf0))
+        if ip is not None and ip > 0 and bf0 is not None and bf0 > 0:
+            bf_per_ip_vals.append(float(bf0) / float(ip))
+    exp_bf = safe_float(expected_bf, DEFAULT_BF) or DEFAULT_BF
+    bf_per_ip = float(clamp(np.mean(bf_per_ip_vals), 3.65, 5.15)) if bf_per_ip_vals else 4.25
+    ip_from_bf = exp_bf / bf_per_ip
+    recent_l3_ip = float(np.mean(ip_vals[:3])) if ip_vals else None
+    recent_l5_ip = float(np.mean(ip_vals[:5])) if ip_vals else recent_l3_ip
+    recent_l10_ip = float(np.mean(ip_vals[:10])) if ip_vals else recent_l5_ip
+    projected_ip = (ip_from_bf * 0.68 + recent_l5_ip * 0.32) if recent_l5_ip is not None else ip_from_bf
+    pc_label = str((pitch_count_profile or {}).get("label") or "").upper()
+    hook = str(manager_hook_status or "").upper()
+    gs_label = str((game_script_risk or {}).get("label") or "").upper() if isinstance(game_script_risk, dict) else ""
+    risk_points, reasons = 0, []
+    if recent_l3_ip is not None and recent_l3_ip < 5.0:
+        risk_points += 22; reasons.append("L3 IP below 5.0")
+    elif recent_l3_ip is not None and recent_l3_ip >= 6.0:
+        risk_points -= 8; reasons.append("L3 IP supports 6+ innings")
+    if exp_bf < 20:
+        risk_points += 18; reasons.append("expected BF under 20")
+    elif exp_bf >= 24:
+        risk_points -= 8; reasons.append("expected BF supports normal leash")
+    if pc_label in ["SHORT_LEASH", "MONITOR"]:
+        risk_points += 18; reasons.append(f"pitch count {pc_label}")
+    elif pc_label in ["FULL_LEASH", "ELITE_VOLUME"]:
+        risk_points -= 8; reasons.append(f"pitch count {pc_label}")
+    if hook == "STRICT_HOOK":
+        risk_points += 20; reasons.append("manager hook strict")
+    if gs_label in ["HIGH", "EXTREME"]:
+        risk_points += 12; reasons.append(f"game script {gs_label}")
+    risk_score = int(clamp(50 + risk_points, 5, 95))
+    if risk_score >= 78:
+        label = "EARLY_PULL_HIGH"
+    elif risk_score >= 62:
+        label = "EARLY_PULL_MONITOR"
+    elif risk_score <= 35:
+        label = "FULL_INNINGS_PROFILE"
+    else:
+        label = "NORMAL_INNINGS"
+    projected_ip = float(clamp(projected_ip, 3.0, 7.6))
+    low_ip = float(clamp(projected_ip - (0.75 if risk_score < 62 else 1.05), 2.0, 8.0))
+    high_ip = float(clamp(projected_ip + (0.70 if risk_score < 62 else 0.45), 2.0, 8.2))
+    projected_pitches = None
+    if ppb is not None:
+        projected_pitches = float(clamp(exp_bf * (safe_float(ppb, 3.9) or 3.9), 45, 115))
+    note_bits = reasons[:4] if reasons else ["normal innings/leash profile"]
+    return {
+        "projected_ip": round(projected_ip, 2),
+        "ip_floor": round(low_ip, 2),
+        "ip_ceiling": round(high_ip, 2),
+        "recent_ip_l3": round(float(recent_l3_ip), 2) if recent_l3_ip is not None else None,
+        "recent_ip_l5": round(float(recent_l5_ip), 2) if recent_l5_ip is not None else None,
+        "recent_ip_l10": round(float(recent_l10_ip), 2) if recent_l10_ip is not None else None,
+        "bf_per_ip": round(float(bf_per_ip), 2),
+        "projected_pitches": round(projected_pitches, 0) if projected_pitches is not None else None,
+        "early_pull_risk_score": risk_score,
+        "early_pull_label": label,
+        "note": f"Innings outcome {label}: IP {projected_ip:.1f} range {low_ip:.1f}-{high_ip:.1f}; " + "; ".join(note_bits),
+    }
+
 def tto_decay_factor(pa_index):
     """Third-time-through-order decay for PA-by-PA K probabilities."""
     i = int(pa_index)
@@ -5374,6 +5445,27 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         bullpen_learn_factor, bullpen_learn_key = 1.0, None
         bullpen_note = f"{bullpen_note}; bullpen learning skipped: {_bp_learn_e}"
     bf = float(clamp(bf * bullpen_factor, 14, 31))
+
+    # Innings Outcome Module: final BF + pitch count/leash context -> projected IP, projected pitches, early-pull risk.
+    try:
+        innings_outcome = build_innings_outcome_module(
+            recent_rows,
+            expected_bf=bf,
+            ppb=leash.get("ppb"),
+            pitch_count_profile=pitch_count_profile if "pitch_count_profile" in locals() else {},
+            manager_hook_status=leash.get("manager_hook_status"),
+            game_script_risk=game_script_risk if "game_script_risk" in locals() else {},
+        )
+    except Exception as _ip_e:
+        innings_outcome = {
+            "projected_ip": round((safe_float(bf, DEFAULT_BF) or DEFAULT_BF) / 4.25, 2),
+            "ip_floor": None,
+            "ip_ceiling": None,
+            "early_pull_risk_score": 50,
+            "early_pull_label": "INNINGS_UNKNOWN",
+            "note": f"Innings outcome skipped: {_ip_e}",
+        }
+
     batter_rates, simulation_source = build_pa_sequence(lineup_rows if lineup_locked else [], bf, lineup_k)
 
     # v10.7: safer Bayesian + Markov Monte Carlo built around expected BF, not generic 27 outs.
@@ -5764,6 +5856,16 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "weather_precip_prob": weather_details.get("precip_prob") if isinstance(weather_details, dict) else None,
         "environment_factor": round(env_mult, 3),
         "expected_bf": round(bf, 1),
+        "projected_ip": innings_outcome.get("projected_ip"),
+        "ip_floor": innings_outcome.get("ip_floor"),
+        "ip_ceiling": innings_outcome.get("ip_ceiling"),
+        "recent_ip_l3": innings_outcome.get("recent_ip_l3"),
+        "recent_ip_l5": innings_outcome.get("recent_ip_l5"),
+        "recent_ip_l10": innings_outcome.get("recent_ip_l10"),
+        "projected_pitches": innings_outcome.get("projected_pitches"),
+        "early_pull_risk_score": innings_outcome.get("early_pull_risk_score"),
+        "early_pull_label": innings_outcome.get("early_pull_label"),
+        "innings_outcome_note": innings_outcome.get("note"),
         "ppb": round(leash["ppb"], 2),
         "pitch_count_score": leash.get("pitch_count_score"),
         "pitch_count_label": leash.get("pitch_count_label"),
@@ -7716,7 +7818,7 @@ def render_kproj_pitcher_card(p):
           <span class="badge {lineup_badge}">Lineup: {p.get('lineup_status')}</span>
           <span class="badge">K Upside: {p.get('elite_upside_score', 0)}/100</span>
         </div>
-        <div><div class="small-muted">K PROJ</div><div class="big-number green">{d['projection']}</div><div class="small-muted">Exp BF {bf:.1f}</div></div>
+        <div><div class="small-muted">K PROJ</div><div class="big-number green">{d['projection']}</div><div class="small-muted">BF {bf:.1f} | IP {p.get('projected_ip', '—')}</div></div>
         <div><div class="small-muted">Line</div><div class="big-number">{line_display}</div><div class="small-muted">Needs {needs_display}</div></div>
         <div><div class="small-muted">Edge</div><div class="big-number green">{edge_display}</div><div class="small-muted">Under wins {under_max_display}</div></div>
         <div><div class="small-muted">Decision</div><div class="big-number green" style="font-size:32px;">{d['decision']}</div><div class="small-muted">Confidence {conf_display}</div></div>
@@ -7727,9 +7829,11 @@ def render_kproj_pitcher_card(p):
         <div class="mobile-info-card"><div class="small-muted">Market</div><div class="kpi-value" style="font-size:16px;">{p.get('market_lean', 'NO_MARKET')}</div><div class="kpi-sub">O {p.get('market_over_odds', '—')} | U {p.get('market_under_odds', '—')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Sharp</div><div class="kpi-value" style="font-size:18px;">{p.get('sharp_warning', 'NONE')}</div><div class="kpi-sub">{p.get('market_agreement', '')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Line Audit</div><div class="kpi-value" style="font-size:16px;">{p.get('line_history_grade', '—')}</div><div class="kpi-sub">L10 {p.get('line_l10_avg', '—')} | HR {'' if p.get('line_recent_hit_rate') is None else str(round((p.get('line_recent_hit_rate') or 0)*100))+'%'}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Innings</div><div class="kpi-value" style="font-size:18px;">{p.get('projected_ip', '—')} IP</div><div class="kpi-sub">Pull: {p.get('early_pull_label', '—')} | Pitches {p.get('projected_pitches', '—')}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Pitch Count</div><div class="kpi-value" style="font-size:18px;">{p.get('pitch_count_score', '—')}</div><div class="kpi-sub">{p.get('pitch_count_label', '—')} | L3 {p.get('pitch_count_avg_l3', '—')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Form</div><div class="kpi-value" style="font-size:15px;">{p.get('recent_vs_season_flag', '—')}</div><div class="kpi-sub">L3 {p.get('recent_form_l3', '—')} | L10 {p.get('recent_form_l10', '—')}</div></div>
       </div>
-      <div class="kpi-sub" style="margin-top:8px;line-height:1.35;">{p.get('market_note','')}<br>{p.get('line_history_note','')}<br>{p.get('sharp_warning_note','')}</div>
+      <div class="kpi-sub" style="margin-top:8px;line-height:1.35;">{p.get('market_note','')}<br>{p.get('line_history_note','')}<br>{p.get('sharp_warning_note','')}<br>{p.get('innings_outcome_note','')}</div>
       <div class="hr-soft"></div>
       <div class="kpi-strip" style="grid-template-columns:repeat(5,minmax(0,1fr));">
         <div class="kpi-box"><div class="kpi-label">{put_label}</div><div class="kpi-value">{put_display}</div><div class="kpi-sub">Putaway/stuff proxy</div></div>
