@@ -72,6 +72,7 @@ UNDERDOG_URLS = [
 ]
 SPORTSGAMEODDS_BASE = "https://api.sportsgameodds.com/v2"
 OPTICODDS_BASE = "https://api.opticodds.com/api/v3"
+SHARPAPI_BASE = "https://api.sharpapi.io/api/v1"
 
 SPORTSBOOK_PITCHER_K_MARKETS = [
     "pitcher_strikeouts",
@@ -218,9 +219,10 @@ def get_secret(key, default=""):
     except Exception:
         return os.getenv(key, default)
 
-# The Odds API key is intentionally hardcoded ONLY for the pitcher-K market/sharp odds feed.
+# SharpAPI is intentionally hardcoded ONLY for the pitcher-K market/sharp odds feed.
 # Projection, BF/IP, pitch count, lineup, sabermetric, and DIPS engines do not use this key.
-ODDS_API_KEY = "9dc242dd0bdc503a59ab3052a173cc9c"
+ODDS_API_KEY = ""  # Disabled: old OddsAPI path is not active in get_sportsbook_k_data().
+SHARPAPI_KEY = "sk_live_UUk8eejunMDA96uM4vRAQT"
 # Optional manual market odds fallback text is assigned from the Streamlit sidebar at runtime.
 # It is used ONLY for Market/Sharp cards and never changes K projection, BF, IP, pitch count, lineups, or active UD line.
 MANUAL_MARKET_ODDS_TEXT = ""
@@ -5274,6 +5276,205 @@ def get_odds_events():
 
 
 # =========================
+# SHARPAPI — MARKET ODDS ONLY
+# =========================
+# This layer is intentionally isolated from the projection engine. It only feeds:
+#   Market card, Sharp card, market agreement score, trap/disagreement warnings.
+# It should NOT directly change K projection, BF, IP, pitch count, or lineup logic.
+def _sharpapi_text_blob(obj):
+    try:
+        if isinstance(obj, dict):
+            vals = []
+            for k, v in obj.items():
+                if isinstance(v, (str, int, float)):
+                    vals.append(f"{k} {v}")
+            return " ".join(vals).lower()
+        return str(obj).lower()
+    except Exception:
+        return ""
+
+def _sharpapi_market_looks_like_pitcher_k(obj):
+    blob = _sharpapi_text_blob(obj)
+    # Keep this intentionally strict so moneyline/run total odds do not leak into K cards.
+    good_terms = [
+        "pitcher strikeout", "pitcher strikeouts", "player strikeout", "player strikeouts",
+        "strikeouts", "strikeout", "earned strikeouts", "total strikeouts", "k prop", " k "
+    ]
+    bad_terms = ["moneyline", "spread", "run line", "total runs", "home runs", "hits allowed", "walks allowed"]
+    if any(x in blob for x in bad_terms):
+        return False
+    return any(x in blob for x in good_terms)
+
+def _sharpapi_find_line(obj):
+    if not isinstance(obj, dict):
+        return None
+    keys = ["line", "point", "points", "handicap", "total", "threshold", "value"]
+    v = first_value(obj, keys)
+    line = safe_float(v)
+    if is_valid_k_line(line, allow_integer=True) is not None:
+        return float(line)
+    # Some APIs put line in strings like "Over 6.5".
+    for val in obj.values():
+        if isinstance(val, str):
+            vals = extract_k_lines_from_text(val)
+            if vals:
+                return float(vals[0])
+    return None
+
+def _sharpapi_find_price(obj, side=None):
+    if not isinstance(obj, dict):
+        return None
+    side_l = str(side or "").lower()
+    if side_l.startswith("over"):
+        keys = ["over_odds", "overOdds", "over_price", "overPrice", "overAmerican", "over_american"]
+        px = safe_float(first_value(obj, keys))
+        if px is not None:
+            return int(px)
+    if side_l.startswith("under"):
+        keys = ["under_odds", "underOdds", "under_price", "underPrice", "underAmerican", "under_american"]
+        px = safe_float(first_value(obj, keys))
+        if px is not None:
+            return int(px)
+    keys = ["price", "odds", "american_odds", "americanOdds", "american", "oddsAmerican"]
+    px = safe_float(first_value(obj, keys))
+    return None if px is None else int(px)
+
+def _sharpapi_find_side(obj):
+    if not isinstance(obj, dict):
+        return ""
+    vals = []
+    for k in ["side", "selection", "outcome", "name", "label", "type", "bet", "position"]:
+        v = obj.get(k)
+        if v is not None:
+            vals.append(str(v))
+    blob = " ".join(vals).lower()
+    if "over" in blob:
+        return "OVER"
+    if "under" in blob:
+        return "UNDER"
+    return ""
+
+def _sharpapi_player_candidate(obj):
+    if not isinstance(obj, dict):
+        return ""
+    keys = [
+        "player", "player_name", "playerName", "participant", "participant_name", "participantName",
+        "description", "selection_name", "selectionName", "name", "athlete", "athleteName"
+    ]
+    val = first_value(obj, keys)
+    return str(val or "")
+
+def _walk_json(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _walk_json(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_json(v)
+
+def _parse_sharpapi_pitcher_k_payload(data, player_name, game_home=None, game_away=None):
+    rows = []
+    seen = set()
+    if data is None:
+        return rows
+    for obj in _walk_json(data):
+        if not isinstance(obj, dict):
+            continue
+        blob = _sharpapi_text_blob(obj)
+        if not _sharpapi_market_looks_like_pitcher_k(obj):
+            continue
+        cand = _sharpapi_player_candidate(obj)
+        # If player field is not direct, allow blob-based player matching.
+        score = max(name_score(player_name, cand), name_score(player_name, blob[:200]))
+        if score < 0.78:
+            continue
+        line = _sharpapi_find_line(obj)
+        if line is None:
+            continue
+        provider = first_value(obj, ["sportsbook", "book", "bookmaker", "book_name", "bookName", "provider", "sportsbookName"]) or "SharpAPI"
+        market = first_value(obj, ["market", "market_name", "marketName", "stat", "stat_type", "prop", "category", "bet_type", "betType"]) or "pitcher_strikeouts"
+        # Case A: one object contains both over and under prices.
+        over_px = _sharpapi_find_price(obj, "OVER")
+        under_px = _sharpapi_find_price(obj, "UNDER")
+        if over_px is not None or under_px is not None:
+            for side, px in [("OVER", over_px), ("UNDER", under_px)]:
+                if px is None:
+                    continue
+                key = (str(provider), str(market), round(line, 2), side, int(px), round(score, 3))
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append({
+                    "Source": "SharpAPI",
+                    "Provider": str(provider),
+                    "Player": player_name,
+                    "Matched Name": cand or player_name,
+                    "Match Score": round(score, 3),
+                    "Market": market,
+                    "Line": line,
+                    "Side": side,
+                    "Price": int(px),
+                    "Last Update": first_value(obj, ["updated_at", "last_update", "lastUpdate", "timestamp"]),
+                })
+            continue
+        # Case B: one object per outcome.
+        side = _sharpapi_find_side(obj)
+        px = _sharpapi_find_price(obj, side)
+        if side in ["OVER", "UNDER"] and px is not None:
+            key = (str(provider), str(market), round(line, 2), side, int(px), round(score, 3))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({
+                "Source": "SharpAPI",
+                "Provider": str(provider),
+                "Player": player_name,
+                "Matched Name": cand or player_name,
+                "Match Score": round(score, 3),
+                "Market": market,
+                "Line": line,
+                "Side": side,
+                "Price": int(px),
+                "Last Update": first_value(obj, ["updated_at", "last_update", "lastUpdate", "timestamp"]),
+            })
+    return rows
+
+@st.cache_data(ttl=180, show_spinner=False)
+def get_sharpapi_mlb_pitcher_k_lines(player_name, game_home=None, game_away=None):
+    """Return SharpAPI pitcher strikeout odds for Market/Sharp cards only.
+
+    This function is intentionally isolated from the projection engine. It may fill
+    the Market and Sharp UI boxes, but it never changes K projection, BF/IP, pitch
+    count, lineups, sabermetrics, DIPS, or Underdog active line selection.
+    """
+    if not SHARPAPI_KEY:
+        return source_result("SharpAPI", "DISABLED", rows=[], message="Add SHARPAPI_KEY to enable Market/Sharp odds")
+    headers = {"X-API-Key": SHARPAPI_KEY}
+    # Based on SharpAPI quick start. Keep league=MLB simple and parse defensively.
+    data = safe_get_json(f"{SHARPAPI_BASE}/odds", params={"league": "MLB"}, headers=headers, timeout=20)
+    if not data:
+        return source_result("SharpAPI", "FAILED", rows=[], message="SharpAPI call failed or returned empty data")
+    rows = _parse_sharpapi_pitcher_k_payload(data, player_name, game_home, game_away)
+    if not rows:
+        # Try a few common query variants without letting this touch projections.
+        for params in [
+            {"league": "MLB", "market": "pitcher_strikeouts"},
+            {"league": "MLB", "market": "player_strikeouts"},
+            {"league": "MLB", "sport": "baseball"},
+        ]:
+            data2 = safe_get_json(f"{SHARPAPI_BASE}/odds", params=params, headers=headers, timeout=20)
+            rows.extend(_parse_sharpapi_pitcher_k_payload(data2, player_name, game_home, game_away))
+            if rows:
+                break
+    if not rows:
+        return source_result("SharpAPI", "NO MATCH", rows=[], message="SharpAPI connected but no pitcher-K odds matched this player")
+    line_vals = [safe_float(r.get("Line")) for r in rows if safe_float(r.get("Line")) is not None]
+    consensus = float(np.median(line_vals)) if line_vals else None
+    return source_result("SharpAPI", "FOUND", line=consensus, rows=rows, message=f"Found {len(rows)} SharpAPI pitcher-K outcomes")
+
+
+# =========================
 # THE ODDS API — MARKET ODDS ONLY
 # =========================
 # This layer is intentionally isolated from the projection engine. It only feeds:
@@ -5432,30 +5633,13 @@ def get_sportsbook_event_pitcher_k_lines(event_id, player_name):
     return source_result("Sportsbook", "FOUND", line=consensus, rows=rows, message=f"Found {len(rows)} sportsbook outcomes")
 
 def get_sportsbook_k_data(game_home, game_away, player_name):
-    """Return real sportsbook K odds from The Odds API for market/sharp only.
+    """Return real sportsbook K odds from SharpAPI for market/sharp only.
 
     Projection independence rule: this source is never used to change pitcher skill,
-    BF, IP, pitch count, or lineup. It only fills Market / Sharp / agreement cards.
+    BF, IP, pitch count, lineups, sabermetrics, DIPS, or active Underdog line.
+    It only fills Market / Sharp / agreement cards.
     """
-    if not ODDS_API_KEY:
-        return source_result("Sportsbook", "DISABLED", rows=[], message="Add ODDS_API_KEY to enable Market/Sharp odds")
-
-    events = get_odds_events()
-    event_id = None
-    for ev in events:
-        if _odds_event_matches_game(ev, game_home, game_away):
-            event_id = ev.get("id")
-            break
-
-    # Primary: event-specific call when we matched the game.
-    if event_id:
-        event_res = get_sportsbook_event_pitcher_k_lines(event_id, player_name)
-        if event_res.get("rows"):
-            return event_res
-
-    # Fallback: all-slate pitcher-K prop search, filtered back to this game/player.
-    # This catches team naming issues like ATH/OAK/Sacramento Athletics.
-    return get_oddsapi_all_pitcher_k_lines(player_name, game_home, game_away)
+    return get_sharpapi_mlb_pitcher_k_lines(player_name, game_home, game_away)
 
 def get_manual_market_k_data(player_name, active_line=None):
     """Manual sportsbook odds fallback for Market/Sharp cards only.
