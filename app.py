@@ -1976,7 +1976,158 @@ def _rotowire_extract_lineups_from_html(raw_html):
     except Exception:
         pass
 
+    # Text fallback parser: works when Rotowire's visible page text is available but CSS classes changed.
+    try:
+        text_lineups = _rotowire_extract_lineups_from_visible_text(raw_html)
+        for t_abbr, t_rows in (text_lineups or {}).items():
+            if len(t_rows or []) >= ROTOWIRE_LINEUP_MIN_VALID_HITTERS and len(lineups.get(t_abbr, [])) < len(t_rows):
+                lineups[t_abbr] = t_rows[:9]
+    except Exception:
+        pass
+
     return lineups
+
+def _rotowire_extract_lineups_from_visible_text(raw_html):
+    """Fallback Rotowire parser using visible text order.
+
+    Rotowire's page can render lineups without stable lineup__ CSS classes.
+    This parser only reads the lineup text and returns team batting orders.
+    It never touches Underdog/PrizePicks/sportsbook line pulls.
+    """
+    if not raw_html:
+        return {}
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(raw_html, "html.parser")
+        for bad in soup(["script", "style", "noscript"]):
+            bad.decompose()
+        lines = []
+        for x in soup.get_text("\n", strip=True).split("\n"):
+            t = _rw_clean_name(x)
+            if t:
+                lines.append(t)
+    except Exception:
+        return {}
+
+    import re
+    team_tokens = set("ARI ATL BAL BOS CHC CHW CIN CLE COL DET HOU KC LAA LAD MIA MIL MIN NYM NYY ATH OAK PHI PIT SD SEA SF STL TB TEX TOR WSH WAS".split())
+    pos_tokens = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH"}
+    stop_tokens = {
+        "Home Run Odds", "Starting Pitcher Intel", "Umpire:", "LINE", "O/U", "Watch Now", "Tickets", "Alerts",
+        "Sportsbook Odds", "Display Preference", "Show DFS Salaries", "View Slates", "Classic", "Showdown", "Tiers"
+    }
+
+    def is_team_token(t):
+        return _rw_norm_team_abbr(t) in {_rw_norm_team_abbr(x) for x in team_tokens}
+
+    def is_pos(t):
+        return str(t or "").upper().strip() in pos_tokens
+
+    def clean_player_line(t):
+        t = _rw_clean_name(t)
+        if not t or t.startswith("$"):
+            return None, None
+        if t in stop_tokens or t.upper() in {x.upper() for x in stop_tokens}:
+            return None, None
+        if re.search(r"\b\d+-\d+\b", t) or " ERA" in t or re.match(r"^\d+(\.\d+)?\s", t):
+            return None, None
+        m = re.match(r"^(.+?)\s+([LRS])$", t)
+        hand = None
+        if m:
+            t = m.group(1).strip()
+            hand = m.group(2).strip().upper()
+        # skip headings/status lines
+        bad_words = {"Confirmed Lineup", "Expected Lineup", "Unknown Lineup", "PRIM", "Lineup", "Subscribe", "Log In"}
+        if t in bad_words:
+            return None, None
+        if len(t) < 3 or len(t) > 34:
+            return None, None
+        # Must look like a name: either two words, or abbreviated first initial + surname.
+        if len(t.split()) < 2:
+            return None, None
+        if not re.search(r"[A-Za-z]", t):
+            return None, None
+        return t, hand
+
+    def collect_lineup(block, start_idx, source_label):
+        rows = []
+        i = start_idx + 1
+        safety = 0
+        while i < len(block) and len(rows) < 9 and safety < 90:
+            safety += 1
+            cur = block[i]
+            if cur in ("Confirmed Lineup", "Expected Lineup", "Unknown Lineup") and rows:
+                break
+            if cur.startswith("Umpire") or cur in {"LINE", "O/U", "Home Run Odds", "Starting Pitcher Intel"}:
+                if rows:
+                    break
+            if is_pos(cur):
+                pos = cur.upper().strip()
+                # Find the next plausible player name before the next position/status line.
+                j = i + 1
+                while j < len(block) and j < i + 8:
+                    nxt = block[j]
+                    if is_pos(nxt) or nxt in ("Confirmed Lineup", "Expected Lineup", "Unknown Lineup"):
+                        break
+                    name, hand = clean_player_line(nxt)
+                    if name:
+                        rows.append({
+                            "Order": len(rows) + 1,
+                            "Batter": name,
+                            "Position": pos,
+                            "Hand": hand,
+                            "Lineup Source": source_label,
+                        })
+                        i = j
+                        break
+                    j += 1
+            i += 1
+        return rows
+
+    out = {}
+    n = len(lines)
+    # Find pairs of MLB team abbreviations that mark each game card.
+    i = 0
+    while i < n:
+        cur = _rw_norm_team_abbr(lines[i])
+        if not is_team_token(cur):
+            i += 1
+            continue
+        pair_j = None
+        for j in range(i + 1, min(i + 10, n)):
+            nxt = _rw_norm_team_abbr(lines[j])
+            if is_team_token(nxt) and nxt != cur:
+                pair_j = j
+                break
+        if pair_j is None:
+            i += 1
+            continue
+        abbrs = [cur, _rw_norm_team_abbr(lines[pair_j])]
+        # Limit this game card to before the next likely game card.
+        end = min(pair_j + 360, n)
+        for k in range(pair_j + 1, min(pair_j + 360, n - 1)):
+            if k > pair_j + 40 and is_team_token(lines[k]):
+                for kk in range(k + 1, min(k + 10, n)):
+                    if is_team_token(lines[kk]) and _rw_norm_team_abbr(lines[kk]) != _rw_norm_team_abbr(lines[k]):
+                        end = k
+                        break
+                if end == k:
+                    break
+        block = lines[pair_j + 1:end]
+        markers = []
+        for idx, t in enumerate(block):
+            if t in ("Confirmed Lineup", "Expected Lineup"):
+                src = "ROTOWIRE_CONFIRMED_LINEUP" if t == "Confirmed Lineup" else "ROTOWIRE_EXPECTED_LINEUP"
+                markers.append((idx, src))
+        if len(markers) >= 2:
+            for team_abbr, (midx, src) in zip(abbrs[:2], markers[:2]):
+                rows = collect_lineup(block, midx, src)
+                if len(rows) >= ROTOWIRE_LINEUP_MIN_VALID_HITTERS:
+                    out[_rw_norm_team_abbr(team_abbr)] = rows[:9]
+            i = end
+        else:
+            i += 1
+    return out
 
 @st.cache_data(ttl=900, show_spinner=False)
 def get_rotowire_expected_lineups():
@@ -2062,11 +2213,11 @@ def build_rotowire_expected_lineup_rows(team_abbr, pitcher_hand=None):
             "Rolling 30d K%": None if rolling30 is None else round(rolling30 * 100, 1),
             "Split PA/AB": split_pa,
             "Used K%": None if used_k is None else round(used_k * 100, 1),
-            "K Source": f"Rotowire expected lineup + {used_source}",
+            "K Source": f"{base.get('Lineup Source', 'ROTOWIRE_EXPECTED_LINEUP').replace('_', ' ').title()} + {used_source}",
             "SO": season_so,
             "PA/AB": season_pa,
             "Raw_K_Rate": used_k,
-            "Lineup Source": "ROTOWIRE_EXPECTED_LINEUP",
+            "Lineup Source": base.get("Lineup Source") or "ROTOWIRE_EXPECTED_LINEUP",
         })
     valid = [r.get("Raw_K_Rate") for r in rows if r.get("Raw_K_Rate") is not None]
     if len(valid) >= ROTOWIRE_LINEUP_MIN_VALID_HITTERS:
@@ -2078,7 +2229,8 @@ def _try_rotowire_expected_lineup(game_pk, opp_side, pitcher_hand=None):
     rw_rows = build_rotowire_expected_lineup_rows(team_abbr, pitcher_hand) if team_abbr else []
     valid_rw = [r.get("Raw_K_Rate") for r in rw_rows[:9] if r.get("Raw_K_Rate") is not None]
     if len(valid_rw) >= ROTOWIRE_LINEUP_MIN_VALID_HITTERS:
-        return float(np.mean(valid_rw)), rw_rows[:9], f"Rotowire expected lineup K% ({team_abbr})", False
+        src = "Rotowire confirmed lineup K%" if any(str(r.get("Lineup Source", "")).upper() == "ROTOWIRE_CONFIRMED_LINEUP" for r in rw_rows[:9]) else "Rotowire expected lineup K%"
+        return float(np.mean(valid_rw)), rw_rows[:9], f"{src} ({team_abbr})", False
     return None, [], "Rotowire expected lineup unavailable", False
 
 
@@ -8124,15 +8276,51 @@ def render_kproj_pitcher_card(p):
         with st.expander(f"Batter-by-batter K matchup — {p.get('pitcher')}", expanded=False):
             rows = []
             for i, r in enumerate(lineup_rows[:9], start=1):
+                k_val = r.get("Used K%")
+                if k_val is None:
+                    k_val = r.get("K%") if r.get("K%") is not None else r.get("Raw_K_Rate")
                 rows.append({
                     "#": i,
                     "Batter": r.get("Batter") or r.get("Name") or r.get("Player") or r.get("player") or "",
-                    "K%": r.get("K%") if r.get("K%") is not None else r.get("Raw_K_Rate"),
-                    "Source": r.get("K Source") or r.get("Source") or r.get("K_Note") or "",
+                    "K%": _display_pct_value(k_val),
+                    "Lineup Source": _short_lineup_source(r),
+                    "K Data": r.get("K Source") or r.get("Source") or r.get("K_Note") or "",
                 })
+            src_counts = pd.Series([x.get("Lineup Source") for x in rows]).value_counts().to_dict() if rows else {}
+            st.caption("Lineup source: " + (", ".join([f"{k} ({v})" for k, v in src_counts.items()]) or "—"))
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
         st.caption("No confirmed batter-by-batter lineup yet. This tab will improve when lineups lock.")
+
+
+def _display_pct_value(v):
+    """Return a readable percentage string for K-rate values.
+    Handles either decimal rates (0.2383) or already-percent values (23.83).
+    """
+    try:
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return "—"
+        x = float(v)
+        if abs(x) <= 1.0:
+            x *= 100.0
+        return f"{x:.1f}%"
+    except Exception:
+        return "—"
+
+def _short_lineup_source(row):
+    src = str((row or {}).get("Lineup Source") or (row or {}).get("Source") or "").upper()
+    ksrc = str((row or {}).get("K Source") or "")
+    if "ROTOWIRE_CONFIRMED" in src:
+        return "Rotowire confirmed"
+    if "ROTOWIRE" in src or "Rotowire" in ksrc:
+        return "Rotowire expected"
+    if "CONFIRMED" in src:
+        return "MLB confirmed"
+    if "PROJECTED" in src or "MLB projected" in ksrc:
+        return "MLB projected"
+    if src:
+        return src.replace("_", " ").title()
+    return "—"
 
 def build_kproj_table(board):
     rows = []
@@ -8755,3 +8943,4 @@ with tab6:
             st.error("All logs cleared.")
 
 st.caption("Workflow: Refresh live board -> inspect lines -> save official before-game snapshot -> after games, grade and learn.")
+
