@@ -10476,38 +10476,227 @@ def _bp_active_ok(obj):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_underdog_batter_prop_rows():
-    """Return only Underdog batter Hits/RBI rows. Never creates synthetic lines."""
+    """Return only Underdog MLB batter Hits/RBI rows. Never creates synthetic lines.
+
+    Fix notes:
+    - Uses Underdog relationships first: line -> over_under -> appearance -> player.
+    - This is required because many line objects do NOT contain the player name and market
+      in the same JSON object, so broad recursive text parsing can either miss everything
+      or leak wrong sports/markets.
+    - If relationship parsing fails, a conservative direct-object fallback is used.
+    - Every displayed row must resolve to an MLB player id before it can appear.
+    """
+    def attrs(obj):
+        if not isinstance(obj, dict):
+            return {}
+        out = {}
+        a = obj.get("attributes")
+        if isinstance(a, dict):
+            out.update(a)
+        for k, v in obj.items():
+            if k not in ["attributes", "relationships", "included", "data"] and k not in out:
+                out[k] = v
+        return out
+
+    def obj_type(obj, fallback=""):
+        return str(obj.get("type") or fallback or "").lower().replace("-", "_") if isinstance(obj, dict) else ""
+
+    def obj_id(obj):
+        if not isinstance(obj, dict):
+            return None
+        v = obj.get("id") or attrs(obj).get("id")
+        return str(v) if v not in [None, ""] else None
+
+    def rel_id(obj, names):
+        if not isinstance(obj, dict):
+            return None
+        rels = obj.get("relationships") or {}
+        for name in names:
+            for key in [name, name.replace("_", "-"), name.replace("_", "")]:
+                node = rels.get(key)
+                if node is None:
+                    continue
+                data = node.get("data") if isinstance(node, dict) else node
+                if isinstance(data, dict) and data.get("id") not in [None, ""]:
+                    return str(data.get("id"))
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict) and item.get("id") not in [None, ""]:
+                            return str(item.get("id"))
+        return None
+
+    def collect(data):
+        objs = []
+        def walk(x, parent_key=""):
+            if isinstance(x, dict):
+                y = dict(x)
+                if parent_key and "_parent_key" not in y:
+                    y["_parent_key"] = parent_key
+                objs.append(y)
+                for k, v in x.items():
+                    if isinstance(v, (dict, list)):
+                        walk(v, k)
+            elif isinstance(x, list):
+                for item in x:
+                    walk(item, parent_key)
+        walk(data)
+        return objs
+
+    def text_from(*objs):
+        parts = []
+        wanted = [
+            "title", "display_title", "name", "player_name", "full_name", "first_name", "last_name",
+            "display_name", "stat", "stat_type", "appearance_stat", "display_stat", "label", "market",
+            "market_name", "sport", "league", "sport_name", "league_name", "position", "description",
+            "over_under", "over_under_title", "scoring_type", "projection_type", "stat_value", "line_score"
+        ]
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            a = attrs(obj)
+            for k in wanted:
+                v = a.get(k)
+                if isinstance(v, dict):
+                    for kk in wanted:
+                        if v.get(kk) not in [None, ""]:
+                            parts.append(str(v.get(kk)))
+                elif v not in [None, ""]:
+                    parts.append(str(v))
+        return " | ".join(parts)
+
+    def player_from(player_obj, appearance_obj=None, ou_obj=None, line_obj=None):
+        candidates = []
+        for obj in [player_obj, appearance_obj, ou_obj, line_obj]:
+            a = attrs(obj) if isinstance(obj, dict) else {}
+            first_last = (str(a.get("first_name", "")).strip() + " " + str(a.get("last_name", "")).strip()).strip()
+            candidates.extend([
+                a.get("display_name"), a.get("full_name"), a.get("name"), a.get("player_name"),
+                a.get("title"), a.get("description"), first_last
+            ])
+        cleaned = []
+        for c in candidates:
+            if isinstance(c, str) and 2 <= len(c) <= 80:
+                cc = _bp_clean_player_name(c)
+                if cc and len(normalize_name(cc).split()) >= 2:
+                    cleaned.append(cc)
+        # Prefer explicit player object names first, then shortest cleaned title-like candidate.
+        if cleaned:
+            cleaned = sorted(cleaned, key=lambda x: (" o/u" in x.lower(), len(x)))
+            return cleaned[0]
+        return ""
+
+    def classify_market(*objs):
+        blob = text_from(*objs).lower()
+        # Hard reject neighboring markets and wrong sports. Do not reject the word "rbi"
+        # globally because that is the target for the RBI tab.
+        non_targets = [
+            "hits allowed", "pitcher hits", "total bases", "singles", "doubles", "home runs",
+            "batter strikeouts", "batter walks", "walks o/u", "stolen bases", "h+r+rbi", "hits+runs",
+            "hits + runs", "fantasy", "shots", "goals", "assists", "saves", "blocks", "tackles",
+            "strokes", "tourney", "finishing position", "soccer", "nhl", "nba", "nfl", "golf"
+        ]
+        if any(x in blob for x in non_targets):
+            return None
+        # Prefer structured stat fields if available.
+        stat_blob = " ".join(
+            str(attrs(o).get(k, "")) for o in objs if isinstance(o, dict)
+            for k in ["stat", "stat_type", "appearance_stat", "display_stat", "market_name", "title", "display_title"]
+        ).lower()
+        if any(x in stat_blob for x in ["runs batted in", "rbis", "rbi"]):
+            return "RBI"
+        # Hits must be plain batter hits; player/title text often says just "Hits" without O/U.
+        if any(x in stat_blob for x in ["batter hits", " hits", "hits"]):
+            return "HITS"
+        return _bp_market_from_text(blob)
+
+    def line_from(*objs, market=None):
+        # Only use structured line fields. This prevents ids/ranks/player numbers becoming fake lines.
+        keys = ["stat_value", "line_score", "over_under_line", "target_value", "display_stat_value"]
+        cfg = BATTER_PROP_MARKETS.get(market or "", {})
+        mn = cfg.get("min_line", 0.5)
+        mx = cfg.get("max_line", 2.5)
+        for obj in objs:
+            a = attrs(obj) if isinstance(obj, dict) else {}
+            for k in keys:
+                raw = a.get(k)
+                v = safe_float(raw, None)
+                if v is None and isinstance(raw, str):
+                    v = _bp_extract_line_from_text(raw, market)
+                if v is not None and mn <= v <= mx and abs(v * 2 - round(v * 2)) < 1e-9:
+                    return float(v)
+        return None
+
+    def active_ok(*objs):
+        status_blob = " ".join(
+            str(attrs(o).get(k, "")) for o in objs if isinstance(o, dict)
+            for k in ["status", "state", "display_status", "over_status", "under_status", "hidden", "active"]
+        ).lower()
+        return not any(x in status_blob for x in ["suspended", "removed", "hidden true", "inactive", "closed", "disabled"])
+
     rows = []
     for url in UNDERDOG_URLS:
         data = safe_get_json(url, timeout=18)
         if not data:
             continue
-        objects = _bp_collect_objects(data)
+        objects = collect(data)
+        by_id = {}
+        line_candidates = []
         for obj in objects:
-            if not isinstance(obj, dict):
-                continue
-            blob = _bp_text_from_obj(obj)
-            low = blob.lower()
-            if is_bad_sport_text(low):
-                continue
-            market = _bp_market_from_text(blob)
+            oid = obj_id(obj)
+            if oid:
+                by_id[oid] = obj
+            typ = obj_type(obj, obj.get("_parent_key", ""))
+            a = attrs(obj)
+            if typ in {"over_under_line", "over_under_lines"} or "over_under_line" in typ or any(a.get(k) not in [None, ""] for k in ["stat_value", "line_score", "over_under_line", "target_value"]):
+                line_candidates.append(obj)
+
+        def get(oid):
+            return by_id.get(str(oid)) if oid not in [None, ""] else None
+
+        # Relationship parser: line -> over_under -> appearance -> player.
+        for line_obj in line_candidates:
+            ou_obj = get(rel_id(line_obj, ["over_under", "over_unders"]))
+            app_obj = get(rel_id(ou_obj, ["appearance", "appearances"])) or get(rel_id(line_obj, ["appearance", "appearances"]))
+            player_obj = get(rel_id(app_obj, ["player", "players"])) or get(rel_id(ou_obj, ["player", "players"])) or get(rel_id(line_obj, ["player", "players"]))
+            market = classify_market(line_obj, ou_obj, app_obj, player_obj)
             if not market:
                 continue
-            if not _bp_active_ok(obj):
+            if not active_ok(line_obj, ou_obj, app_obj, player_obj):
                 continue
-            line = _bp_find_line(obj, market)
+            line = line_from(line_obj, ou_obj, app_obj, market=market)
+            if line is None:
+                continue
+            player = player_from(player_obj, app_obj, ou_obj, line_obj)
+            if not player or len(normalize_name(player).split()) < 2:
+                continue
+            if any(x in normalize_name(player) for x in ["team", "first inning", "game"]):
+                continue
+            pid = _mlb_search_player_id_by_name(player)
+            if not pid:
+                continue
+            rows.append({
+                "Source": "Underdog",
+                "Player": player.strip(),
+                "Market": market,
+                "Market Label": BATTER_PROP_MARKETS[market]["label"],
+                "Line": float(line),
+                "Evidence": text_from(line_obj, ou_obj, app_obj, player_obj)[:240],
+            })
+
+        # Conservative direct-object fallback for API shapes where relationship objects are flattened.
+        # Still requires structured line + MLB-resolvable player, so it will not create fake lines.
+        for obj in objects:
+            blob = _bp_text_from_obj(obj)
+            market = classify_market(obj)
+            if not market or not active_ok(obj):
+                continue
+            line = line_from(obj, market=market)
             if line is None:
                 continue
             player = _bp_candidate_name(obj)
             player = _bp_clean_player_name(player)
             if not player or len(normalize_name(player).split()) < 2:
-                # Some Underdog objects need relationship joining; avoid guessing names.
                 continue
-            # Prevent pitcher/team/non-MLB rows from leaking into batter tabs.
-            if any(x in normalize_name(player) for x in ["team", "first inning", "game"]):
-                continue
-            # Validate the player can be resolved by MLB before displaying the row.
-            # This removes NHL/Golf/Soccer "Hits" props even if Underdog text lacks a sport tag.
             if not _mlb_search_player_id_by_name(player):
                 continue
             rows.append({
@@ -10518,10 +10707,11 @@ def fetch_underdog_batter_prop_rows():
                 "Line": float(line),
                 "Evidence": blob[:240],
             })
-    # Deduplicate by player/market/line.
+
+    # Deduplicate by player/market. Keep the first real line for each player/market.
     dedup = {}
     for r in rows:
-        key = (normalize_name(r.get("Player")), r.get("Market"), float(r.get("Line")))
+        key = (normalize_name(r.get("Player")), r.get("Market"))
         if key not in dedup:
             dedup[key] = r
     return list(dedup.values())
