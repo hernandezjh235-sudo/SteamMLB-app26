@@ -9889,6 +9889,100 @@ def kproj_bar_html(vals):
         parts.append(f"<span class='mini-k-bar-wrap'><span class='mini-k-bar' style='height:{h}px;background:{color};'></span><span class='mini-k-label'>{v}</span></span>")
     return "<div class='mini-k-bars'>" + "".join(parts) + "</div>"
 
+
+
+def _k_context_reason_chips(p, d=None):
+    """Mobile-friendly explanation chips for K cards.
+    UI-only: reads existing model fields and does not change projections or decisions.
+    """
+    d = d or {}
+    reasons = []
+    risks = []
+    try:
+        proj = safe_float(d.get("projection"), safe_float(p.get("projection"), None))
+        line = safe_float(d.get("line"), safe_float(p.get("line"), None))
+        if proj is not None and line is not None:
+            edge = proj - line
+            if edge >= 1.0:
+                reasons.append(f"Projection edge +{edge:.2f} K")
+            elif edge <= -1.0:
+                risks.append(f"Projection edge {edge:.2f} K")
+            else:
+                risks.append(f"Tight edge {edge:+.2f} K")
+    except Exception:
+        pass
+    lineup_status = str(p.get("lineup_status") or "").upper()
+    if p.get("lineup_locked") or "CONFIRMED" in lineup_status:
+        reasons.append("Confirmed lineup read")
+    else:
+        risks.append("Pre-lineup estimate")
+    opp_k = safe_float(p.get("opp_k"), None)
+    if opp_k is not None:
+        if opp_k >= 0.245:
+            reasons.append(f"High lineup K pressure {opp_k*100:.1f}%")
+        elif opp_k <= 0.185:
+            risks.append(f"Contact lineup {opp_k*100:.1f}%")
+    whiff = safe_float(p.get("whiff_pct"), safe_float(p.get("putaway_whiff"), None))
+    csw = safe_float(p.get("csw_pct"), None)
+    if whiff is not None:
+        w = whiff if whiff <= 1 else whiff/100
+        if w >= 0.30:
+            reasons.append(f"Whiff/stuff boost {w*100:.1f}%")
+        elif w <= 0.20:
+            risks.append(f"Low whiff/stuff {w*100:.1f}%")
+    if csw is not None:
+        c = csw if csw <= 1 else csw/100
+        if c >= 0.31:
+            reasons.append(f"CSW strength {c*100:.1f}%")
+        elif c <= 0.26:
+            risks.append(f"CSW below ideal {c*100:.1f}%")
+    leash = str(p.get("early_pull_label") or p.get("leash_label") or "").upper()
+    if any(x in leash for x in ["SHORT", "EARLY", "HOOK", "LIMIT"]):
+        risks.append("Early-pull/leash risk")
+    elif any(x in leash for x in ["NORMAL", "WORKHORSE", "LONG"]):
+        reasons.append("Normal workload support")
+    market = str(p.get("market_lean") or "").upper()
+    if market and "NO_MARKET" not in market:
+        reasons.append(f"Market: {market.replace('_',' ')}")
+    # Deduplicate while preserving order and keep mobile concise.
+    def uniq(xs):
+        out=[]
+        for x in xs:
+            if x and x not in out:
+                out.append(x)
+        return out[:4]
+    reasons = uniq(reasons)
+    risks = uniq(risks)
+    reason_html = "".join([f"<span class='badge good-badge' style='margin:3px 4px 3px 0;'>{html.escape(x)}</span>" for x in reasons]) or "<span class='small-muted'>No major green signal</span>"
+    risk_html = "".join([f"<span class='badge yellow-badge' style='margin:3px 4px 3px 0;'>{html.escape(x)}</span>" for x in risks]) or "<span class='small-muted'>No major risk flag</span>"
+    summary = " / ".join(reasons[:2] + risks[:1]) if (reasons or risks) else "Context neutral"
+    return summary, reason_html, risk_html
+
+
+def _lineup_pressure_summary(lineup_rows):
+    """Return a short high/low-K batter summary for the lineup expander. UI-only."""
+    rows = lineup_rows or []
+    if not rows:
+        return "No batter-by-batter lineup available yet."
+    vals=[]
+    for r in rows[:9]:
+        name = r.get("Batter") or r.get("Name") or r.get("Player") or r.get("player") or ""
+        k = r.get("Used K%")
+        if k is None:
+            k = r.get("K%") if r.get("K%") is not None else r.get("Raw_K_Rate")
+        kv = safe_float(k, None)
+        if kv is None:
+            continue
+        if abs(kv) <= 1.0:
+            kv *= 100.0
+        vals.append((name, kv))
+    if not vals:
+        return "Lineup available, but hitter K% data is still filling in."
+    high = [n for n,k in vals if k >= 25]
+    low = [n for n,k in vals if k <= 15]
+    avg = sum(k for _,k in vals)/len(vals)
+    return f"Avg lineup K {avg:.1f}% • High-K bats {len(high)} • Low-K contact bats {len(low)}"
+
 def render_kproj_pitcher_card(p):
     d = kproj_decision(p)
     dist = kproj_distribution_profile(d.get("projection"), d.get("line"), p)
@@ -9907,6 +10001,7 @@ def render_kproj_pitcher_card(p):
     line_badge = "good-badge" if d["line_source"] == "Underdog" else "yellow-badge"
     lineup_badge = "good-badge" if p.get("lineup_locked") else "yellow-badge"
     recent_html = kproj_bar_html(p.get("last_10_ks"))
+    why_summary, why_green_html, why_risk_html = _k_context_reason_chips(p, d)
     # Mobile-friendly mechanics and attribution summaries.
     velo_delta = safe_float(p.get('fastball_velo_delta'))
     velo_display = "—" if velo_delta is None else f"{velo_delta:+.1f} mph"
@@ -9952,6 +10047,12 @@ def render_kproj_pitcher_card(p):
         <div class="mobile-info-card"><div class="small-muted">BABIP Regression</div><div class="kpi-value" style="font-size:18px;">{babip_display}</div><div class="kpi-sub">{babip_sub_display}</div></div>
       </div>
       <div class="mobile-info-card" style="margin-top:10px;min-height:0;">
+        <div class="small-muted">Why This Pick</div>
+        <div class="kpi-value" style="font-size:16px;">{html.escape(why_summary)}</div>
+        <div class="kpi-sub" style="margin-top:8px;"><b>Green signals:</b><br>{why_green_html}</div>
+        <div class="kpi-sub" style="margin-top:8px;"><b>Risk checks:</b><br>{why_risk_html}</div>
+      </div>
+      <div class="mobile-info-card" style="margin-top:10px;min-height:0;">
         <div class="small-muted">Projection Attribution</div>
         <div class="kpi-value" style="font-size:16px;">{attr_summary_display}</div>
         <div class="kpi-sub" style="margin-top:4px;">{html.escape(str(p.get('mechanics_k_label','MECH_UNKNOWN')))} | {html.escape(str(p.get('mechanics_k_note',''))[:130])}</div>
@@ -9986,6 +10087,7 @@ def render_kproj_pitcher_card(p):
                 })
             src_counts = pd.Series([x.get("Lineup Source") for x in rows]).value_counts().to_dict() if rows else {}
             st.caption("Lineup source: " + (", ".join([f"{k} ({v})" for k, v in src_counts.items()]) or "—"))
+            st.info(_lineup_pressure_summary(lineup_rows))
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
         st.caption("No batter-by-batter lineup available yet. The app uses MLB confirmed lineups when posted and MLB projected pre-lineups before lock.")
