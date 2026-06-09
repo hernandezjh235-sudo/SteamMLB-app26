@@ -53,6 +53,8 @@ SIGNAL_TRACKING_FILE = os.path.join(STORAGE_DIR, "signal_tracking.json")
 LONG_BACKTEST_FILE = os.path.join(STORAGE_DIR, "long_backtest_rows.json")
 LINEUP_CACHE_FILE = os.path.join(STORAGE_DIR, "locked_lineup_cache.json")
 LINE_HISTORY_FILE = os.path.join(STORAGE_DIR, "line_history.json")
+HRR_SNAPSHOT_FILE = os.path.join(STORAGE_DIR, "hrr_official_snapshot.json")
+ML_SNAPSHOT_FILE = os.path.join(STORAGE_DIR, "moneyline_official_snapshot.json")
 CALIBRATION_ENGINE_FILE = os.path.join(STORAGE_DIR, "true_calibration_engine.json")
 BULLPEN_LEARNING_FILE = os.path.join(STORAGE_DIR, "bullpen_learning_engine.json")
 UMPIRE_LEARNING_FILE = os.path.join(STORAGE_DIR, "umpire_learning_engine.json")
@@ -8753,8 +8755,9 @@ if save_btn:
         st.warning("Refresh the live board first, inspect the lines, then save the official before-game snapshot.")
     else:
         added = save_many_once(st.session_state.loaded_picks)
+        non_k_added = save_non_k_snapshots(dates, st.session_state.loaded_picks)
         st.session_state.last_saved_count = added
-        st.success(f"Saved official before-game snapshot. Added {added} new rows.")
+        st.success(f"Saved official before-game snapshot. Added {added} K rows, {non_k_added.get('hrr_rows', 0)} H+R+R rows, and {non_k_added.get('ml_rows', 0)} Moneyline rows.")
 
 saved = load_json(PICK_LOG, [])
 
@@ -13551,6 +13554,164 @@ def build_batter_prop_board(market):
                 df[col] = default
             df[col] = df[col].apply(lambda x: default if _hrr_missing_value(x) else x)
     return df
+
+
+# =========================
+# H+R+R + MONEYLINE SAVE/LOAD SNAPSHOTS
+# =========================
+# K already persisted through PICK_LOG. These helpers persist the non-K tabs so
+# they load on the next app open without needing a live refresh.
+
+def _snapshot_date_key_from_dates(dates):
+    try:
+        if dates:
+            return "|".join([str(d) for d in dates])
+    except Exception:
+        pass
+    return str(date.today())
+
+
+def _df_to_records_safe(df):
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return []
+        clean = df.copy()
+        clean = clean.replace({np.nan: None})
+        return clean.to_dict("records")
+    except Exception:
+        return []
+
+
+def save_non_k_snapshots(dates, k_board=None):
+    """Save H+R+R and Moneyline tabs. Does not alter K saved snapshots."""
+    key = _snapshot_date_key_from_dates(dates)
+    saved_at = now_iso()
+    added = {"hrr_rows": 0, "ml_rows": 0}
+
+    try:
+        hrr_df = build_batter_prop_board("HRR")
+        hrr_rows = _df_to_records_safe(hrr_df)
+        hrr_store = load_json(HRR_SNAPSHOT_FILE, {})
+        hrr_store[key] = {"saved_at": saved_at, "rows": hrr_rows}
+        save_json(HRR_SNAPSHOT_FILE, hrr_store)
+        added["hrr_rows"] = len(hrr_rows)
+    except Exception as e:
+        log_source_request("save_non_k_snapshots_hrr", "ERROR", str(e))
+
+    try:
+        ml_df = ml_build_board(k_board or [])
+        ml_rows = _df_to_records_safe(ml_df)
+        ml_store = load_json(ML_SNAPSHOT_FILE, {})
+        ml_store[key] = {"saved_at": saved_at, "rows": ml_rows}
+        save_json(ML_SNAPSHOT_FILE, ml_store)
+        added["ml_rows"] = len(ml_rows)
+    except Exception as e:
+        log_source_request("save_non_k_snapshots_ml", "ERROR", str(e))
+
+    return added
+
+
+def load_non_k_snapshot(kind, dates):
+    key = _snapshot_date_key_from_dates(dates)
+    path = HRR_SNAPSHOT_FILE if kind == "HRR" else ML_SNAPSHOT_FILE
+    data = load_json(path, {})
+    item = data.get(key) or {}
+    rows = item.get("rows") or []
+    if not rows:
+        return pd.DataFrame(), item.get("saved_at")
+    return pd.DataFrame(rows), item.get("saved_at")
+
+
+# Preserve live renderers and wrap them with saved fallback support.
+_live_render_batter_prop_tab = render_batter_prop_tab
+_live_render_moneyline_edge_tab = render_moneyline_edge_tab
+
+
+def render_batter_prop_tab(market):
+    cfg = BATTER_PROP_MARKETS.get(market, {"label": market})
+    title = "Batter H+R+R"
+    st.markdown(f'<div class="section-title-pro">{title} — Underdog Only</div>', unsafe_allow_html=True)
+    st.caption("Separate batter-prop engine. Lines come from Underdog only. Saved H+R+R snapshots load without refresh.")
+
+    live_df = build_batter_prop_board(market)
+    saved_df, saved_at = load_non_k_snapshot("HRR", dates)
+    using_saved = False
+    df = live_df
+    if (df is None or df.empty) and isinstance(saved_df, pd.DataFrame) and not saved_df.empty:
+        df = saved_df
+        using_saved = True
+
+    if df is None or df.empty:
+        st.warning(f"No active Underdog {cfg.get('label', market)} rows found and no saved H+R+R snapshot found for this date.")
+        return
+
+    if using_saved:
+        st.info(f"Loaded saved H+R+R snapshot from {saved_at or 'saved file'} — refresh live board to update lines.")
+    else:
+        st.success("Loaded live H+R+R board from Underdog.")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Rows", len(df))
+    c2.metric("Overs", int((df["Decision"].astype(str) == "OVER").sum()) if "Decision" in df.columns else 0)
+    c3.metric("Unders", int((df["Decision"].astype(str) == "UNDER").sum()) if "Decision" in df.columns else 0)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Mobile cards")
+    for _, r in df.head(20).iterrows():
+        dec = str(r.get("Decision", "PASS"))
+        color = "#2ecc71" if dec == "OVER" else "#ff4d4d" if dec == "UNDER" else "#f5c542"
+        st.markdown(f"""
+        <div class="pro-card" style="padding:18px;margin-bottom:12px;">
+          <div style="font-size:24px;font-weight:900;">{html.escape(str(r.get('Player','')))}</div>
+          <div class="small-muted">{html.escape(str(r.get('Market Label','')))} · Underdog line {r.get('Line')}</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px;">
+            <div><div class="small-muted">Projection</div><div class="big-number green">{r.get('Projection','—')}</div></div>
+            <div><div class="small-muted">Decision</div><div style="font-size:30px;font-weight:900;color:{color};">{dec}</div><div class="small-muted">Conf {r.get('Confidence %','—')}%</div></div>
+          </div>
+          <div class="kpi-strip" style="grid-template-columns:repeat(3,minmax(0,1fr));margin-top:12px;">
+            <div class="kpi-box"><div class="kpi-label">Edge</div><div class="kpi-value">{r.get('Edge','—')}</div></div>
+            <div class="kpi-box"><div class="kpi-label">Projected PA</div><div class="kpi-value">{r.get('Projected PA','—')}</div><div class="kpi-sub">Slot {r.get('Lineup Slot','—')}</div></div>
+            <div class="kpi-box"><div class="kpi-label">Team Runs</div><div class="kpi-value">{r.get('Team Implied Runs', r.get('Team BaseRuns/G','—'))}</div><div class="kpi-sub">wRC+ {r.get('Team wRC+ Split','—')}</div></div>
+            <div class="kpi-box"><div class="kpi-label">OBP</div><div class="kpi-value">{r.get('OBP','—')}</div><div class="kpi-sub">Moneyball core</div></div>
+            <div class="kpi-box"><div class="kpi-label">Contact</div><div class="kpi-value">{r.get('Contact%','—')}%</div><div class="kpi-sub">K% {r.get('K%','—')}%</div></div>
+            <div class="kpi-box"><div class="kpi-label">Opportunity</div><div class="kpi-value">{r.get('HRR Opportunity Score', r.get('RBI Opp Score','—'))}</div><div class="kpi-sub">H+R+R model</div></div>
+          </div>
+          <div style="margin-top:10px;padding:10px;border:1px solid #1f2a34;border-radius:12px;background:#0b0f14;">
+            <div class="small-muted">Attribution</div>
+            <div style="font-size:13px;font-weight:700;line-height:1.35;">{html.escape(str(r.get('Attribution','—')))}</div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+
+def render_moneyline_edge_tab(board, dates=None):
+    st.markdown("### 💰 Moneyline Edge")
+    st.caption("Separate ML module. Saved ML snapshots load without refresh; K projections are untouched.")
+    df = ml_build_board(board or [])
+    saved_df, saved_at = load_non_k_snapshot("ML", dates or [])
+    using_saved = False
+    if (df is None or df.empty) and isinstance(saved_df, pd.DataFrame) and not saved_df.empty:
+        df = saved_df
+        using_saved = True
+    if df is None or df.empty:
+        st.info("No ML board yet and no saved Moneyline snapshot found. Refresh the K board first, then save.")
+        return
+    if using_saved:
+        st.info(f"Loaded saved Moneyline snapshot from {saved_at or 'saved file'} — refresh live board to update.")
+    else:
+        st.success("Loaded live Moneyline board.")
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Games", len(df))
+    c2.metric("Playable", int((df["Status"]=="PLAYABLE").sum()) if "Status" in df.columns else 0)
+    c3.metric("Leans", int((df["Status"]=="LEAN").sum()) if "Status" in df.columns else 0)
+    c4.metric("Snapshot", "Saved" if using_saved else "Live")
+    st.markdown('<div class="section-title-pro">Moneyline Pro Board</div>', unsafe_allow_html=True)
+    try:
+        render_moneyline_pro_board(df.head(15))
+    except Exception:
+        pass
+    st.markdown('<div class="section-title-pro">Moneyline Table</div>', unsafe_allow_html=True)
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
 # =========================
 # PROJECTION DRIFT + TRAP LINE 2.0
