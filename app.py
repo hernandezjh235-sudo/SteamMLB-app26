@@ -10708,6 +10708,64 @@ def fetch_underdog_batter_prop_rows():
                 "Evidence": blob[:240],
             })
 
+
+
+    # Last-resort Underdog fallback:
+    # Some Underdog payloads do not link line -> market -> appearance in the expected JSON:API
+    # relationship shape. If the strict relationship parser finds nothing, scan flattened objects
+    # for explicit MLB-style titles like "Pete Alonso Hits O/U" or "Pete Alonso RBIs O/U".
+    # This still refuses fake rows by requiring:
+    #   1) exact target market wording, not neighboring props;
+    #   2) a structured/nearby line in a sane range;
+    #   3) MLB player-name validation.
+    if not rows:
+        import re
+        fallback_rows = []
+        target_re = re.compile(r"([A-Z][A-Za-zÀ-ÿ.'’\-]+(?:\s+(?:[A-Z][A-Za-zÀ-ÿ.'’\-]+|Jr\.|Sr\.|II|III|IV)){1,4})\s+(Hits|RBIs?)\s+O/U", re.I)
+        bad_market_re = re.compile(r"Total Bases|Home Runs|Runs O/U|Batter Strikeouts|Batter Walks|Walks O/U|Stolen Bases|Singles|Doubles|Fantasy|Shots|Goals|Assists|Saves|Blocks|Tackles|Strokes|Tourney|Finishing Position", re.I)
+        for url in UNDERDOG_URLS:
+            data = safe_get_json(url, timeout=18)
+            if not data:
+                continue
+            objects = collect(data)
+            for obj in objects:
+                blob = _bp_text_from_obj(obj)
+                if not blob or bad_market_re.search(blob):
+                    continue
+                # Avoid obvious non-MLB sports payloads when the object exposes a sport/league label.
+                sport_blob = " ".join(str(attrs(obj).get(k, "")) for k in ["sport", "sport_name", "league", "league_name"]).lower()
+                if any(x in sport_blob for x in ["nhl", "nba", "nfl", "soccer", "golf", "tennis", "hockey", "basketball", "football"]):
+                    continue
+                m = target_re.search(blob)
+                if not m:
+                    continue
+                player = _bp_clean_player_name(m.group(1))
+                stat = m.group(2).lower()
+                market = "RBI" if stat.startswith("rbi") else "HITS"
+                # structured first; fallback to the target title area only, not entire nested JSON ids
+                line = _bp_find_line(obj, market)
+                if line is None:
+                    # Look near the title match for explicit stat/line phrasing.
+                    start = max(0, m.start() - 160)
+                    end = min(len(blob), m.end() + 240)
+                    line = _bp_extract_line_from_text(blob[start:end], market)
+                if line is None:
+                    continue
+                if not player or len(normalize_name(player).split()) < 2:
+                    continue
+                pid = _mlb_search_player_id_by_name(player)
+                if not pid:
+                    continue
+                fallback_rows.append({
+                    "Source": "Underdog",
+                    "Player": player.strip(),
+                    "Market": market,
+                    "Market Label": BATTER_PROP_MARKETS[market]["label"],
+                    "Line": float(line),
+                    "Evidence": "fallback title scan: " + blob[:220],
+                })
+        rows.extend(fallback_rows)
+
     # Deduplicate by player/market. Keep the first real line for each player/market.
     dedup = {}
     for r in rows:
