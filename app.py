@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.17 K PROJ UPSIDE + MONEYBALL HITS/RBI + ML 2.0"
+APP_VERSION = "v11.17 K PROJ UPSIDE + H+R+R + ACE/VET STABILITY"
 
 try:
     import pytz
@@ -7015,6 +7015,189 @@ def apply_official_play_filter_2_0(p):
     out['risk_notes'] = (rn + '; ' if rn else '') + reliability.get('note', '') + '; Official Filter: ' + out['official_filter_note']
     return out
 
+
+
+# =========================
+# ACE / VETERAN / ROOKIE STABILITY LAYER
+# Conservative workload-confidence layer only.
+# Pitchers: tiny BF/leash refinement, never a direct K% boost.
+# Batters: H+R+R confidence/stability label only, never a direct projection boost.
+# =========================
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _mlb_person_meta_safe(player_id):
+    try:
+        if not player_id:
+            return {}
+        data = safe_get_json(f"{MLB_BASE}/people/{player_id}", timeout=10) or {}
+        people = data.get("people") or []
+        return people[0] if people else {}
+    except Exception:
+        return {}
+
+
+def _years_since_debut_from_meta(meta):
+    try:
+        debut = str((meta or {}).get("mlbDebutDate") or "")[:10]
+        if not debut or len(debut) < 4:
+            return None
+        y = int(debut[:4])
+        return max(0, datetime.now().year - y)
+    except Exception:
+        return None
+
+
+def build_pitcher_experience_stability_layer(player_id, profile=None, recent_rows=None, leash=None):
+    """Classify pitcher as elite/veteran/rookie for workload confidence.
+
+    This is intentionally conservative. It is not a name-brand boost and it does
+    not directly raise K%. It only applies a tiny BF/leash factor so proven
+    workhorses are not treated like short-leash rookies, and volatile rookies
+    are not treated like 190-IP veterans.
+    """
+    profile = profile or {}
+    recent_rows = recent_rows or []
+    leash = leash or {}
+    meta = _mlb_person_meta_safe(player_id)
+    years = _years_since_debut_from_meta(meta)
+    k_pct = safe_float(profile.get("Pitcher K%"), None)
+    k9 = safe_float(profile.get("K/9"), None)
+    season_ip = safe_float(profile.get("IP"), None)
+    avg_ip = safe_float(profile.get("AVG IP"), None)
+    if avg_ip is None:
+        avg_ip = safe_float(leash.get("recent_ip"), None)
+    avg_pitches = None
+    try:
+        pitch_vals = []
+        for r in recent_rows[:6]:
+            p = safe_float(r.get("pitchesThrown", r.get("Pitches")), None)
+            if p is not None:
+                pitch_vals.append(p)
+        if pitch_vals:
+            avg_pitches = float(np.mean(pitch_vals))
+    except Exception:
+        avg_pitches = None
+
+    score = 50.0
+    notes = []
+    if k_pct is not None:
+        score += clamp((k_pct - 0.22) * 120, -10, 12)
+    if k9 is not None:
+        score += clamp((k9 - 8.5) * 1.8, -7, 10)
+    if avg_ip is not None:
+        score += clamp((avg_ip - 5.2) * 7.0, -8, 10)
+    if avg_pitches is not None:
+        score += clamp((avg_pitches - 86) * 0.35, -7, 8)
+    if years is not None:
+        if years >= 5:
+            score += 5
+            notes.append(f"{years}y MLB experience")
+        elif years <= 1:
+            score -= 5
+            notes.append("rookie/limited MLB history")
+    if season_ip is not None and season_ip < 45:
+        score -= 4
+        notes.append("low season IP sample")
+
+    score = float(clamp(score, 25, 92))
+    if (k_pct is not None and k_pct >= 0.285) and (avg_ip is None or avg_ip >= 5.0):
+        label = "ELITE_ACE_PROFILE"
+    elif (years is not None and years >= 5) and ((avg_ip or 0) >= 5.5 or (avg_pitches or 0) >= 90):
+        label = "VETERAN_WORKHORSE"
+    elif (years is not None and years <= 1) and ((avg_ip or 5.0) < 5.4 or (season_ip is not None and season_ip < 70)):
+        label = "ROOKIE_VOLATILITY"
+    elif (k_pct is not None and k_pct >= 0.275) and (years is not None and years <= 2):
+        label = "YOUNG_POWER_ARM"
+    elif score >= 62:
+        label = "STABLE_STARTER"
+    elif score <= 42:
+        label = "SHORT_SAMPLE_RISK"
+    else:
+        label = "NEUTRAL_EXPERIENCE"
+
+    # Tiny factor. This protects the existing K model: max roughly +/-0.25 BF.
+    bf_factor = 1.0 + ((score - 50.0) / 50.0) * 0.012
+    bf_factor = float(clamp(bf_factor, 0.992, 1.012))
+    # Rookie risk should not over-punish power arms.
+    if label == "ROOKIE_VOLATILITY":
+        bf_factor = min(bf_factor, 0.996)
+    if label in ["ELITE_ACE_PROFILE", "VETERAN_WORKHORSE"]:
+        bf_factor = max(bf_factor, 1.004)
+    note = f"{label}: workload-confidence score {score:.0f}/100; BF x{bf_factor:.3f}"
+    if notes:
+        note += "; " + "; ".join(notes[:3])
+    return {
+        "label": label,
+        "score": round(score, 1),
+        "bf_factor": round(bf_factor, 4),
+        "years_mlb": years,
+        "avg_ip": None if avg_ip is None else round(float(avg_ip), 2),
+        "avg_pitches": None if avg_pitches is None else round(float(avg_pitches), 1),
+        "note": note,
+    }
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def build_batter_experience_stability_layer(player_name, player_id=None, profile=None):
+    """Batter H+R+R stability label.
+
+    This does not change the H+R+R projection. It only gives a small confidence
+    calibration so rookies/small-sample hitters don't show the same confidence
+    as established everyday bats.
+    """
+    profile = profile or {}
+    pid = player_id or profile.get("player_id") or _mlb_search_player_id_by_name(player_name)
+    meta = _mlb_person_meta_safe(pid)
+    years = _years_since_debut_from_meta(meta)
+    games = None
+    pa = None
+    try:
+        data = safe_get_json(f"{MLB_BASE}/people/{pid}/stats", params={"stats": "season", "group": "hitting"}, timeout=10) or {}
+        split = get_first_stat_split(data)
+        stt = (split or {}).get("stat", {})
+        games = safe_float(stt.get("gamesPlayed"), None)
+        pa = safe_float(stt.get("plateAppearances"), None)
+    except Exception:
+        pass
+    obp = safe_float(profile.get("season_obp"), None)
+    contact = safe_float(profile.get("contact_rate"), None)
+
+    score = 50.0
+    if years is not None:
+        score += 8 if years >= 4 else (-7 if years <= 1 else 0)
+    if games is not None:
+        score += clamp((games - 45) * 0.20, -8, 8)
+    if pa is not None:
+        score += clamp((pa - 160) * 0.035, -8, 8)
+    if obp is not None:
+        score += clamp((obp - 0.315) * 35, -5, 6)
+    if contact is not None:
+        score += clamp((contact - 0.75) * 20, -4, 4)
+    score = float(clamp(score, 25, 85))
+
+    if years is not None and years >= 4 and (pa is None or pa >= 180):
+        label = "ESTABLISHED_BAT"
+    elif years is not None and years <= 1 and (pa is None or pa < 180):
+        label = "ROOKIE_SMALL_SAMPLE"
+    elif score >= 62:
+        label = "STABLE_EVERYDAY_BAT"
+    elif score <= 42:
+        label = "VOLATILE_BAT_SAMPLE"
+    else:
+        label = "NEUTRAL_BAT_STABILITY"
+
+    # Confidence only, capped to avoid changing side/projection.
+    conf_nudge = float(clamp((score - 50.0) * 0.035, -1.8, 1.8))
+    return {
+        "label": label,
+        "score": round(score, 1),
+        "confidence_nudge": round(conf_nudge, 2),
+        "years_mlb": years,
+        "games": None if games is None else int(games),
+        "pa": None if pa is None else int(pa),
+        "note": f"{label}: batter stability {score:.0f}/100; confidence {conf_nudge:+.1f}%",
+    }
+
 def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, use_calibration, use_bayesian_markov=True, use_weather=True, use_umpire=True, use_xgboost_assist=False, use_sgo=False, use_optic=False):
     pid = row["pitcher_id"]
     pitcher_name = row["pitcher"]
@@ -7227,6 +7410,22 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     env_mult = float(clamp(park * ump_mult * weather_mult, 0.94, 1.06))
 
     bf = leash["expected_bf"]
+    # Ace/Veteran/Rookie workload-confidence layer.
+    # Tiny BF-only adjustment. It never directly boosts pitcher K%.
+    try:
+        pitcher_experience_profile = build_pitcher_experience_stability_layer(pid, profile=profile, recent_rows=recent_rows, leash=leash)
+        exp_bf_factor = safe_float(pitcher_experience_profile.get("bf_factor"), 1.0) or 1.0
+        bf = float(clamp((safe_float(bf, DEFAULT_BF) or DEFAULT_BF) * exp_bf_factor, 14, 31))
+        leash["experience_label"] = pitcher_experience_profile.get("label")
+        leash["experience_score"] = pitcher_experience_profile.get("score")
+        leash["experience_bf_factor"] = pitcher_experience_profile.get("bf_factor")
+        leash["experience_note"] = pitcher_experience_profile.get("note")
+    except Exception as _exp_e:
+        pitcher_experience_profile = {"label": "EXPERIENCE_UNKNOWN", "score": 50, "bf_factor": 1.0, "note": f"Experience layer skipped: {_exp_e}"}
+        leash["experience_label"] = "EXPERIENCE_UNKNOWN"
+        leash["experience_score"] = 50
+        leash["experience_bf_factor"] = 1.0
+        leash["experience_note"] = pitcher_experience_profile.get("note")
     bullpen_factor, bullpen_note, bullpen_usage = bullpen_fatigue_bf_factor(row.get("team_id"), row.get("date"))
     try:
         bullpen_learn_factor, bullpen_learn_note, bullpen_learn_key = bullpen_learning_bf_factor(bullpen_usage)
@@ -7568,6 +7767,8 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         risk_notes = (risk_notes + "; " if risk_notes else "") + "Run Damage Engine: " + str(game_script_note)
     if final_decision_note:
         risk_notes = (risk_notes + "; " if risk_notes else "") + "Final Decision: " + str(final_decision_note)
+    if "pitcher_experience_profile" in locals() and pitcher_experience_profile.get("note"):
+        risk_notes = (risk_notes + "; " if risk_notes else "") + "Experience Layer: " + str(pitcher_experience_profile.get("note"))
 
     prop_rows = []
     for src in [sportsbook_data, pp_data, ud_data, sgo_data, optic_data]:
@@ -7693,6 +7894,10 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "weather_precip_prob": weather_details.get("precip_prob") if isinstance(weather_details, dict) else None,
         "environment_factor": round(env_mult, 3),
         "expected_bf": round(bf, 1),
+        "pitcher_experience_label": pitcher_experience_profile.get("label") if "pitcher_experience_profile" in locals() else None,
+        "pitcher_experience_score": pitcher_experience_profile.get("score") if "pitcher_experience_profile" in locals() else None,
+        "pitcher_experience_bf_factor": pitcher_experience_profile.get("bf_factor") if "pitcher_experience_profile" in locals() else None,
+        "pitcher_experience_note": pitcher_experience_profile.get("note") if "pitcher_experience_profile" in locals() else None,
         "projected_ip": innings_outcome.get("projected_ip"),
         "ip_floor": innings_outcome.get("ip_floor"),
         "ip_ceiling": innings_outcome.get("ip_ceiling"),
@@ -13196,6 +13401,54 @@ def render_batter_prop_tab(market):
         </div>
         """, unsafe_allow_html=True)
 
+
+
+
+# =========================
+# BATTER H+R+R EXPERIENCE/STABILITY DISPLAY
+# Adds rookie/veteran/established-bat context to H+R+R only.
+# Does not change H+R+R projection or Underdog lines.
+# =========================
+_prev_batter_stability_project_batter_prop = project_batter_prop
+
+def project_batter_prop(row):
+    base = dict(_prev_batter_stability_project_batter_prop(row) or row)
+    if row.get('Market') != 'HRR':
+        return base
+    try:
+        player = row.get('Player') or base.get('Player')
+        prof = get_batter_hits_rbi_profile_by_name(player)
+        stability = build_batter_experience_stability_layer(player, player_id=prof.get('player_id'), profile=prof)
+        base['Batter Stability Label'] = stability.get('label')
+        base['Batter Stability Score'] = stability.get('score')
+        base['Batter Stability Note'] = stability.get('note')
+        # Confidence-only calibration, capped. Projection/edge/side stay based on the model and UD line.
+        conf = safe_float(base.get('Confidence %'), None)
+        if conf is not None:
+            base['Confidence %'] = round(clamp(conf + safe_float(stability.get('confidence_nudge'), 0.0), 50, 85), 1)
+        attr = str(base.get('Attribution') or '')
+        if stability.get('label') and 'BatStab' not in attr:
+            base['Attribution'] = (attr + f" | BatStab {stability.get('label')} {stability.get('score')}").strip(' |')
+    except Exception as _batstab_e:
+        base['Batter Stability Label'] = 'BATTER_STABILITY_UNKNOWN'
+        base['Batter Stability Score'] = 50
+        base['Batter Stability Note'] = f'Batter stability skipped: {_batstab_e}'
+    return base
+
+_prev_batter_stability_build_batter_prop_board = build_batter_prop_board
+
+def build_batter_prop_board(market):
+    df = _prev_batter_stability_build_batter_prop_board(market)
+    if isinstance(df, pd.DataFrame) and not df.empty and market == 'HRR':
+        for col, default in [
+            ('Batter Stability Label', 'NEUTRAL_BAT_STABILITY'),
+            ('Batter Stability Score', 50),
+            ('Batter Stability Note', ''),
+        ]:
+            if col not in df.columns:
+                df[col] = default
+            df[col] = df[col].apply(lambda x: default if _hrr_missing_value(x) else x)
+    return df
 
 # =========================
 # PROJECTION DRIFT + TRAP LINE 2.0
