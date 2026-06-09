@@ -10292,17 +10292,30 @@ def render_moneyline_edge_tab(board, dates=None):
 BATTER_PROP_MARKETS = {
     "HITS": {
         "label": "Batter Hits",
-        "terms": ["hits", "hit"],
-        "bad_terms": ["hits allowed", "pitcher hits", "hits+runs", "hits + runs", "h+r+rbi", "hr+rbi", "total bases", "fantasy"],
+        # Strict MLB batter-Hits only. NHL also has a "hits" market, so do not use
+        # broad substring matching. Require the Underdog market title wording.
+        "terms": ["hits o/u", "batter hits o/u", "hits over/under", "batter hits over/under"],
+        "bad_terms": [
+            "hits allowed", "pitcher hits", "hits+runs", "hits + runs", "h+r+rbi", "hr+rbi",
+            "total bases", "singles", "doubles", "home runs", "runs o/u", "rbis", "rbi",
+            "fantasy", "shots", "goals", "assists", "saves", "blocks", "tackles", "strokes",
+            "tourney", "finishing position", "soccer", "nhl", "nba", "nfl", "golf"
+        ],
         "min_line": 0.5,
-        "max_line": 3.5,
+        "max_line": 2.5,
     },
     "RBI": {
         "label": "Batter RBI",
-        "terms": ["rbi", "runs batted in", "runs batted"],
-        "bad_terms": ["hits+runs", "hits + runs", "h+r+rbi", "fantasy", "team rbi"],
+        # Strict MLB RBI only. Prevent Total Bases/Runs/HR/Walks/SB from leaking in.
+        "terms": ["rbis o/u", "rbi o/u", "runs batted in o/u", "runs batted over/under"],
+        "bad_terms": [
+            "hits", "total bases", "singles", "doubles", "home runs", "runs o/u",
+            "batter strikeouts", "batter walks", "walks o/u", "stolen bases", "fantasy", "team rbi",
+            "shots", "goals", "assists", "saves", "blocks", "tackles", "strokes",
+            "tourney", "finishing position", "soccer", "nhl", "nba", "nfl", "golf"
+        ],
         "min_line": 0.5,
-        "max_line": 4.5,
+        "max_line": 2.5,
     },
 }
 
@@ -10346,15 +10359,26 @@ def _bp_text_from_obj(obj):
 
 
 def _bp_market_from_text(text):
+    """Strictly classify only MLB Batter Hits and Batter RBI Underdog rows.
+
+    This intentionally avoids broad matching because other sports also use "Hits",
+    and MLB has many neighboring batter props (Total Bases, HR, Runs, Walks, SB).
+    """
     low = str(text or "").lower()
-    for market, cfg in BATTER_PROP_MARKETS.items():
-        if any(bad in low for bad in cfg["bad_terms"]):
-            continue
-        if any(term in low for term in cfg["terms"]):
-            # Keep hitter props away from pitcher prop rows.
-            if "allowed" in low or "pitcher" in low and market == "HITS":
-                continue
-            return market
+    # Hard reject non-target markets/sports first.
+    global_bad = [
+        "hits allowed", "pitcher hits", "total bases", "singles", "doubles", "home runs",
+        "runs o/u", "batter strikeouts", "batter walks", "walks o/u", "stolen bases",
+        "hits+runs", "hits + runs", "h+r+rbi", "fantasy", "shots", "goals", "assists",
+        "saves", "blocks", "tackles", "strokes", "tourney", "finishing position",
+        "soccer", "nhl", "nba", "nfl", "golf"
+    ]
+    if any(bad in low for bad in global_bad):
+        return None
+    if any(term in low for term in BATTER_PROP_MARKETS["RBI"]["terms"]):
+        return "RBI"
+    if any(term in low for term in BATTER_PROP_MARKETS["HITS"]["terms"]):
+        return "HITS"
     return None
 
 
@@ -10377,20 +10401,51 @@ def _bp_extract_line_from_text(text, market):
 
 
 def _bp_find_line(obj, market):
+    """Extract only real Underdog prop target lines from structured fields.
+
+    Do NOT parse random numbers from the full JSON blob; that caused fake 1/2/3/4
+    lines from ids/ranks/other markets. If no structured line exists, skip row.
+    """
     if not isinstance(obj, dict):
         return None
     a = _bp_attrs(obj)
+    strict_keys = [
+        "stat_value", "line", "over_under_line", "target_value", "line_score", "overUnderLine",
+        "over_under", "display_stat_value"
+    ]
+    cfg = BATTER_PROP_MARKETS.get(market, {})
+    mn, mx = cfg.get("min_line", 0.5), cfg.get("max_line", 2.5)
     for d in [a, obj]:
         if not isinstance(d, dict):
             continue
-        for key in ["line", "stat_value", "target_value", "line_score", "over_under_line", "points", "value", "total"]:
-            v = safe_float(d.get(key), None)
-            if v is not None:
-                cfg = BATTER_PROP_MARKETS.get(market, {})
-                if cfg.get("min_line", 0.5) <= v <= cfg.get("max_line", 4.5):
-                    return float(v)
-    return _bp_extract_line_from_text(_bp_text_from_obj(obj), market)
+        for key in strict_keys:
+            raw = d.get(key)
+            v = safe_float(raw, None)
+            if v is None and isinstance(raw, str):
+                v = _bp_extract_line_from_text(raw, market)
+            if v is not None and mn <= v <= mx and abs(v * 2 - round(v * 2)) < 1e-9:
+                return float(v)
+    return None
 
+
+def _bp_clean_player_name(name):
+    """Remove Underdog market suffixes so MLB player search receives a real name."""
+    import re
+    s = str(name or "").strip()
+    # Remove common O/U prop suffixes from title/description fields.
+    patterns = [
+        r"\s+(Batter\s+)?Hits\s+O/U.*$",
+        r"\s+(Batter\s+)?Hits\s+Over/Under.*$",
+        r"\s+RBIs?\s+O/U.*$",
+        r"\s+Runs\s+Batted\s+In\s+O/U.*$",
+        r"\s+Runs\s+Batted\s+Over/Under.*$",
+    ]
+    for pat in patterns:
+        s = re.sub(pat, "", s, flags=re.I).strip()
+    # Remove punctuation fragments that sometimes trail descriptions.
+    s = re.sub(r"\s+[OU]nder.*$", "", s, flags=re.I).strip()
+    s = re.sub(r"\s+[OH]igher.*$", "", s, flags=re.I).strip()
+    return s.strip(" -|•:")
 
 def _bp_candidate_name(obj):
     if not isinstance(obj, dict):
@@ -10410,7 +10465,7 @@ def _bp_candidate_name(obj):
     if candidates:
         # Prefer the string that looks most like a real name.
         candidates = sorted(candidates, key=lambda s: (len(s.split()) >= 2, len(s)), reverse=True)
-        return candidates[0]
+        return _bp_clean_player_name(candidates[0])
     return ""
 
 
@@ -10444,11 +10499,16 @@ def fetch_underdog_batter_prop_rows():
             if line is None:
                 continue
             player = _bp_candidate_name(obj)
+            player = _bp_clean_player_name(player)
             if not player or len(normalize_name(player).split()) < 2:
                 # Some Underdog objects need relationship joining; avoid guessing names.
                 continue
-            # Prevent pitcher rows from leaking into batter tabs.
+            # Prevent pitcher/team/non-MLB rows from leaking into batter tabs.
             if any(x in normalize_name(player) for x in ["team", "first inning", "game"]):
+                continue
+            # Validate the player can be resolved by MLB before displaying the row.
+            # This removes NHL/Golf/Soccer "Hits" props even if Underdog text lacks a sport tag.
+            if not _mlb_search_player_id_by_name(player):
                 continue
             rows.append({
                 "Source": "Underdog",
@@ -10629,13 +10689,19 @@ def project_batter_prop(row):
     if market == "HITS":
         season = safe_float(prof.get("season_hits_per_game"), None)
         recent = safe_float(prof.get("recent_hits_avg"), None)
+        # League-average fallbacks keep true MLB hitters from showing Projection=None.
+        # They are conservative and still PASS unless there is a real edge.
+        obp = safe_float(obp, 0.315)
+        contact = safe_float(contact, 0.765)
+        babip = safe_float(babip, 0.300)
+        season = safe_float(season, max(0.55, obp * 2.65))
         # OBP and contact are Moneyball-style support signals, not the line source.
-        obp_proxy = None if obp is None else obp * 3.25
-        contact_proxy = None if contact is None else contact * 1.45
-        babip_proxy = None if babip is None else babip * 3.10
+        obp_proxy = obp * 3.00
+        contact_proxy = contact * 1.30
+        babip_proxy = babip * 2.70
         vals, weights = [], []
-        run_env_proxy = None if team_bsr is None else max(0.15, min(1.65, team_bsr / max(MLB_AVG_RUNS_PER_GAME, 0.1) * 0.95))
-        for v, w in [(season, 0.40), (recent, 0.24), (obp_proxy, 0.14), (contact_proxy, 0.11), (babip_proxy, 0.07), (run_env_proxy, 0.04)]:
+        run_env_proxy = max(0.15, min(1.65, (team_bsr if team_bsr is not None else MLB_AVG_RUNS_PER_GAME) / max(MLB_AVG_RUNS_PER_GAME, 0.1) * 0.85))
+        for v, w in [(season, 0.46), (recent, 0.18), (obp_proxy, 0.14), (contact_proxy, 0.11), (babip_proxy, 0.07), (run_env_proxy, 0.04)]:
             if v is not None:
                 vals.append(v * w); weights.append(w)
         proj = sum(vals) / sum(weights) if weights else None
