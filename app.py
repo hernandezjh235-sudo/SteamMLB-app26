@@ -13005,6 +13005,149 @@ def fetch_underdog_batter_prop_rows():
             dedup[key] = r
     return list(dedup.values())
 
+
+
+# =========================
+# H+R+R DISPLAY/CONTEXT FALLBACK CLEANUP
+# Keeps real confirmed lineup/team context as the priority, but prevents
+# blank/nan mobile cards before lineups are posted. This affects only H+R+R.
+# K projection and K Upside are untouched.
+# =========================
+
+def _hrr_missing_value(v):
+    try:
+        if v is None:
+            return True
+        s = str(v).strip().lower()
+        if s in ["", "none", "nan", "na", "n/a", "—", "-"]:
+            return True
+        f = float(v)
+        return pd.isna(f)
+    except Exception:
+        return False
+
+
+def _hrr_num_or(v, fallback):
+    if _hrr_missing_value(v):
+        return fallback
+    try:
+        f = float(v)
+        if pd.isna(f):
+            return fallback
+        return f
+    except Exception:
+        return fallback
+
+
+def _hrr_parse_attr_number(attr, key, fallback=None):
+    """Extract numbers from attribution text like 'ImpRuns 4.31 | wRC+ 99'."""
+    try:
+        m = re.search(rf"{re.escape(key)}\s+(-?\d+(?:\.\d+)?)", str(attr or ""), re.I)
+        if m:
+            return float(m.group(1))
+    except Exception:
+        pass
+    return fallback
+
+
+_prev_hrr_fallback_project_batter_prop = project_batter_prop
+
+def project_batter_prop(row):
+    """Final H+R+R-only fallback layer.
+
+    Real confirmed lineup data still wins. If lineup/team context is missing
+    before lineups are posted, use neutral defaults so cards and calculations
+    do not show nan/blank values.
+    """
+    base = dict(_prev_hrr_fallback_project_batter_prop(row) or row)
+    if row.get('Market') != 'HRR':
+        return base
+
+    attr = str(base.get('Attribution') or '')
+
+    # If official lineup is not resolved yet, use neutral slot/PA.
+    real_slot = base.get('Lineup Slot')
+    slot = _hrr_num_or(real_slot, 5.0)
+    if _hrr_missing_value(real_slot):
+        base['Lineup Slot'] = 5.0
+        if not base.get('Lineup Source'):
+            base['Lineup Source'] = 'FALLBACK_PENDING_CONFIRMED'
+        base['Confirmed Lineup'] = base.get('Confirmed Lineup') if str(base.get('Confirmed Lineup')).upper() == 'YES' else 'NO'
+
+    # PA fallback should be neutral and should be replaced by confirmed lineup once posted.
+    pa = _hrr_num_or(base.get('Projected PA'), _confirmed_pa_from_slot(slot, None) or 4.10)
+    base['Projected PA'] = round(pa, 2)
+
+    # Team runs fallback: use existing implied runs if available, else attribution ImpRuns, else league-neutral.
+    imp_from_attr = _hrr_parse_attr_number(attr, 'ImpRuns', None)
+    team_runs = _hrr_num_or(base.get('Team Implied Runs'), imp_from_attr if imp_from_attr is not None else 4.35)
+    base['Team Implied Runs'] = round(team_runs, 2)
+
+    # wRC+ fallback: use attribution value if available, else neutral 100.
+    wrc_from_attr = _hrr_parse_attr_number(attr, 'wRC+', None)
+    wrc = _hrr_num_or(base.get('Team wRC+ Split'), wrc_from_attr if wrc_from_attr is not None else 100)
+    base['Team wRC+ Split'] = int(round(wrc))
+
+    # Offense environment and opportunity fallback if missing.
+    off_from_attr = _hrr_parse_attr_number(attr, 'OffEnv', None)
+    offenv = _hrr_num_or(base.get('Offense Env Score'), off_from_attr if off_from_attr is not None else 50)
+    base['Offense Env Score'] = int(round(clamp(offenv, 10, 95)))
+
+    opp = _hrr_num_or(base.get('HRR Opportunity Score'), base.get('RBI Opp Score') if not _hrr_missing_value(base.get('RBI Opp Score')) else 50)
+    base['HRR Opportunity Score'] = int(round(clamp(opp, 10, 95)))
+
+    # If Projection exists, refresh edge/conf after neutral fallback so displayed math is aligned.
+    proj = safe_float(base.get('Projection'), None)
+    line = safe_float(row.get('Line'), safe_float(base.get('Line'), None))
+    try:
+        if proj is not None and not pd.isna(float(proj)) and line is not None and not pd.isna(float(line)):
+            edge = float(proj) - float(line)
+            base['Edge'] = round(edge, 2)
+            if abs(edge) < 0.22:
+                base['Decision'] = 'PASS'
+            else:
+                base['Decision'] = 'OVER' if edge > 0 else 'UNDER'
+            base['Confidence %'] = round(clamp(50 + abs(edge) * 13.5 + abs(base['HRR Opportunity Score'] - 50) * 0.025, 50, 85), 1)
+    except Exception:
+        pass
+
+    if 'Fallback' not in attr and ('FALLBACK_PENDING_CONFIRMED' in str(base.get('Lineup Source',''))):
+        attr = (attr + ' | Fallback slot/PA pending confirmed lineup').strip(' |')
+    # Ensure attribution has clean final context, without nan.
+    if 'PA ' not in attr:
+        attr = (attr + f" | PA {base['Projected PA']}").strip(' |')
+    if 'ImpRuns' not in attr:
+        attr = (attr + f" | ImpRuns {base['Team Implied Runs']}").strip(' |')
+    if 'wRC+' not in attr:
+        attr = (attr + f" | wRC+ {base['Team wRC+ Split']}").strip(' |')
+    base['Attribution'] = attr
+    return base
+
+
+_prev_hrr_fallback_build_batter_prop_board = build_batter_prop_board
+
+def build_batter_prop_board(market):
+    df = _prev_hrr_fallback_build_batter_prop_board(market)
+    if isinstance(df, pd.DataFrame) and not df.empty and market == 'HRR':
+        # Replace display-breaking nan/blank values only in H+R+R output.
+        for col, default in [
+            ('Lineup Slot', 5.0),
+            ('Projected PA', 4.10),
+            ('Team Implied Runs', 4.35),
+            ('Team wRC+ Split', 100),
+            ('Offense Env Score', 50),
+            ('HRR Opportunity Score', 50),
+        ]:
+            if col not in df.columns:
+                df[col] = default
+            df[col] = df[col].apply(lambda x: default if _hrr_missing_value(x) else x)
+        if 'Lineup Source' not in df.columns:
+            df['Lineup Source'] = 'FALLBACK_PENDING_CONFIRMED'
+        df['Lineup Source'] = df['Lineup Source'].apply(lambda x: 'FALLBACK_PENDING_CONFIRMED' if _hrr_missing_value(x) else x)
+        if 'Confirmed Lineup' not in df.columns:
+            df['Confirmed Lineup'] = 'NO'
+    return df
+
 _prev_hrr_debug_render_batter_prop_tab = render_batter_prop_tab
 
 def render_batter_prop_tab(market):
