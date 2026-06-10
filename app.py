@@ -11198,8 +11198,8 @@ def _handedness_split_score_from_profile(prof):
     return int(round(sum(vals) / len(vals))) if vals else 50
 
 
-_prev_hrr_profile_for_opportunity = get_batter_hits_rbi_profile_by_name
-_prev_hrr_project_for_opportunity = project_batter_prop
+_prev_hrr_profile_for_opportunity = globals().get('get_batter_hits_rbi_profile_by_name', lambda player_name: {})
+_prev_hrr_project_for_opportunity = globals().get('project_batter_prop', lambda row: row)
 
 
 # CLEANUP: removed earlier duplicate definition of get_batter_hits_rbi_profile_by_name (kept latest version).
@@ -11333,9 +11333,9 @@ def _confirmed_pa_from_slot(slot, team_implied_runs=None):
     return round(clamp(base, 3.35, 5.10), 2)
 
 
-_prev_confirmed_hrr_profile = get_batter_hits_rbi_profile_by_name
-_prev_confirmed_hrr_project = project_batter_prop
-_prev_confirmed_ml_factors = ml_moneyline_factors
+_prev_confirmed_hrr_profile = globals().get('get_batter_hits_rbi_profile_by_name', lambda player_name: {})
+_prev_confirmed_hrr_project = globals().get('project_batter_prop', lambda row: row)
+_prev_confirmed_ml_factors = globals().get('ml_moneyline_factors', lambda team_abbr, team_pitcher_row, opp_pitcher_row: (50.0, {}))
 
 # CLEANUP: removed earlier duplicate definition of get_batter_hits_rbi_profile_by_name (kept latest version).
 
@@ -11382,7 +11382,7 @@ def _team_confirmed_lineup_strength_delta(team_id):
 # CLEANUP: removed earlier duplicate definition of ml_moneyline_factors (kept latest version).
 
 # Add confirmed-lineup columns to H+R+R table/mobile output without changing K.
-_prev_confirmed_build_batter_prop_board = build_batter_prop_board
+_prev_confirmed_build_batter_prop_board = globals().get('build_batter_prop_board', lambda market=None: pd.DataFrame())
 
 # CLEANUP: removed earlier duplicate definition of build_batter_prop_board (kept latest version).
 
@@ -11526,9 +11526,9 @@ def _offense_environment_score(team_implied_runs=None, wrc_plus_split=None, base
     return int(round(implied_score * 0.40 + wrc_score * 0.30 + bsr_score * 0.20 + park_score * 0.10))
 
 
-_prev_env_hrr_profile = get_batter_hits_rbi_profile_by_name
-_prev_env_hrr_project = project_batter_prop
-_prev_env_ml_moneyline_factors = ml_moneyline_factors
+_prev_env_hrr_profile = globals().get('get_batter_hits_rbi_profile_by_name', lambda player_name: {})
+_prev_env_hrr_project = globals().get('project_batter_prop', lambda row: row)
+_prev_env_ml_moneyline_factors = globals().get('ml_moneyline_factors', lambda team_abbr, team_pitcher_row, opp_pitcher_row: (50.0, {}))
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -11597,7 +11597,7 @@ def ml_moneyline_factors(team_abbr, team_pitcher_row, opp_pitcher_row):
     return float(score2), factors
 
 
-_prev_env_ml_factor_summary = ml_factor_summary
+_prev_env_ml_factor_summary = globals().get('ml_factor_summary', lambda factors: '')
 
 def ml_factor_summary(factors):
     if not isinstance(factors, dict):
@@ -11610,7 +11610,7 @@ def ml_factor_summary(factors):
     )
 
 
-_prev_env_build_batter_prop_board = build_batter_prop_board
+_prev_env_build_batter_prop_board = globals().get('build_batter_prop_board', lambda market=None: pd.DataFrame())
 
 # CLEANUP: removed earlier duplicate definition of build_batter_prop_board (kept latest version).
 
@@ -11945,16 +11945,16 @@ def _hrr_parse_attr_number(attr, key, fallback=None):
     return fallback
 
 
-_prev_hrr_fallback_project_batter_prop = project_batter_prop
+_prev_hrr_fallback_project_batter_prop = globals().get('project_batter_prop', lambda row: row)
 
 # CLEANUP: removed earlier duplicate definition of project_batter_prop (kept latest version).
 
 
-_prev_hrr_fallback_build_batter_prop_board = build_batter_prop_board
+_prev_hrr_fallback_build_batter_prop_board = globals().get('build_batter_prop_board', lambda market=None: pd.DataFrame())
 
 # CLEANUP: removed earlier duplicate definition of build_batter_prop_board (kept latest version).
 
-_prev_hrr_debug_render_batter_prop_tab = render_batter_prop_tab
+_prev_hrr_debug_render_batter_prop_tab = globals().get('render_batter_prop_tab', lambda market=None: None)
 
 def render_batter_prop_tab(market):
     cfg = BATTER_PROP_MARKETS[market]
@@ -12226,7 +12226,7 @@ def build_fantasy_score_board(board_rows=None):
 # Adds rookie/veteran/established-bat context to H+R+R only.
 # Does not change H+R+R projection or Underdog lines.
 # =========================
-_prev_batter_stability_project_batter_prop = project_batter_prop
+_prev_batter_stability_project_batter_prop = globals().get('project_batter_prop', lambda row: row)
 
 def project_batter_prop(row):
     base = dict(_prev_batter_stability_project_batter_prop(row) or row)
@@ -12252,7 +12252,7 @@ def project_batter_prop(row):
         base['Batter Stability Note'] = f'Batter stability skipped: {_batstab_e}'
     return base
 
-_prev_batter_stability_build_batter_prop_board = build_batter_prop_board
+_prev_batter_stability_build_batter_prop_board = globals().get('build_batter_prop_board', lambda market=None: pd.DataFrame())
 
 def build_batter_prop_board(market):
     df = _prev_batter_stability_build_batter_prop_board(market)
@@ -12380,7 +12380,7 @@ def _fs_batter_power_speed_context(prof, pa, team_runs, lineup_slot):
 
 
 # Save reference to original fantasy projection, then override only Fantasy Score projection.
-_prev_fantasy_score_project_row = project_fantasy_score_row
+_prev_fantasy_score_project_row = globals().get('project_fantasy_score_row', lambda row, board_rows=None: row)
 
 def project_fantasy_score_row(row, board_rows=None):
     market = row.get("Market")
