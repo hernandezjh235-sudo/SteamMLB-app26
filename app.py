@@ -13232,3 +13232,500 @@ with tab6:
             st.error("All logs cleared.")
 
 st.caption("Workflow: Refresh live board -> inspect lines -> save official before-game snapshot -> after games, grade and learn.")
+
+# =========================
+# ML FINAL REFINEMENT PATCH
+# Adds only Moneyline improvements:
+# 1) stronger but capped ML weighting
+# 2) probable-pitcher validation / cleanup
+# 3) ML confidence calibration labels
+# K Upside + Fantasy projections are untouched.
+# =========================
+
+def _ml_num_from_factors(factors, key, default=0.0):
+    try:
+        return safe_float((factors or {}).get(key), default) or default
+    except Exception:
+        return default
+
+
+def _ml_factor_edge_points(afactors, hfactors):
+    """Translate real ML factor differences into win-probability separation.
+    Designed to avoid 50/50 boards while staying capped to prevent wild ML outputs.
+    """
+    a_bsr = _ml_num_from_factors(afactors, 'BaseRuns/G', MLB_AVG_RUNS_PER_GAME)
+    h_bsr = _ml_num_from_factors(hfactors, 'BaseRuns/G', MLB_AVG_RUNS_PER_GAME)
+    a_wrc = _ml_num_from_factors(afactors, 'Team wRC+ Split', 100)
+    h_wrc = _ml_num_from_factors(hfactors, 'Team wRC+ Split', 100)
+    a_lu = _ml_num_from_factors(afactors, 'Lineup Strength', 50)
+    h_lu = _ml_num_from_factors(hfactors, 'Lineup Strength', 50)
+    a_pyth = _ml_num_from_factors(afactors, 'Pyth Win%', 50)
+    h_pyth = _ml_num_from_factors(hfactors, 'Pyth Win%', 50)
+    a_imp = _ml_num_from_factors(afactors, 'Team Implied Runs', MLB_AVG_RUNS_PER_GAME)
+    h_imp = _ml_num_from_factors(hfactors, 'Team Implied Runs', MLB_AVG_RUNS_PER_GAME)
+    a_rest = _ml_num_from_factors(afactors, 'Rest Edge', 0)
+    h_rest = _ml_num_from_factors(hfactors, 'Rest Edge', 0)
+    a_conf = _ml_num_from_factors(afactors, 'Confirmed Lineup Delta', 0)
+    h_conf = _ml_num_from_factors(hfactors, 'Confirmed Lineup Delta', 0)
+
+    edge = 0.0
+    edge += (a_bsr - h_bsr) * 3.2
+    edge += (a_imp - h_imp) * 2.5
+    edge += (a_wrc - h_wrc) * 0.075
+    edge += (a_lu - h_lu) * 0.16
+    edge += (a_pyth - h_pyth) * 0.075
+    edge += (a_rest - h_rest) * 0.30
+    edge += (a_conf - h_conf) * 0.85
+    return float(clamp(edge, -16.0, 16.0))
+
+
+def _ml_data_quality_label(afactors, hfactors, ap, hp):
+    issues = []
+    ap_name = str((ap or {}).get('pitcher') or '').strip()
+    hp_name = str((hp or {}).get('pitcher') or '').strip()
+    if not ap_name or ap_name == '—':
+        issues.append('AWAY_SP_MISSING')
+    if not hp_name or hp_name == '—':
+        issues.append('HOME_SP_MISSING')
+    if ap_name and hp_name and ap_name == hp_name:
+        issues.append('DUPLICATE_SP_REVIEW')
+    if _ml_num_from_factors(afactors, 'Team ID', None) is None:
+        issues.append('AWAY_TEAM_ID_MISSING')
+    if _ml_num_from_factors(hfactors, 'Team ID', None) is None:
+        issues.append('HOME_TEAM_ID_MISSING')
+    if not issues:
+        return 'OK', ''
+    return 'REVIEW', ', '.join(issues)
+
+
+def _ml_calibrated_confidence(edge, afactors, hfactors, data_label='OK'):
+    edge = abs(safe_float(edge, 0) or 0)
+    # ML confidence should be conservative because moneyline variance is high.
+    conf = 50.0 + min(24.0, edge * 3.2)
+    mode_a = str((afactors or {}).get('Data Mode') or '')
+    mode_h = str((hfactors or {}).get('Data Mode') or '')
+    if 'CONFIRMED' in mode_a or 'CONFIRMED' in mode_h:
+        conf += 2.0
+    if data_label != 'OK':
+        conf -= 5.0
+    return round(float(clamp(conf, 50.0, 78.0)), 1)
+
+
+def _ml_pick_pitchers_clean(ps, away_abbr, home_abbr):
+    """Pick one pitcher row per side and flag probable-pitcher problems.
+    This keeps ML from silently showing the same SP on both teams.
+    """
+    ps = [p for p in (ps or []) if isinstance(p, dict)]
+    away_abbr = str(away_abbr or '').upper()
+    home_abbr = str(home_abbr or '').upper()
+    ap = next((p for p in ps if str(p.get('team') or '').upper() == away_abbr), None)
+    hp = next((p for p in ps if str(p.get('team') or '').upper() == home_abbr), None)
+    if ap is None and ps:
+        ap = ps[0]
+    if hp is None:
+        hp = next((p for p in ps if p is not ap), None) or (ps[1] if len(ps) > 1 else {})
+    ap = ap or {}
+    hp = hp or {}
+    return ap, hp
+
+
+# Preserve current board builder for fallback/reference, then override ML only.
+_prev_ml_build_board_weight_patch = globals().get('ml_build_board', None)
+
+def ml_build_board(board):
+    odds = ml_fetch_oddsapi_h2h()
+    games = {}
+    for p in board or []:
+        if not isinstance(p, dict):
+            continue
+        a, h = ml_sides(p.get('matchup'))
+        team = str(p.get('team') or '').upper()
+        if not a or not h or not team:
+            continue
+        rec = games.setdefault(f'{a} @ {h}', {'away': a, 'home': h, 'pitchers': []})
+        rec['pitchers'].append(p)
+
+    rows = []
+    for matchup, g in games.items():
+        a, h = g['away'], g['home']
+        ps = g.get('pitchers') or []
+        ap, hp = _ml_pick_pitchers_clean(ps, a, h)
+
+        ascore, afactors = ml_moneyline_factors(a, ap, hp)
+        hscore, hfactors = ml_moneyline_factors(h, hp, ap)
+
+        factor_edge = _ml_factor_edge_points(afactors, hfactors)
+        # Blend factor edge with existing score separation. Existing score is still respected,
+        # but the factor edge prevents season-profile boards from staying glued to 50/50.
+        raw_score_edge = clamp((safe_float(ascore, 50) or 50) - (safe_float(hscore, 50) or 50), -12, 12)
+        blended_edge = clamp((factor_edge * 0.72) + (raw_score_edge * 0.28), -16, 16)
+        amodel = round(float(clamp(50.0 + blended_edge, 25, 75)), 1)
+        hmodel = round(100.0 - amodel, 1)
+
+        og = next((x for x in odds if x.get('away_abbr') == a and x.get('home_abbr') == h), None)
+        amkt = og.get('away_market') if og else None
+        hmkt = og.get('home_market') if og else None
+        aedge = None if amkt is None else round(amodel - amkt, 1)
+        hedge = None if hmkt is None else round(hmodel - hmkt, 1)
+        data_label, data_note = _ml_data_quality_label(afactors, hfactors, ap, hp)
+
+        if aedge is None or hedge is None:
+            pick = a if amodel >= hmodel else h
+            edge = round(abs(amodel - hmodel), 1)
+            status = 'MODEL ONLY' if data_label == 'OK' else 'MODEL ONLY — SP REVIEW'
+            grade = f'MODEL LEAN — {pick}'
+        else:
+            pick, edge = (a, aedge) if aedge >= hedge else (h, hedge)
+            if edge >= 6 and data_label == 'OK':
+                status, grade = 'PLAYABLE', f'🔥 ML EDGE — {pick}'
+            elif edge >= 3:
+                status, grade = 'LEAN' if data_label == 'OK' else 'LEAN — SP REVIEW', f'✅ ML LEAN — {pick}'
+            else:
+                status, grade = 'PASS' if data_label == 'OK' else 'PASS — SP REVIEW', f'🚫 PASS ML — {pick}'
+
+        ml_conf = _ml_calibrated_confidence(edge, afactors, hfactors, data_label)
+        rows.append({
+            'Matchup': matchup, 'Pick': pick, 'ML Grade': grade, 'Status': status, 'ML Edge %': edge,
+            'ML Confidence %': ml_conf, 'ML Data Quality': data_label, 'ML Data Note': data_note,
+            'Away Model %': amodel, 'Home Model %': hmodel,
+            'Away Market %': amkt, 'Home Market %': hmkt,
+            'Away Price': og.get('away_price') if og else None, 'Home Price': og.get('home_price') if og else None,
+            'Away SP': ap.get('pitcher', '—') if isinstance(ap, dict) else '—',
+            'Home SP': hp.get('pitcher', '—') if isinstance(hp, dict) else '—',
+            'Away BaseRuns/G': afactors.get('BaseRuns/G'),
+            'Home BaseRuns/G': hfactors.get('BaseRuns/G'),
+            'Away Pyth Win%': afactors.get('Pyth Win%'),
+            'Home Pyth Win%': hfactors.get('Pyth Win%'),
+            'Away Lineup Strength': afactors.get('Lineup Strength'),
+            'Home Lineup Strength': hfactors.get('Lineup Strength'),
+            'Away Bullpen': afactors.get('Bullpen'),
+            'Home Bullpen': hfactors.get('Bullpen'),
+            'Away Rest': afactors.get('Rest'),
+            'Home Rest': hfactors.get('Rest'),
+            'Park': afactors.get('Park'),
+            'Park Factor': afactors.get('Park Factor'),
+            'Away ML Factors': ml_factor_summary(afactors),
+            'Home ML Factors': ml_factor_summary(hfactors),
+            'Source': 'OddsAPI + ML 2.0 + weighted calibration' if og else 'ML 2.0 model only + weighted calibration'
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values('ML Edge %', ascending=False)
+    return df
+
+
+
+
+# ============================================================
+# FANTASY SCORE UNDERDOG LOADER FIX — RELATIONSHIP-AWARE
+# Fixes Fantasy Score tab showing candidates=0 while Underdog has rows.
+# This override affects ONLY Fantasy Score rows. K Upside, ML, and projections are untouched.
+# ============================================================
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_underdog_fantasy_score_rows():
+    import re, json
+
+    pitcher_terms = [
+        "pitcher fantasy", "pitching fantasy", "pitcher fantasy score", "pitcher fantasy points",
+        "pitching fantasy score", "pitching fantasy points"
+    ]
+    batter_terms = [
+        "batter fantasy", "hitter fantasy", "batter fantasy score", "batter fantasy points",
+        "hitter fantasy score", "hitter fantasy points"
+    ]
+    generic_terms = ["fantasy points", "fantasy score", "fantasy pts"]
+    bad_sports = [
+        "nba", "wnba", "nfl", "nhl", "soccer", "golf", "ufc", "tennis", "football", "basketball",
+        "hockey", "shots", "goals", "assists", "rebounds", "passing", "receiving", "rushing",
+        "tourney", "finishing position", "strokes", "saves", "blocks", "tackles"
+    ]
+    bad_mlb_neighbor_props = [
+        "hits + runs + rbis", "h+r+r", "hits allowed", "earned runs", "pitching outs",
+        "strikeouts", "home runs", "total bases", "singles", "doubles", "rbis", "runs batted",
+        "batter hits", "batter walks", "walks o/u", "stolen bases"
+    ]
+
+    def attrs(obj):
+        if not isinstance(obj, dict):
+            return {}
+        out = {}
+        a = obj.get("attributes")
+        if isinstance(a, dict):
+            out.update(a)
+        for k, v in obj.items():
+            if k not in ["attributes", "relationships", "included", "data"] and k not in out:
+                out[k] = v
+        return out
+
+    def typ(obj, fallback=""):
+        if not isinstance(obj, dict):
+            return str(fallback or "").lower().replace("-", "_")
+        return str(obj.get("type") or fallback or obj.get("_parent_key", "")).lower().replace("-", "_")
+
+    def oid(obj):
+        if not isinstance(obj, dict):
+            return None
+        v = obj.get("id") or attrs(obj).get("id")
+        return str(v) if v not in [None, ""] else None
+
+    def collect(data):
+        out = []
+        def walk(x, parent_key=""):
+            if isinstance(x, dict):
+                y = dict(x)
+                if parent_key and "_parent_key" not in y:
+                    y["_parent_key"] = parent_key
+                out.append(y)
+                for k, v in x.items():
+                    if isinstance(v, (dict, list)):
+                        walk(v, k)
+            elif isinstance(x, list):
+                for item in x:
+                    walk(item, parent_key)
+        walk(data)
+        return out
+
+    def build_maps(objects):
+        by_key, by_id = {}, {}
+        for o in objects:
+            i = oid(o)
+            if not i:
+                continue
+            t = typ(o)
+            for tt in {t, t.rstrip('s'), t + 's'}:
+                by_key[(tt, i)] = o
+            by_id.setdefault(i, []).append(o)
+        return by_key, by_id
+
+    def rel_obj(obj, names, by_key, by_id):
+        if not isinstance(obj, dict):
+            return None
+        rels = obj.get("relationships") or {}
+        for name in names:
+            keys = {name, name.replace("_", "-"), name.replace("_", ""), name.rstrip('s'), name + 's'}
+            for key in keys:
+                node = rels.get(key)
+                if node is None:
+                    continue
+                data = node.get("data") if isinstance(node, dict) else node
+                items = data if isinstance(data, list) else [data]
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    ri = item.get("id")
+                    rt = str(item.get("type") or key or "").lower().replace("-", "_")
+                    if ri in [None, ""]:
+                        continue
+                    for cand_t in [rt, rt.rstrip('s'), rt + 's', key, key.rstrip('s'), key + 's']:
+                        hit = by_key.get((cand_t, str(ri)))
+                        if hit is not None:
+                            return hit
+                    candidates = by_id.get(str(ri), [])
+                    if candidates:
+                        for c in candidates:
+                            ct = typ(c)
+                            if key.rstrip('s') in ct or ct.rstrip('s') in key:
+                                return c
+                        return candidates[0]
+        return None
+
+    def text_from(*objs):
+        parts = []
+        wanted = [
+            "title", "display_title", "name", "player_name", "full_name", "first_name", "last_name",
+            "display_name", "stat", "stat_type", "appearance_stat", "display_stat", "label", "market",
+            "market_name", "sport", "league", "sport_name", "league_name", "description",
+            "over_under", "over_under_title", "scoring_type", "projection_type", "appearance_name",
+            "position", "team", "team_name", "abbr", "abbreviation", "stat_value", "line_score"
+        ]
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            for d in [attrs(obj), obj]:
+                if not isinstance(d, dict):
+                    continue
+                for k in wanted:
+                    v = d.get(k)
+                    if isinstance(v, dict):
+                        for kk in wanted:
+                            vv = v.get(kk)
+                            if vv not in [None, ""] and not isinstance(vv, (dict, list)):
+                                parts.append(str(vv))
+                    elif v not in [None, ""] and not isinstance(v, (dict, list)):
+                        parts.append(str(v))
+        try:
+            # JSON tail helps when Underdog nests the market title under an unexpected attribute.
+            for obj in objs:
+                if isinstance(obj, dict):
+                    parts.append(json.dumps(obj, default=str)[:900])
+        except Exception:
+            pass
+        return " | ".join(parts)
+
+    def active_ok(*objs):
+        blob = " ".join(str(attrs(o).get(k, "")) for o in objs if isinstance(o, dict) for k in ["status", "state", "display_status", "over_status", "under_status", "hidden", "active"]).lower()
+        return not any(x in blob for x in ["suspended", "removed", "hidden true", "inactive", "closed", "disabled"])
+
+    def structured_line(*objs):
+        keys = ["stat_value", "line", "over_under_line", "target_value", "line_score", "overUnderLine", "display_stat_value", "projection", "value"]
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            for d in [attrs(obj), obj]:
+                if not isinstance(d, dict):
+                    continue
+                for k in keys:
+                    raw = d.get(k)
+                    v = safe_float(raw, None)
+                    if v is not None and 0.5 <= v <= 75.5 and abs(v * 2 - round(v * 2)) < 1e-9:
+                        return float(v)
+        return None
+
+    def clean_name(s):
+        try:
+            return _fs_clean_player_name(s)
+        except Exception:
+            return str(s or "").strip(" -|•:")
+
+    def player_name_from(*objs):
+        # Prefer actual player objects, then appearance objects, then title regex.
+        candidates = []
+        player_keys = ["full_name", "fullName", "display_name", "player_name", "name", "title", "appearance_name", "description"]
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            for d in [attrs(obj), obj]:
+                if not isinstance(d, dict):
+                    continue
+                # first + last pattern if available
+                fn = d.get("first_name") or d.get("firstName")
+                ln = d.get("last_name") or d.get("lastName")
+                if fn and ln:
+                    candidates.append(f"{fn} {ln}")
+                for k in player_keys:
+                    v = d.get(k)
+                    if isinstance(v, dict):
+                        v = v.get("full_name") or v.get("fullName") or v.get("display_name") or v.get("name")
+                    if isinstance(v, str) and 2 <= len(v) <= 80:
+                        candidates.append(v)
+        combined = text_from(*objs)
+        # Handles "Chris Sale Fantasy Points O/U" and similar.
+        m = re.search(r"([A-Z][A-Za-zÀ-ÿ.'’\-]+(?:\s+(?:[A-Z][A-Za-zÀ-ÿ.'’\-]+|Jr\.|Sr\.|II|III|IV)){1,5})\s+(?:(?:Batter|Hitter|Pitcher|Pitching)\s+)?Fantasy\s+(?:Score|Points|Pts)", combined, re.I)
+        if m:
+            candidates.append(m.group(1))
+        if not candidates:
+            return ""
+        # Prefer names with at least 2 words and without market words.
+        scored = []
+        for c in candidates:
+            c2 = clean_name(c)
+            low = c2.lower()
+            if any(x in low for x in ["fantasy", "higher", "lower", "over", "under", "o/u", "mlb", "baseball"]):
+                continue
+            if len(c2.split()) >= 2:
+                scored.append(c2)
+        if not scored:
+            return ""
+        scored = sorted(scored, key=lambda s: (len(s.split()), len(s)), reverse=True)
+        return scored[0]
+
+    def market_from_text(txt, line, player_obj=None):
+        low = str(txt or "").lower()
+        if "fantasy" not in low:
+            return None
+        if any(x in low for x in bad_sports):
+            return None
+        # Do not allow neighboring props masquerading as fantasy unless explicit fantasy wording wins.
+        if any(x in low for x in bad_mlb_neighbor_props) and not any(x in low for x in generic_terms + pitcher_terms + batter_terms):
+            return None
+        if any(x in low for x in pitcher_terms):
+            return "PITCHER_FS"
+        if any(x in low for x in batter_terms):
+            return "BATTER_FS"
+        # Generic Underdog UI often calls both sides "Fantasy Points". Use position/line heuristic.
+        pos_blob = ""
+        if isinstance(player_obj, dict):
+            pa = attrs(player_obj)
+            pos_blob = " ".join(str(pa.get(k, "")) for k in ["position", "position_name", "positionName"] ).lower()
+        if any(x in pos_blob.split() for x in ["sp", "rp", "p", "pitcher"]):
+            return "PITCHER_FS"
+        # Pitcher fantasy lines are usually 20+; batter fantasy often lower.
+        if line is not None and line >= 20:
+            return "PITCHER_FS"
+        return "BATTER_FS"
+
+    rows = []
+    debug = {"urls": 0, "objects": 0, "candidates": 0, "mlb_valid": 0, "sample_markets": []}
+    seen = set()
+
+    for url in UNDERDOG_URLS:
+        try:
+            data = safe_get_json(url, timeout=18)
+            debug["urls"] += 1
+        except Exception:
+            data = None
+        if not data:
+            continue
+        objects = collect(data)
+        debug["objects"] += len(objects)
+        by_key, by_id = build_maps(objects)
+
+        # Prefer actual line-ish objects, but keep broad enough for Underdog beta endpoint changes.
+        lineish = []
+        for obj in objects:
+            t = typ(obj)
+            a = attrs(obj)
+            if "over_under_line" in t or "over_under" in t or any(k in a for k in ["stat_value", "line_score", "line", "over_under_line", "target_value"]):
+                lineish.append(obj)
+
+        for line_obj in lineish:
+            ou_obj = rel_obj(line_obj, ["over_under", "over_unders", "market", "markets"], by_key, by_id)
+            app_obj = rel_obj(line_obj, ["appearance", "appearances"], by_key, by_id)
+            player_obj = rel_obj(app_obj, ["player", "players"], by_key, by_id) if app_obj else None
+            if player_obj is None:
+                player_obj = rel_obj(line_obj, ["player", "players", "new_player", "new_players"], by_key, by_id)
+
+            combined = text_from(line_obj, ou_obj, app_obj, player_obj)
+            if "fantasy" in combined.lower() and len(debug["sample_markets"]) < 15:
+                debug["sample_markets"].append(combined[:700])
+            line = structured_line(line_obj, ou_obj, app_obj)
+            if line is None:
+                continue
+            market = market_from_text(combined, line, player_obj=player_obj)
+            if not market:
+                continue
+            if market == "PITCHER_FS" and not (3.5 <= line <= 75.5):
+                continue
+            if market == "BATTER_FS" and not (0.5 <= line <= 35.5):
+                continue
+            if not active_ok(line_obj, ou_obj, app_obj, player_obj):
+                continue
+            player = player_name_from(player_obj, app_obj, line_obj, ou_obj)
+            if not player or len(player.split()) < 2:
+                continue
+            debug["candidates"] += 1
+            pid = _mlb_search_player_id_by_name(player)
+            if not pid:
+                continue
+            debug["mlb_valid"] += 1
+            key = (market, normalize_name(player), float(line))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({
+                "Source": "Underdog",
+                "Player": player,
+                "Player ID": pid,
+                "Market": market,
+                "Market Label": FANTASY_SCORE_MARKETS.get(market, {}).get("label", "Fantasy Score"),
+                "Line": float(line),
+                "Evidence": combined[:300],
+            })
+
+    try:
+        st.session_state["fantasy_ud_debug"] = debug
+    except Exception:
+        pass
+    return rows
+
