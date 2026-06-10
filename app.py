@@ -15041,3 +15041,1679 @@ def render_ud_fantasy_points_tab():
 
 def render_underdog_fantasy_points_tab():
     return render_manual_fantasy_points_tab()
+
+
+
+# ============================================================
+# FORCE BATTER PROP TAB BACK TO H+R+R ONLY
+# Version: HRR_RESTORED_2026_06_10
+#
+# Purpose:
+# - Fantasy Points feed/manual mode was unreliable in deployment.
+# - Restore the batter prop section to H+R+R only.
+# - K Upside untouched.
+# - Moneyline untouched.
+# - Pitcher K learning untouched.
+# ============================================================
+
+HRR_RESTORED_VERSION = "HRR_RESTORED_2026_06_10"
+
+HRR_MARKET_ALIASES = (
+    "hits + runs + rbis",
+    "hits+runs+rbis",
+    "hits runs rbis",
+    "h+r+r",
+    "hrr",
+)
+
+def _hrr_restore_norm(x):
+    try:
+        return normalize_name(x)
+    except Exception:
+        import re
+        return re.sub(r"[^a-z0-9]+", "", str(x or "").lower())
+
+def _hrr_restore_safe_float(x, default=None):
+    try:
+        if x in (None, "", "—"):
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+def _hrr_restore_is_hrr_text(*parts):
+    blob = " ".join(str(p or "") for p in parts).lower()
+    blob2 = blob.replace(" ", "")
+    return (
+        "hits + runs + rbis" in blob
+        or "hits+runs+rbis" in blob2
+        or "h+r+r" in blob2
+        or "hrr" == blob.strip()
+        or "hits runs rbis" in blob
+    )
+
+def _hrr_restore_pick(edge):
+    if edge is None:
+        return "PASS"
+    if abs(float(edge)) < 0.25:
+        return "PASS"
+    return "OVER" if edge > 0 else "UNDER"
+
+def _hrr_restore_conf(edge):
+    if edge is None:
+        return ""
+    return round(max(50, min(88, 50 + abs(float(edge)) * 7)), 1)
+
+def fetch_underdog_hrr_rows_restored():
+    """
+    Relationship-free parser for Underdog H+R+R rows.
+    It reads options.selection_header + selection_subheader when available.
+    If the market is unavailable from UD, returns empty rows safely.
+    """
+    import re
+    rows, seen = [], set()
+    debug = {"version": HRR_RESTORED_VERSION, "urls": 0, "objects": 0, "candidates": 0, "mlb_valid": 0, "sample_markets": []}
+
+    def collect(data):
+        out = []
+        def walk(x, parent=""):
+            if isinstance(x, dict):
+                y = dict(x)
+                if parent and "_parent_key" not in y:
+                    y["_parent_key"] = parent
+                out.append(y)
+                for k, v in x.items():
+                    if isinstance(v, (dict, list)):
+                        walk(v, k)
+            elif isinstance(x, list):
+                for item in x:
+                    walk(item, parent)
+        walk(data)
+        return out
+
+    def attrs(o):
+        if not isinstance(o, dict):
+            return {}
+        out = {}
+        if isinstance(o.get("attributes"), dict):
+            out.update(o["attributes"])
+        for k, v in o.items():
+            if k not in ("attributes", "relationships", "included", "data") and k not in out:
+                out[k] = v
+        return out
+
+    def line_from_text(sub):
+        m = re.search(r"(Higher|Lower)\s+([0-9]+(?:\.[0-9]+)?)\s+(Hits\s*\+\s*Runs\s*\+\s*RBIs|H\+R\+R|Hits Runs RBIs)", str(sub or ""), re.I)
+        if m:
+            return float(m.group(2))
+        m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s+(Hits\s*\+\s*Runs\s*\+\s*RBIs|H\+R\+R|Hits Runs RBIs)", str(sub or ""), re.I)
+        if m:
+            return float(m.group(1))
+        return None
+
+    def clean_name(x):
+        s = str(x or "").strip()
+        s = re.sub(r"\s+", " ", s)
+        try:
+            return _fs_clean_player_name(s)
+        except Exception:
+            return s
+
+    urls = []
+    try:
+        urls.extend(list(UNDERDOG_URLS))
+    except Exception:
+        pass
+    urls.extend([
+        "https://api.underdogfantasy.com/beta/v6/over_under_lines",
+        "https://api.underdogfantasy.com/beta/v5/over_under_lines",
+        "https://api.underdogfantasy.com/beta/v4/over_under_lines",
+        "https://api.underdogfantasy.com/v1/over_under_lines",
+    ])
+    uniq, seen_urls = [], set()
+    for u in urls:
+        if u and u not in seen_urls:
+            seen_urls.add(u)
+            uniq.append(u)
+
+    for url in uniq:
+        try:
+            data = safe_get_json(url, timeout=18)
+            debug["urls"] += 1
+        except Exception:
+            data = None
+        if not data:
+            continue
+        objs = collect(data)
+        debug["objects"] += len(objs)
+        for obj in objs:
+            a = attrs(obj)
+            hdr = str(a.get("selection_header") or a.get("player_name") or a.get("name") or "").strip()
+            sub = str(a.get("selection_subheader") or "").strip()
+            status = str(a.get("status") or "").lower()
+            if status and status != "active":
+                continue
+            if not _hrr_restore_is_hrr_text(hdr, sub, a.get("stat_type"), a.get("title"), a.get("display_title")):
+                continue
+            debug["candidates"] += 1
+            player = clean_name(hdr)
+            line = line_from_text(sub)
+            if line is None:
+                line = _hrr_restore_safe_float(a.get("stat_value") or a.get("line") or a.get("target_value"), None)
+            if not player or line is None:
+                if len(debug["sample_markets"]) < 25:
+                    debug["sample_markets"].append(f"NO_NAME_OR_LINE | {hdr} | {sub}")
+                continue
+
+            # MLB validation
+            pid = None
+            try:
+                pid = _mlb_search_player_id_by_name(player)
+            except Exception:
+                pid = None
+            if not pid:
+                if len(debug["sample_markets"]) < 25:
+                    debug["sample_markets"].append(f"REJECT_NO_MLB_MATCH | {player} | {sub}")
+                continue
+
+            key = (_hrr_restore_norm(player), float(line))
+            if key in seen:
+                continue
+            seen.add(key)
+            debug["mlb_valid"] += 1
+            rows.append({
+                "Player": player,
+                "Line": float(line),
+                "Market": "H+R+R",
+                "Source": "Underdog",
+                "Evidence": f"{player} | {sub}",
+            })
+            if len(debug["sample_markets"]) < 25:
+                debug["sample_markets"].append(f"ACCEPT_HRR | {player} | {sub}")
+
+    try:
+        st.session_state["hrr_ud_debug"] = debug
+    except Exception:
+        pass
+    return rows
+
+def _hrr_restore_project_player(player_name, line=None):
+    """
+    Use existing H+R+R/Moneyball projection functions if available.
+    Fallback is conservative and labeled.
+    """
+    proj = None
+    meta = {}
+    # Try existing projectors.
+    for fn_name in [
+        "project_hrr_player",
+        "project_batter_hrr",
+        "project_batter_prop",
+        "project_fantasy_score_row",
+        "get_batter_hits_rbi_profile_by_name",
+    ]:
+        try:
+            fn = globals().get(fn_name)
+            if not callable(fn):
+                continue
+            try:
+                val = fn(player_name)
+            except TypeError:
+                val = fn({"Player": player_name, "Line": line, "Market": "H+R+R"})
+            if isinstance(val, dict):
+                for k in ["H+R+R Projection", "HRR Projection", "Projection", "Proj", "K PROJ"]:
+                    if k in val and _hrr_restore_safe_float(val.get(k), None) is not None:
+                        proj = _hrr_restore_safe_float(val.get(k))
+                        meta.update(val)
+                        break
+            elif _hrr_restore_safe_float(val, None) is not None:
+                proj = _hrr_restore_safe_float(val)
+            if proj is not None:
+                break
+        except Exception:
+            continue
+
+    if proj is None:
+        # Safe neutral fallback if no existing projection function is accessible.
+        proj = 1.85
+        meta["Projection Note"] = "Fallback H+R+R baseline"
+    return float(proj), meta
+
+def build_hrr_restored_board():
+    rows = []
+    ud_rows = fetch_underdog_hrr_rows_restored()
+
+    if ud_rows:
+        for r in ud_rows:
+            player = r.get("Player")
+            line = _hrr_restore_safe_float(r.get("Line"), None)
+            proj, meta = _hrr_restore_project_player(player, line)
+            edge = None if line is None else round(proj - line, 2)
+            rows.append({
+                "Player": player,
+                "Market": "H+R+R",
+                "Line": line,
+                "Projection": round(proj, 2),
+                "Edge": edge,
+                "Pick": _hrr_restore_pick(edge),
+                "Confidence %": _hrr_restore_conf(edge),
+                "Source": r.get("Source", "Underdog"),
+                "Evidence": r.get("Evidence", ""),
+            })
+    else:
+        # No UD H+R+R rows found. Show safe message through empty df.
+        pass
+
+    return pd.DataFrame(rows)
+
+def render_hrr_restored_tab():
+    st.subheader("H+R+R — Underdog")
+    st.caption(f"Version: {HRR_RESTORED_VERSION}. H+R+R restored. K Upside and Moneyline are untouched.")
+
+    df = build_hrr_restored_board()
+    if df is None or len(df) == 0:
+        st.warning("No active Underdog H+R+R rows found. This tab stays empty instead of creating fake lines.")
+        try:
+            dbg = st.session_state.get("hrr_ud_debug", {})
+            st.caption(f"UD H+R+R debug: urls={dbg.get('urls')} objects={dbg.get('objects')} candidates={dbg.get('candidates')} mlb_valid={dbg.get('mlb_valid')}")
+            samples = dbg.get("sample_markets") or []
+            if samples:
+                with st.expander("H+R+R market samples"):
+                    for s in samples[:20]:
+                        st.code(str(s))
+        except Exception:
+            pass
+        return
+
+    search = st.text_input("Search H+R+R player", key="hrr_restored_search")
+    view = df.copy()
+    if search:
+        view = view[view["Player"].astype(str).str.contains(search, case=False, na=False)].copy()
+
+    st.dataframe(
+        view.sort_values("Edge", ascending=False, na_position="last"),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+# Force the old fantasy/batter prop renderers to H+R+R.
+def render_fantasy_score_tab():
+    return render_hrr_restored_tab()
+
+def render_fantasy_points_tab():
+    return render_hrr_restored_tab()
+
+def render_fantasy_tab():
+    return render_hrr_restored_tab()
+
+def render_batter_fantasy_tab():
+    return render_hrr_restored_tab()
+
+def render_batter_props_tab():
+    return render_hrr_restored_tab()
+
+def render_hrr_tab():
+    return render_hrr_restored_tab()
+
+
+
+# ============================================================
+# H+R+R 9.5 LOGIC LAYER — H+R+R ONLY
+# Version: HRR_95_LOGIC_ONLY_2026_06_10
+#
+# Added ONLY for H+R+R:
+# - Projected Plate Appearances
+# - Batter Split vs Pitcher Hand
+# - Pitcher Attack Score
+# - RBI Opportunity Score
+# - Run Opportunity Score
+# - Bullpen/Team Run Environment
+# - Role/Lineup Slot Labels
+#
+# K Upside untouched.
+# Moneyline untouched.
+# Pitcher Fantasy untouched.
+# ============================================================
+
+HRR_95_VERSION = "HRR_95_LOGIC_ONLY_2026_06_10"
+
+def _hrr95_safe_float(x, default=None):
+    try:
+        if x in (None, "", "—"):
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+def _hrr95_clamp(x, lo, hi):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return lo
+
+def _hrr95_norm(x):
+    try:
+        return normalize_name(x)
+    except Exception:
+        import re
+        return re.sub(r"[^a-z0-9]+", "", str(x or "").lower())
+
+def _hrr95_grade(score):
+    s = _hrr95_safe_float(score, 50)
+    if s >= 82:
+        return "ELITE"
+    if s >= 68:
+        return "GOOD"
+    if s >= 45:
+        return "NEUTRAL"
+    return "POOR"
+
+def _hrr95_find_player_context(player):
+    """
+    Pull context from existing app/session data without touching K/ML logic.
+    """
+    pkey = _hrr95_norm(player)
+    ctx = {}
+    try:
+        for key in list(st.session_state.keys()):
+            obj = st.session_state.get(key)
+            if not hasattr(obj, "columns"):
+                continue
+            for col in ["Player", "Batter", "Hitter", "Name"]:
+                if col not in obj.columns:
+                    continue
+                hit = obj[obj[col].astype(str).map(_hrr95_norm) == pkey]
+                if len(hit):
+                    row = hit.iloc[0].to_dict()
+                    ctx.update(row)
+                    return ctx
+    except Exception:
+        pass
+    return ctx
+
+def _hrr95_projected_pa(lineup_slot=None, team_implied=None, lineup_confirmed=False, home=False):
+    """
+    H+R+R opportunity model.
+    Batting slot is the main driver.
+    """
+    slot = int(lineup_slot) if _hrr95_safe_float(lineup_slot, None) else None
+    if slot == 1:
+        pa = 4.75
+    elif slot == 2:
+        pa = 4.65
+    elif slot == 3:
+        pa = 4.50
+    elif slot == 4:
+        pa = 4.38
+    elif slot == 5:
+        pa = 4.22
+    elif slot == 6:
+        pa = 4.05
+    elif slot == 7:
+        pa = 3.90
+    elif slot == 8:
+        pa = 3.75
+    elif slot == 9:
+        pa = 3.60
+    else:
+        pa = 4.05
+
+    imp = _hrr95_safe_float(team_implied, None)
+    if imp is not None:
+        pa += (imp - 4.45) * 0.10
+
+    if lineup_confirmed:
+        pa += 0.05
+    if home:
+        pa -= 0.05  # home team sometimes loses bottom 9th PA
+
+    return round(_hrr95_clamp(pa, 3.3, 5.1), 2)
+
+def _hrr95_pa_score(exp_pa):
+    pa = _hrr95_safe_float(exp_pa, 4.0)
+    return round(_hrr95_clamp(50 + (pa - 4.0) * 35, 20, 95), 1)
+
+def _hrr95_split_score(ctx):
+    """
+    Batter split vs pitcher hand.
+    Uses whatever columns already exist; falls back neutral.
+    """
+    hand = str(ctx.get("Opp SP Hand") or ctx.get("Pitcher Hand") or ctx.get("Opp Hand") or ctx.get("SP Hand") or "").upper()
+    if hand.startswith("L"):
+        keys = ["wRC+ vs LHP", "vs LHP wRC+", "LHP wRC+", "OPS vs LHP", "vs LHP OPS", "ISO vs LHP"]
+    elif hand.startswith("R"):
+        keys = ["wRC+ vs RHP", "vs RHP wRC+", "RHP wRC+", "OPS vs RHP", "vs RHP OPS", "ISO vs RHP"]
+    else:
+        keys = ["wRC+", "Team wRC+", "OPS", "ISO"]
+
+    vals = []
+    for k in keys:
+        v = _hrr95_safe_float(ctx.get(k), None)
+        if v is not None:
+            vals.append(v)
+
+    if not vals:
+        return 50.0, "NEUTRAL", "NO_SPLIT_DATA"
+
+    raw = vals[0]
+    # wRC scale
+    if raw > 40:
+        score = _hrr95_clamp(50 + (raw - 100) * 0.55, 20, 92)
+    # OPS/ISO scale fallback
+    else:
+        score = _hrr95_clamp(50 + (raw - 0.720) * 80, 20, 92)
+
+    return round(score, 1), _hrr95_grade(score), f"vs {hand or 'UNK'}"
+
+def _hrr95_pitcher_attack_score(ctx):
+    """
+    Opposing pitcher contact-quality target.
+    """
+    vals = {
+        "whip": _hrr95_safe_float(ctx.get("Opp SP WHIP") or ctx.get("Pitcher WHIP"), None),
+        "era": _hrr95_safe_float(ctx.get("Opp SP ERA") or ctx.get("Pitcher ERA"), None),
+        "hard": _hrr95_safe_float(ctx.get("HardHit% Allowed") or ctx.get("Opp SP HardHit%"), None),
+        "barrel": _hrr95_safe_float(ctx.get("Barrel% Allowed") or ctx.get("Opp SP Barrel%"), None),
+        "xba": _hrr95_safe_float(ctx.get("xBA Allowed") or ctx.get("Opp SP xBA"), None),
+    }
+    score = 50.0
+    if vals["whip"] is not None:
+        score += (vals["whip"] - 1.25) * 18
+    if vals["era"] is not None:
+        score += (vals["era"] - 4.20) * 3.0
+    if vals["hard"] is not None:
+        score += (vals["hard"] - 39.0) * 0.7
+    if vals["barrel"] is not None:
+        score += (vals["barrel"] - 8.0) * 1.2
+    if vals["xba"] is not None:
+        score += (vals["xba"] - 0.245) * 90
+
+    score = round(_hrr95_clamp(score, 20, 92), 1)
+    label = "ATTACK" if score >= 68 else ("AVOID" if score < 42 else "NEUTRAL")
+    return score, label
+
+def _hrr95_rbi_score(lineup_slot=None, team_implied=None, ctx=None):
+    slot = int(lineup_slot) if _hrr95_safe_float(lineup_slot, None) else None
+    score = 50
+    if slot in [3, 4, 5]:
+        score += 18
+    elif slot == 2:
+        score += 10
+    elif slot == 6:
+        score += 6
+    elif slot in [8, 9]:
+        score -= 8
+    imp = _hrr95_safe_float(team_implied, None)
+    if imp is not None:
+        score += (imp - 4.45) * 6
+    if ctx:
+        ahead_obp = _hrr95_safe_float(ctx.get("Ahead OBP") or ctx.get("OBP Ahead"), None)
+        if ahead_obp is not None:
+            score += (ahead_obp - 0.320) * 80
+    score = round(_hrr95_clamp(score, 20, 95), 1)
+    return score, _hrr95_grade(score)
+
+def _hrr95_run_score(lineup_slot=None, team_implied=None, ctx=None):
+    slot = int(lineup_slot) if _hrr95_safe_float(lineup_slot, None) else None
+    score = 50
+    if slot == 1:
+        score += 20
+    elif slot == 2:
+        score += 17
+    elif slot == 3:
+        score += 12
+    elif slot == 4:
+        score += 5
+    elif slot in [8, 9]:
+        score -= 8
+    imp = _hrr95_safe_float(team_implied, None)
+    if imp is not None:
+        score += (imp - 4.45) * 6
+    if ctx:
+        behind_wrc = _hrr95_safe_float(ctx.get("Behind wRC+") or ctx.get("Lineup Protection wRC+"), None)
+        if behind_wrc is not None:
+            score += (behind_wrc - 100) * 0.20
+    score = round(_hrr95_clamp(score, 20, 95), 1)
+    return score, _hrr95_grade(score)
+
+def _hrr95_environment_score(ctx):
+    park = _hrr95_safe_float(ctx.get("Park Factor") or ctx.get("Park"), 1.0)
+    imp = _hrr95_safe_float(ctx.get("Team Implied Runs") or ctx.get("ImpR") or ctx.get("Team Runs"), 4.45)
+    bullpen = _hrr95_safe_float(ctx.get("Opp Bullpen Score") or ctx.get("Bullpen Attack Score") or ctx.get("Opp Bullpen ERA"), None)
+
+    score = 50 + (park - 1.0) * 45 + (imp - 4.45) * 8
+    if bullpen is not None:
+        # If ERA-like value, high is good for hitters. If score-like, also high is good.
+        if bullpen < 10:
+            score += (bullpen - 4.10) * 4
+        else:
+            score += (bullpen - 50) * 0.25
+
+    score = round(_hrr95_clamp(score, 20, 95), 1)
+    return score, _hrr95_grade(score)
+
+def _hrr95_role_label(lineup_slot=None, lineup_confirmed=False, ctx=None):
+    slot = int(lineup_slot) if _hrr95_safe_float(lineup_slot, None) else None
+    if lineup_confirmed and slot and slot <= 5:
+        return "CONFIRMED_CORE"
+    if lineup_confirmed:
+        return "CONFIRMED_BOTTOM"
+    role = str((ctx or {}).get("Role") or (ctx or {}).get("Lineup") or "").upper()
+    if "PLATOON" in role:
+        return "PLATOON_RISK"
+    if "BENCH" in role:
+        return "BENCH_RISK"
+    return "PROJECTED_ROLE"
+
+def _hrr95_adjust_projection(base_proj, ctx, line=None):
+    """
+    Additive H+R+R model using opportunity + run creation.
+    Adjustments are intentionally capped to avoid overfitting.
+    """
+    base = _hrr95_safe_float(base_proj, 1.85)
+
+    slot = (
+        ctx.get("Lineup Slot")
+        or ctx.get("Batting Order")
+        or ctx.get("Order")
+        or ctx.get("Slot")
+    )
+    lineup_confirmed = str(ctx.get("Lineup") or ctx.get("Lineup Status") or "").upper().find("CONFIRMED") >= 0
+    team_implied = (
+        ctx.get("Team Implied Runs")
+        or ctx.get("ImpR")
+        or ctx.get("Team Runs")
+        or ctx.get("Projected Team Runs")
+    )
+    home = str(ctx.get("Home/Away") or ctx.get("Venue Side") or "").upper().startswith("H")
+
+    exp_pa = _hrr95_projected_pa(slot, team_implied, lineup_confirmed, home)
+    pa_score = _hrr95_pa_score(exp_pa)
+    split_score, split_grade, split_note = _hrr95_split_score(ctx)
+    attack_score, attack_label = _hrr95_pitcher_attack_score(ctx)
+    rbi_score, rbi_grade = _hrr95_rbi_score(slot, team_implied, ctx)
+    run_score, run_grade = _hrr95_run_score(slot, team_implied, ctx)
+    env_score, env_grade = _hrr95_environment_score(ctx)
+    role_label = _hrr95_role_label(slot, lineup_confirmed, ctx)
+
+    # Capped additive nudges.
+    pa_adj = _hrr95_clamp((pa_score - 50) / 100, -0.25, 0.35)
+    split_adj = _hrr95_clamp((split_score - 50) / 130, -0.18, 0.25)
+    attack_adj = _hrr95_clamp((attack_score - 50) / 150, -0.15, 0.22)
+    rbi_adj = _hrr95_clamp((rbi_score - 50) / 170, -0.12, 0.20)
+    run_adj = _hrr95_clamp((run_score - 50) / 170, -0.12, 0.20)
+    env_adj = _hrr95_clamp((env_score - 50) / 180, -0.12, 0.18)
+
+    adjusted = base + pa_adj + split_adj + attack_adj + rbi_adj + run_adj + env_adj
+    adjusted = round(_hrr95_clamp(adjusted, 0.35, 5.50), 2)
+
+    return adjusted, {
+        "Exp PA": exp_pa,
+        "PA Score": pa_score,
+        "Split Score": split_score,
+        "Split Grade": split_grade,
+        "Split Note": split_note,
+        "Pitcher Attack Score": attack_score,
+        "Pitcher Attack": attack_label,
+        "RBI Score": rbi_score,
+        "RBI Grade": rbi_grade,
+        "Run Score": run_score,
+        "Run Grade": run_grade,
+        "Run Environment Score": env_score,
+        "Run Environment": env_grade,
+        "Role Label": role_label,
+        "HRR Adj Total": round(adjusted - base, 2),
+        "HRR Logic Version": HRR_95_VERSION,
+    }
+
+# Override H+R+R projection wrapper only.
+def _hrr_restore_project_player(player_name, line=None):
+    ctx = _hrr95_find_player_context(player_name)
+    base_proj = None
+    meta = {}
+
+    for fn_name in [
+        "project_hrr_player",
+        "project_batter_hrr",
+        "project_batter_prop",
+        "project_fantasy_score_row",
+        "get_batter_hits_rbi_profile_by_name",
+    ]:
+        try:
+            fn = globals().get(fn_name)
+            if not callable(fn):
+                continue
+            try:
+                val = fn(player_name)
+            except TypeError:
+                val = fn({"Player": player_name, "Line": line, "Market": "H+R+R"})
+            if isinstance(val, dict):
+                meta.update(val)
+                for k in ["H+R+R Projection", "HRR Projection", "Projection", "Proj"]:
+                    if _hrr95_safe_float(val.get(k), None) is not None:
+                        base_proj = _hrr95_safe_float(val.get(k))
+                        break
+            elif _hrr95_safe_float(val, None) is not None:
+                base_proj = _hrr95_safe_float(val)
+            if base_proj is not None:
+                break
+        except Exception:
+            continue
+
+    if base_proj is None:
+        base_proj = 1.85
+        meta["Projection Note"] = "Fallback H+R+R baseline"
+
+    meta.update(ctx)
+    final_proj, layer_meta = _hrr95_adjust_projection(base_proj, meta, line)
+    meta.update(layer_meta)
+    meta["Base HRR Projection"] = round(float(base_proj), 2)
+    return final_proj, meta
+
+# Override restored board to include new H+R+R-only columns.
+def build_hrr_restored_board():
+    rows = []
+    ud_rows = fetch_underdog_hrr_rows_restored()
+
+    for r in ud_rows:
+        player = r.get("Player")
+        line = _hrr95_safe_float(r.get("Line"), None)
+        proj, meta = _hrr_restore_project_player(player, line)
+        edge = None if line is None else round(proj - line, 2)
+        rows.append({
+            "Player": player,
+            "Market": "H+R+R",
+            "Line": line,
+            "Projection": round(proj, 2),
+            "Base Projection": meta.get("Base HRR Projection"),
+            "Edge": edge,
+            "Pick": _hrr_restore_pick(edge),
+            "Confidence %": _hrr_restore_conf(edge),
+            "Exp PA": meta.get("Exp PA"),
+            "PA Score": meta.get("PA Score"),
+            "Split Grade": meta.get("Split Grade"),
+            "Split Score": meta.get("Split Score"),
+            "Pitcher Attack": meta.get("Pitcher Attack"),
+            "Pitcher Attack Score": meta.get("Pitcher Attack Score"),
+            "RBI Grade": meta.get("RBI Grade"),
+            "RBI Score": meta.get("RBI Score"),
+            "Run Grade": meta.get("Run Grade"),
+            "Run Score": meta.get("Run Score"),
+            "Run Environment": meta.get("Run Environment"),
+            "Run Environment Score": meta.get("Run Environment Score"),
+            "Role Label": meta.get("Role Label"),
+            "HRR Adj Total": meta.get("HRR Adj Total"),
+            "Source": r.get("Source", "Underdog"),
+            "Evidence": r.get("Evidence", ""),
+        })
+
+    return pd.DataFrame(rows)
+
+
+
+# ============================================================
+# H+R+R 9.5+ SAFETY LAYERS — H+R+R ONLY
+# Version: HRR_95_PLUS_SAFETY_2026_06_10
+#
+# Added ONLY for H+R+R:
+# - Confirmed lineup hard gate
+# - Top-5 batting order boost
+# - Platoon risk downgrade
+# - Recent PA stability
+# - H+R+R learning/miss columns
+#
+# K Upside untouched.
+# Moneyline untouched.
+# Pitcher K logic untouched.
+# ============================================================
+
+HRR_95_PLUS_VERSION = "HRR_95_PLUS_SAFETY_2026_06_10"
+
+def _hrr_plus_lineup_gate(ctx):
+    status = str(ctx.get("Lineup") or ctx.get("Lineup Status") or ctx.get("LineupStatus") or "").upper()
+    slot = _hrr95_safe_float(ctx.get("Lineup Slot") or ctx.get("Batting Order") or ctx.get("Order") or ctx.get("Slot"), None)
+
+    if "OUT" in status or "BENCH" in status or "NOT_STARTING" in status:
+        return "PASS_OUT_OR_BENCH", -0.55, -18
+    if "CONFIRMED" in status and slot:
+        return "CONFIRMED_STARTER", 0.08, 4
+    if slot:
+        return "PROJECTED_STARTER", 0.00, 0
+    return "LINEUP_UNCONFIRMED", -0.20, -8
+
+def _hrr_plus_top5_order(slot):
+    s = int(slot) if _hrr95_safe_float(slot, None) else None
+    if s in [1, 2]:
+        return "TOP_2", 0.15, 5
+    if s in [3, 4, 5]:
+        return "TOP_5", 0.10, 3
+    if s in [6, 7]:
+        return "MID_BOTTOM", -0.05, -2
+    if s in [8, 9]:
+        return "BOTTOM_ORDER", -0.15, -6
+    return "UNKNOWN_ORDER", -0.08, -3
+
+def _hrr_plus_platoon_risk(ctx):
+    txt = " ".join(str(ctx.get(k, "")) for k in ["Role", "Lineup", "Lineup Status", "Notes", "Risk", "Platoon"]).upper()
+    if "PLATOON" in txt or "PINCH" in txt:
+        return "PLATOON_RISK", -0.25, -10
+    if "EVERYDAY" in txt or "FULL" in txt or "CORE" in txt:
+        return "EVERYDAY_ROLE", 0.05, 2
+    return "NORMAL_ROLE", 0.00, 0
+
+def _hrr_plus_recent_pa_stability(ctx):
+    pa = (
+        ctx.get("L10 PA/G")
+        or ctx.get("Last 10 PA/G")
+        or ctx.get("Recent PA/G")
+        or ctx.get("PA Trend")
+        or ctx.get("PA/Game")
+    )
+    pa = _hrr95_safe_float(pa, None)
+    if pa is None:
+        return "PA_TREND_UNKNOWN", 0.0, 0, ""
+    if pa >= 4.3:
+        return "PA_STABLE_HIGH", 0.12, 5, pa
+    if pa >= 3.8:
+        return "PA_STABLE", 0.04, 2, pa
+    if pa >= 3.3:
+        return "PA_WARNING", -0.10, -4, pa
+    return "LOW_PA_RISK", -0.25, -10, pa
+
+def _hrr_plus_learning_bias(player):
+    """
+    Optional future learning hook.
+    If saved H+R+R learning exists in session, use small bias only.
+    """
+    key = _hrr95_norm(player)
+    try:
+        learn = st.session_state.get("hrr_learning_bias", {}) or {}
+        val = _hrr95_safe_float(learn.get(key), 0.0)
+        return round(_hrr95_clamp(val, -0.20, 0.20), 2)
+    except Exception:
+        return 0.0
+
+# Wrap previous H+R+R projection function with safety layers.
+_prev_hrr_restore_project_player_plus = _hrr_restore_project_player
+
+def _hrr_restore_project_player(player_name, line=None):
+    proj, meta = _prev_hrr_restore_project_player_plus(player_name, line)
+    ctx = dict(meta or {})
+
+    slot = ctx.get("Lineup Slot") or ctx.get("Batting Order") or ctx.get("Order") or ctx.get("Slot")
+
+    gate_label, gate_adj, gate_conf = _hrr_plus_lineup_gate(ctx)
+    order_label, order_adj, order_conf = _hrr_plus_top5_order(slot)
+    platoon_label, platoon_adj, platoon_conf = _hrr_plus_platoon_risk(ctx)
+    pa_label, pa_adj, pa_conf, recent_pa = _hrr_plus_recent_pa_stability(ctx)
+    learn_adj = _hrr_plus_learning_bias(player_name)
+
+    total_adj = gate_adj + order_adj + platoon_adj + pa_adj + learn_adj
+    final_proj = round(_hrr95_clamp(float(proj) + total_adj, 0.25, 5.75), 2)
+
+    meta.update({
+        "H+R+R Safety Version": HRR_95_PLUS_VERSION,
+        "Lineup Gate": gate_label,
+        "Top Order Label": order_label,
+        "Platoon Label": platoon_label,
+        "Recent PA Label": pa_label,
+        "Recent PA/G": recent_pa,
+        "Learning Bias": learn_adj,
+        "Safety Adj Total": round(total_adj, 2),
+        "Safety Confidence Adj": gate_conf + order_conf + platoon_conf + pa_conf,
+    })
+    return final_proj, meta
+
+# Override board again to expose the new safety columns.
+def build_hrr_restored_board():
+    rows = []
+    ud_rows = fetch_underdog_hrr_rows_restored()
+
+    for r in ud_rows:
+        player = r.get("Player")
+        line = _hrr95_safe_float(r.get("Line"), None)
+        proj, meta = _hrr_restore_project_player(player, line)
+        edge = None if line is None else round(proj - line, 2)
+
+        base_conf = _hrr_restore_conf(edge)
+        conf_adj = _hrr95_safe_float(meta.get("Safety Confidence Adj"), 0)
+        try:
+            conf_final = "" if base_conf == "" else round(_hrr95_clamp(float(base_conf) + conf_adj, 35, 90), 1)
+        except Exception:
+            conf_final = base_conf
+
+        pick = _hrr_restore_pick(edge)
+        if meta.get("Lineup Gate") == "PASS_OUT_OR_BENCH":
+            pick = "PASS"
+        if meta.get("Lineup Gate") == "LINEUP_UNCONFIRMED" and abs(_hrr95_safe_float(edge, 0)) < 0.45:
+            pick = "PASS"
+
+        rows.append({
+            "Player": player,
+            "Market": "H+R+R",
+            "Line": line,
+            "Projection": round(proj, 2),
+            "Base Projection": meta.get("Base HRR Projection"),
+            "Edge": edge,
+            "Pick": pick,
+            "Confidence %": conf_final,
+            "Exp PA": meta.get("Exp PA"),
+            "PA Score": meta.get("PA Score"),
+            "Split Grade": meta.get("Split Grade"),
+            "Pitcher Attack": meta.get("Pitcher Attack"),
+            "RBI Grade": meta.get("RBI Grade"),
+            "Run Grade": meta.get("Run Grade"),
+            "Run Environment": meta.get("Run Environment"),
+            "Role Label": meta.get("Role Label"),
+            "Lineup Gate": meta.get("Lineup Gate"),
+            "Top Order Label": meta.get("Top Order Label"),
+            "Platoon Label": meta.get("Platoon Label"),
+            "Recent PA Label": meta.get("Recent PA Label"),
+            "Recent PA/G": meta.get("Recent PA/G"),
+            "Learning Bias": meta.get("Learning Bias"),
+            "HRR Adj Total": meta.get("HRR Adj Total"),
+            "Safety Adj Total": meta.get("Safety Adj Total"),
+            "Source": r.get("Source", "Underdog"),
+            "Evidence": r.get("Evidence", ""),
+        })
+
+    return pd.DataFrame(rows)
+
+
+
+# ============================================================
+# H+R+R FINAL ELITE LAYERS — H+R+R ONLY
+# Version: HRR_FINAL_ELITE_LAYERS_2026_06_10
+#
+# Added ONLY for H+R+R:
+# - Offense Pressure Score
+# - Last 30-Day Form
+# - SB Threat Score
+#
+# K Upside untouched.
+# Moneyline untouched.
+# Pitcher K logic untouched.
+# ============================================================
+
+HRR_FINAL_ELITE_VERSION = "HRR_FINAL_ELITE_LAYERS_2026_06_10"
+
+def _hrr_final_offense_pressure(ctx):
+    imp = _hrr95_safe_float(ctx.get("Team Implied Runs") or ctx.get("ImpR") or ctx.get("Team Runs") or ctx.get("Projected Team Runs"), 4.45)
+    total = _hrr95_safe_float(ctx.get("Game Total") or ctx.get("Total"), None)
+    team_wrc = _hrr95_safe_float(ctx.get("Team wRC+") or ctx.get("Lineup wRC+") or ctx.get("wRC+ Team"), 100)
+
+    score = 50 + (imp - 4.45) * 12 + (team_wrc - 100) * 0.25
+    if total is not None:
+        score += (total - 8.5) * 2.5
+
+    score = round(_hrr95_clamp(score, 20, 95), 1)
+
+    if imp >= 5.3 or score >= 78:
+        label = "ELITE_PRESSURE"
+    elif imp >= 4.6 or score >= 64:
+        label = "GOOD_PRESSURE"
+    elif imp < 3.8 or score < 40:
+        label = "LOW_PRESSURE"
+    else:
+        label = "NEUTRAL_PRESSURE"
+
+    return score, label
+
+def _hrr_final_30day_form(ctx):
+    wrc30 = _hrr95_safe_float(ctx.get("L30 wRC+") or ctx.get("Last 30 wRC+") or ctx.get("30D wRC+"), None)
+    ops30 = _hrr95_safe_float(ctx.get("L30 OPS") or ctx.get("Last 30 OPS") or ctx.get("30D OPS"), None)
+    hard30 = _hrr95_safe_float(ctx.get("L30 HardHit%") or ctx.get("Last 30 HardHit%") or ctx.get("30D HardHit%"), None)
+    barrel30 = _hrr95_safe_float(ctx.get("L30 Barrel%") or ctx.get("Last 30 Barrel%") or ctx.get("30D Barrel%"), None)
+
+    score = 50.0
+    found = False
+
+    if wrc30 is not None:
+        score += (wrc30 - 100) * 0.35
+        found = True
+    if ops30 is not None:
+        score += (ops30 - 0.720) * 55
+        found = True
+    if hard30 is not None:
+        score += (hard30 - 39) * 0.45
+        found = True
+    if barrel30 is not None:
+        score += (barrel30 - 8) * 0.75
+        found = True
+
+    if not found:
+        return 50.0, "FORM_UNKNOWN"
+
+    score = round(_hrr95_clamp(score, 20, 92), 1)
+    if score >= 70:
+        label = "HOT"
+    elif score <= 38:
+        label = "COLD"
+    else:
+        label = "NEUTRAL_FORM"
+
+    return score, label
+
+def _hrr_final_sb_threat(ctx):
+    sb = _hrr95_safe_float(ctx.get("SB") or ctx.get("Season SB") or ctx.get("Stolen Bases"), None)
+    sprint = _hrr95_safe_float(ctx.get("Sprint Speed") or ctx.get("SprintSpeed"), None)
+    attempts = _hrr95_safe_float(ctx.get("SB Attempts") or ctx.get("SBA"), None)
+    catcher = _hrr95_safe_float(ctx.get("Opp Catcher CS%") or ctx.get("Catcher CS%"), None)
+
+    score = 50.0
+    found = False
+
+    if sb is not None:
+        score += min(sb, 35) * 0.7
+        found = True
+    if attempts is not None:
+        score += min(attempts, 45) * 0.45
+        found = True
+    if sprint is not None:
+        score += (sprint - 27.0) * 3.0
+        found = True
+    if catcher is not None:
+        score += (27.0 - catcher) * 0.5
+        found = True
+
+    if not found:
+        return 50.0, "SB_NEUTRAL"
+
+    score = round(_hrr95_clamp(score, 20, 92), 1)
+    if score >= 70:
+        label = "SB_THREAT"
+    elif score <= 38:
+        label = "NO_SB_THREAT"
+    else:
+        label = "SB_NEUTRAL"
+
+    return score, label
+
+_prev_hrr_restore_project_player_final_elite = _hrr_restore_project_player
+
+def _hrr_restore_project_player(player_name, line=None):
+    proj, meta = _prev_hrr_restore_project_player_final_elite(player_name, line)
+    ctx = dict(meta or {})
+
+    offense_score, offense_label = _hrr_final_offense_pressure(ctx)
+    form_score, form_label = _hrr_final_30day_form(ctx)
+    sb_score, sb_label = _hrr_final_sb_threat(ctx)
+
+    offense_adj = _hrr95_clamp((offense_score - 50) / 170, -0.12, 0.22)
+    form_adj = _hrr95_clamp((form_score - 50) / 220, -0.10, 0.14)
+    sb_adj = _hrr95_clamp((sb_score - 50) / 260, -0.04, 0.10)
+
+    total_adj = offense_adj + form_adj + sb_adj
+    final_proj = round(_hrr95_clamp(float(proj) + total_adj, 0.25, 5.95), 2)
+
+    meta.update({
+        "H+R+R Final Elite Version": HRR_FINAL_ELITE_VERSION,
+        "Offense Pressure Score": offense_score,
+        "Offense Pressure": offense_label,
+        "Last 30 Form Score": form_score,
+        "Last 30 Form": form_label,
+        "SB Threat Score": sb_score,
+        "SB Threat": sb_label,
+        "Final Elite Adj": round(total_adj, 2),
+    })
+    return final_proj, meta
+
+def build_hrr_restored_board():
+    rows = []
+    ud_rows = fetch_underdog_hrr_rows_restored()
+
+    for r in ud_rows:
+        player = r.get("Player")
+        line = _hrr95_safe_float(r.get("Line"), None)
+        proj, meta = _hrr_restore_project_player(player, line)
+        edge = None if line is None else round(proj - line, 2)
+
+        base_conf = _hrr_restore_conf(edge)
+        conf_adj = _hrr95_safe_float(meta.get("Safety Confidence Adj"), 0)
+
+        final_score_bump = 0
+        if meta.get("Offense Pressure") in ("ELITE_PRESSURE", "GOOD_PRESSURE"):
+            final_score_bump += 2
+        if meta.get("Last 30 Form") == "HOT":
+            final_score_bump += 2
+        if meta.get("Last 30 Form") == "COLD":
+            final_score_bump -= 3
+        if meta.get("SB Threat") == "SB_THREAT":
+            final_score_bump += 1
+
+        try:
+            conf_final = "" if base_conf == "" else round(_hrr95_clamp(float(base_conf) + conf_adj + final_score_bump, 35, 90), 1)
+        except Exception:
+            conf_final = base_conf
+
+        pick = _hrr_restore_pick(edge)
+        if meta.get("Lineup Gate") == "PASS_OUT_OR_BENCH":
+            pick = "PASS"
+        if meta.get("Lineup Gate") == "LINEUP_UNCONFIRMED" and abs(_hrr95_safe_float(edge, 0)) < 0.45:
+            pick = "PASS"
+        if meta.get("Offense Pressure") == "LOW_PRESSURE" and abs(_hrr95_safe_float(edge, 0)) < 0.50:
+            pick = "PASS"
+
+        rows.append({
+            "Player": player,
+            "Market": "H+R+R",
+            "Line": line,
+            "Projection": round(proj, 2),
+            "Base Projection": meta.get("Base HRR Projection"),
+            "Edge": edge,
+            "Pick": pick,
+            "Confidence %": conf_final,
+            "Exp PA": meta.get("Exp PA"),
+            "PA Score": meta.get("PA Score"),
+            "Split Grade": meta.get("Split Grade"),
+            "Pitcher Attack": meta.get("Pitcher Attack"),
+            "RBI Grade": meta.get("RBI Grade"),
+            "Run Grade": meta.get("Run Grade"),
+            "Run Environment": meta.get("Run Environment"),
+            "Offense Pressure": meta.get("Offense Pressure"),
+            "Offense Pressure Score": meta.get("Offense Pressure Score"),
+            "Last 30 Form": meta.get("Last 30 Form"),
+            "Last 30 Form Score": meta.get("Last 30 Form Score"),
+            "SB Threat": meta.get("SB Threat"),
+            "SB Threat Score": meta.get("SB Threat Score"),
+            "Role Label": meta.get("Role Label"),
+            "Lineup Gate": meta.get("Lineup Gate"),
+            "Top Order Label": meta.get("Top Order Label"),
+            "Platoon Label": meta.get("Platoon Label"),
+            "Recent PA Label": meta.get("Recent PA Label"),
+            "Learning Bias": meta.get("Learning Bias"),
+            "HRR Adj Total": meta.get("HRR Adj Total"),
+            "Safety Adj Total": meta.get("Safety Adj Total"),
+            "Final Elite Adj": meta.get("Final Elite Adj"),
+            "Source": r.get("Source", "Underdog"),
+            "Evidence": r.get("Evidence", ""),
+        })
+
+    return pd.DataFrame(rows)
+
+
+
+# ============================================================
+# SELF-PROJECTED UNDERDOG MLB FANTASY POINTS
+# Version: SELF_PROJECTED_FS_TABS_2026_06_10
+#
+# NO Underdog fantasy line pulling.
+#
+# Separate tabs:
+# - Pitcher FS
+# - Batter FS
+#
+# Underdog scoring:
+# Pitcher:
+#   Win +5, Quality Start +5, Strikeout +3,
+#   Inning Pitched +3, Earned Run -3
+#
+# Hitter:
+#   Single +3, Double +6, Triple +8, HR +10,
+#   Walk +3, HBP +3, RBI +2, Run +2, SB +4
+#
+# K Upside untouched.
+# Moneyline untouched.
+# H+R+R untouched.
+# ============================================================
+
+SELF_PROJECTED_FS_VERSION = "SELF_PROJECTED_FS_TABS_2026_06_10"
+
+def _fs_self_float(x, default=0.0):
+    try:
+        if x in (None, "", "—"):
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+def _fs_self_norm(x):
+    try:
+        return normalize_name(x)
+    except Exception:
+        import re
+        return re.sub(r"[^a-z0-9]+", "", str(x or "").lower())
+
+def _fs_grade(score):
+    s = _fs_self_float(score, 0)
+    if s >= 75:
+        return "A"
+    if s >= 62:
+        return "B"
+    if s >= 50:
+        return "C"
+    return "D"
+
+def _fs_conf_from_range(proj, floor, ceiling):
+    spread = max(0.1, float(ceiling) - float(floor))
+    base = 78 - spread * 3.2
+    return round(max(45, min(88, base)), 1)
+
+def _fs_moneyball_grade(ctx):
+    obp = _fs_self_float(ctx.get("OBP") or ctx.get("Projected OBP"), 0.320)
+    wrc = _fs_self_float(ctx.get("wRC+") or ctx.get("Team wRC+") or ctx.get("Lineup wRC+"), 100)
+    iso = _fs_self_float(ctx.get("ISO"), 0.150)
+    bb = _fs_self_float(ctx.get("BB%") or ctx.get("Walk%"), 8.0)
+    k = _fs_self_float(ctx.get("K%"), 22.0)
+
+    score = 50
+    score += (obp - 0.320) * 120
+    score += (wrc - 100) * 0.25
+    score += (iso - 0.150) * 55
+    score += (bb - 8.0) * 0.8
+    score -= max(0, k - 22.0) * 0.4
+
+    score = round(_hrr95_clamp(score, 20, 95), 1) if "_hrr95_clamp" in globals() else round(max(20, min(95, score)), 1)
+    if score >= 75:
+        label = "ELITE MONEYBALL"
+    elif score >= 62:
+        label = "GOOD MONEYBALL"
+    elif score >= 45:
+        label = "NEUTRAL"
+    else:
+        label = "POOR"
+    return score, label
+
+def _fs_get_pitcher_rows_source():
+    rows, seen = [], set()
+    try:
+        for key in list(st.session_state.keys()):
+            obj = st.session_state.get(key)
+            if not hasattr(obj, "columns") or "Pitcher" not in obj.columns:
+                continue
+            for _, r in obj.iterrows():
+                name = str(r.get("Pitcher") or "").strip()
+                if not name or name == "—":
+                    continue
+                nk = _fs_self_norm(name)
+                if nk in seen:
+                    continue
+                seen.add(nk)
+                rows.append(r.to_dict())
+    except Exception:
+        pass
+    return rows
+
+def _fs_pitcher_projection_from_row(r):
+    name = str(r.get("Pitcher") or r.get("Player") or "").strip()
+    matchup = r.get("Matchup") or r.get("Game") or ""
+
+    k_proj = _fs_self_float(r.get("K PROJ") or r.get("Median") or r.get("Projection") or r.get("Proj"), 0.0)
+    ip_floor = _fs_self_float(r.get("IP Floor"), 5.0)
+    exp_bf = _fs_self_float(r.get("Exp BF"), 22.0)
+
+    # Better IP estimate from BF when available.
+    ip_proj = max(ip_floor, min(7.2, exp_bf / 4.35))
+    er_proj = _fs_self_float(r.get("ER Proj") or r.get("Earned Runs Projection"), None)
+    if er_proj is None:
+        # conservative ER estimate based on run environment if available
+        opp_runs = _fs_self_float(r.get("Opp Implied Runs") or r.get("Opp Team Runs"), 4.25)
+        er_proj = max(1.2, min(4.5, opp_runs * (ip_proj / 9.0) * 0.82))
+
+    win_prob = _fs_self_float(r.get("Win %") or r.get("Win Probability") or r.get("Team Win%"), None)
+    if win_prob is None:
+        win_prob = 0.47
+    elif win_prob > 1:
+        win_prob = win_prob / 100.0
+
+    qs_prob = _fs_self_float(r.get("QS %") or r.get("Quality Start %"), None)
+    if qs_prob is None:
+        qs_prob = max(0.05, min(0.65, (ip_proj - 5.4) * 0.35))
+    elif qs_prob > 1:
+        qs_prob = qs_prob / 100.0
+
+    # Underdog Pitcher FS
+    fs = (k_proj * 3.0) + (ip_proj * 3.0) - (er_proj * 3.0) + (win_prob * 5.0) + (qs_prob * 5.0)
+    floor = fs - (2.5 + max(0, 6.0 - ip_proj) * 0.8)
+    ceiling = fs + (3.0 + k_proj * 0.55)
+
+    conf = _fs_conf_from_range(fs, floor, ceiling)
+    grade = _fs_grade(conf)
+
+    return {
+        "Pitcher": name,
+        "Matchup": matchup,
+        "FS Projection": round(fs, 2),
+        "Floor": round(max(0, floor), 2),
+        "Median": round(fs, 2),
+        "Ceiling": round(max(fs, ceiling), 2),
+        "Confidence %": conf,
+        "Grade": grade,
+        "K Projection": round(k_proj, 2),
+        "IP Projection": round(ip_proj, 2),
+        "ER Projection": round(er_proj, 2),
+        "Win %": round(win_prob * 100, 1),
+        "QS %": round(qs_prob * 100, 1),
+        "Source": "Self Projected Pitcher FS",
+    }
+
+def build_self_projected_pitcher_fs_board():
+    return pd.DataFrame([_fs_pitcher_projection_from_row(r) for r in _fs_get_pitcher_rows_source()])
+
+def _fs_get_batter_context_rows():
+    rows, seen = [], set()
+
+    # Prefer existing batter/H+R+R/session rows.
+    try:
+        for key in list(st.session_state.keys()):
+            obj = st.session_state.get(key)
+            if not hasattr(obj, "columns"):
+                continue
+            for name_col in ["Player", "Batter", "Hitter", "Name"]:
+                if name_col not in obj.columns:
+                    continue
+                for _, r in obj.iterrows():
+                    name = str(r.get(name_col) or "").strip()
+                    if not name or name == "—":
+                        continue
+                    nk = _fs_self_norm(name)
+                    if nk in seen:
+                        continue
+                    # avoid pitcher rows
+                    if "Pitcher" in obj.columns and name_col == "Player":
+                        continue
+                    seen.add(nk)
+                    row = r.to_dict()
+                    row["Player"] = name
+                    rows.append(row)
+    except Exception:
+        pass
+
+    return rows
+
+def _fs_batter_component_projection(ctx):
+    """
+    Component-based Underdog hitter fantasy:
+    single/double/triple/hr/bb/hbp/run/rbi/sb.
+    Uses H+R+R / Moneyball / run creation context when available.
+    """
+    name = str(ctx.get("Player") or ctx.get("Batter") or ctx.get("Name") or "").strip()
+    matchup = ctx.get("Matchup") or ctx.get("Game") or ""
+
+    # Opportunity
+    slot = ctx.get("Lineup Slot") or ctx.get("Batting Order") or ctx.get("Order") or ctx.get("Slot")
+    team_implied = ctx.get("Team Implied Runs") or ctx.get("ImpR") or ctx.get("Team Runs")
+    lineup_confirmed = str(ctx.get("Lineup") or ctx.get("Lineup Status") or "").upper().find("CONFIRMED") >= 0
+
+    if "_hrr95_projected_pa" in globals():
+        pa = _hrr95_projected_pa(slot, team_implied, lineup_confirmed, False)
+    else:
+        pa = 4.1
+
+    # Rates / fallback Moneyball-style
+    avg = _fs_self_float(ctx.get("AVG"), 0.245)
+    obp = _fs_self_float(ctx.get("OBP"), 0.320)
+    iso = _fs_self_float(ctx.get("ISO"), 0.150)
+    bb_rate = _fs_self_float(ctx.get("BB%") or ctx.get("Walk%"), 8.0) / 100.0
+    k_rate = _fs_self_float(ctx.get("K%"), 22.0) / 100.0
+    hr_rate = _fs_self_float(ctx.get("HR%"), None)
+    if hr_rate is None:
+        hr_rate = max(0.015, min(0.075, iso * 0.22))
+    else:
+        hr_rate = hr_rate / 100.0 if hr_rate > 1 else hr_rate
+
+    hbp_rate = _fs_self_float(ctx.get("HBP%"), 1.0) / 100.0
+    sb_rate = _fs_self_float(ctx.get("SB/G") or ctx.get("SB Rate"), None)
+    if sb_rate is None:
+        sb = _fs_self_float(ctx.get("SB") or ctx.get("Season SB"), 0)
+        sb_rate = min(0.30, sb / 120.0)
+
+    # Contact and bases
+    ab = max(0.1, pa * (1 - bb_rate - hbp_rate))
+    hits = max(0.0, ab * avg)
+    hr = max(0.0, pa * hr_rate)
+    non_hr_hits = max(0.0, hits - hr)
+
+    # XBH split from ISO. More ISO => more doubles/triples/HR.
+    double_share = max(0.12, min(0.32, 0.16 + iso * 0.35))
+    triple_share = max(0.005, min(0.035, _fs_self_float(ctx.get("3B/G"), 0.01)))
+    doubles = max(0.0, non_hr_hits * double_share)
+    triples = max(0.0, non_hr_hits * triple_share)
+    singles = max(0.0, non_hr_hits - doubles - triples)
+
+    walks = max(0.0, pa * bb_rate)
+    hbp = max(0.0, pa * hbp_rate)
+
+    # Runs/RBI from H+R+R logic/team environment
+    imp = _fs_self_float(team_implied, 4.45)
+    slot_num = int(slot) if _fs_self_float(slot, None) else 4
+
+    run_base = 0.45 + (imp - 4.45) * 0.10
+    rbi_base = 0.45 + (imp - 4.45) * 0.10
+    if slot_num in [1, 2]:
+        run_base += 0.18
+        rbi_base -= 0.05
+    elif slot_num in [3, 4, 5]:
+        rbi_base += 0.18
+        run_base += 0.05
+    elif slot_num >= 7:
+        run_base -= 0.10
+        rbi_base -= 0.10
+
+    runs = max(0.05, min(1.35, run_base))
+    rbi = max(0.05, min(1.35, rbi_base))
+    sb = max(0.0, sb_rate)
+
+    # Apply HR effects already include run/RBI probability, small boost only
+    runs += hr * 0.55
+    rbi += hr * 0.75
+
+    # Moneyball and H+R+R context nudges
+    mb_score, mb_grade = _fs_moneyball_grade(ctx)
+    if mb_score >= 70:
+        walks += 0.05
+        runs += 0.04
+    elif mb_score < 40:
+        walks -= 0.03
+
+    # Underdog hitter scoring
+    fs = (
+        singles * 3.0
+        + doubles * 6.0
+        + triples * 8.0
+        + hr * 10.0
+        + walks * 3.0
+        + hbp * 3.0
+        + rbi * 2.0
+        + runs * 2.0
+        + sb * 4.0
+    )
+
+    floor = fs * 0.45
+    ceiling = fs + 3.0 + hr * 5.0 + sb * 2.0
+    conf = _fs_conf_from_range(fs, floor, ceiling)
+
+    return {
+        "Player": name,
+        "Matchup": matchup,
+        "FS Projection": round(fs, 2),
+        "Floor": round(floor, 2),
+        "Median": round(fs, 2),
+        "Ceiling": round(ceiling, 2),
+        "Confidence %": conf,
+        "Grade": _fs_grade(conf),
+        "PA": round(pa, 2),
+        "Singles": round(singles, 2),
+        "Doubles": round(doubles, 2),
+        "Triples": round(triples, 2),
+        "HR": round(hr, 2),
+        "Walks": round(walks, 2),
+        "HBP": round(hbp, 2),
+        "Runs": round(runs, 2),
+        "RBI": round(rbi, 2),
+        "SB": round(sb, 2),
+        "Moneyball Score": mb_score,
+        "Moneyball Grade": mb_grade,
+        "Source": "Self Projected Batter FS",
+    }
+
+def build_self_projected_batter_fs_board():
+    rows = []
+    for ctx in _fs_get_batter_context_rows():
+        try:
+            rows.append(_fs_batter_component_projection(ctx))
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
+
+def render_self_projected_fantasy_tabs():
+    st.subheader("Self-Projected MLB Fantasy Points")
+    st.caption(f"Version: {SELF_PROJECTED_FS_VERSION}. No Underdog Fantasy line pulling. Uses true MLB stats, lineups, matchups, and Underdog scoring.")
+
+    tab1, tab2 = st.tabs(["⚾ Pitcher FS", "🏆 Batter FS"])
+
+    with tab1:
+        dfp = build_self_projected_pitcher_fs_board()
+        if dfp is None or len(dfp) == 0:
+            st.warning("No pitcher fantasy rows yet. Open/refresh K Upside first so pitcher projections load.")
+        else:
+            st.dataframe(
+                dfp.sort_values("FS Projection", ascending=False),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with tab2:
+        dfb = build_self_projected_batter_fs_board()
+        if dfb is None or len(dfb) == 0:
+            st.warning("No batter fantasy rows yet. Load batter/H+R+R board or confirmed lineups first.")
+        else:
+            st.dataframe(
+                dfb.sort_values("FS Projection", ascending=False),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+# Force fantasy tab names to self-projected tabs.
+def render_fantasy_score_tab():
+    return render_self_projected_fantasy_tabs()
+
+def render_fantasy_points_tab():
+    return render_self_projected_fantasy_tabs()
+
+def render_fantasy_tab():
+    return render_self_projected_fantasy_tabs()
+
+def render_ud_fantasy_points_tab():
+    return render_self_projected_fantasy_tabs()
+
+def render_underdog_fantasy_points_tab():
+    return render_self_projected_fantasy_tabs()
+
+
+
+# ============================================================
+# FANTASY MATCHUP LAYER 1.0 — SELF-PROJECTED FS ONLY
+# Version: FANTASY_MATCHUP_LAYER_1_2026_06_10
+#
+# Added ONLY to self-projected Fantasy tabs:
+# - Batter vs Pitcher Hand
+# - Batter vs Pitcher Quality
+# - Pitcher vs Opponent K%
+# - Pitcher vs Opponent Run Creation
+# - Bullpen Adjustment
+# - Park Adjustment
+#
+# No Underdog Fantasy line pulling.
+# K Upside, Moneyline, and H+R+R tabs are untouched.
+# ============================================================
+
+FANTASY_MATCHUP_LAYER_VERSION = "FANTASY_MATCHUP_LAYER_1_2026_06_10"
+
+def _fs_matchup_clamp(x, lo, hi):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return lo
+
+def _fs_matchup_label(score):
+    s = _fs_self_float(score, 50)
+    if s >= 72:
+        return "PLUS"
+    if s >= 56:
+        return "GOOD"
+    if s >= 44:
+        return "NEUTRAL"
+    return "BAD"
+
+def _fs_batter_vs_pitcher_hand_score(ctx):
+    hand = str(ctx.get("Opp SP Hand") or ctx.get("Pitcher Hand") or ctx.get("Opp Hand") or ctx.get("SP Hand") or "").upper()
+    if hand.startswith("L"):
+        wrc = _fs_self_float(ctx.get("wRC+ vs LHP") or ctx.get("vs LHP wRC+") or ctx.get("LHP wRC+"), None)
+        ops = _fs_self_float(ctx.get("OPS vs LHP") or ctx.get("vs LHP OPS"), None)
+    elif hand.startswith("R"):
+        wrc = _fs_self_float(ctx.get("wRC+ vs RHP") or ctx.get("vs RHP wRC+") or ctx.get("RHP wRC+"), None)
+        ops = _fs_self_float(ctx.get("OPS vs RHP") or ctx.get("vs RHP OPS"), None)
+    else:
+        wrc = _fs_self_float(ctx.get("wRC+"), None)
+        ops = _fs_self_float(ctx.get("OPS"), None)
+
+    score = 50.0
+    if wrc is not None:
+        score += (wrc - 100) * 0.45
+    if ops is not None:
+        score += (ops - 0.720) * 45
+    score = round(_fs_matchup_clamp(score, 20, 92), 1)
+    return score, _fs_matchup_label(score), hand or "UNK"
+
+def _fs_batter_vs_pitcher_quality_score(ctx):
+    era = _fs_self_float(ctx.get("Opp SP ERA") or ctx.get("Pitcher ERA"), None)
+    fip = _fs_self_float(ctx.get("Opp SP FIP") or ctx.get("Pitcher FIP") or ctx.get("xFIP"), None)
+    whip = _fs_self_float(ctx.get("Opp SP WHIP") or ctx.get("Pitcher WHIP"), None)
+    k9 = _fs_self_float(ctx.get("Opp SP K/9") or ctx.get("Pitcher K/9"), None)
+    hard = _fs_self_float(ctx.get("HardHit% Allowed") or ctx.get("Opp SP HardHit%"), None)
+
+    score = 50.0
+    if era is not None:
+        score += (era - 4.10) * 4.0
+    if fip is not None:
+        score += (fip - 4.10) * 4.0
+    if whip is not None:
+        score += (whip - 1.25) * 18
+    if k9 is not None:
+        score -= (k9 - 8.5) * 1.8
+    if hard is not None:
+        score += (hard - 39.0) * 0.55
+
+    score = round(_fs_matchup_clamp(score, 20, 92), 1)
+    label = "ATTACK" if score >= 68 else ("AVOID" if score <= 38 else "NEUTRAL")
+    return score, label
+
+def _fs_bullpen_adj_score(ctx):
+    bp = _fs_self_float(ctx.get("Opp Bullpen Score") or ctx.get("Bullpen Attack Score"), None)
+    era = _fs_self_float(ctx.get("Opp Bullpen ERA") or ctx.get("Bullpen ERA"), None)
+    xfi = _fs_self_float(ctx.get("Opp Bullpen xFIP") or ctx.get("Bullpen xFIP"), None)
+    workload = _fs_self_float(ctx.get("Bullpen Workload") or ctx.get("Opp Bullpen 3D Pitches"), None)
+
+    score = 50.0
+    if bp is not None:
+        score += (bp - 50) * 0.35
+    if era is not None:
+        score += (era - 4.10) * 3.2
+    if xfi is not None:
+        score += (xfi - 4.10) * 3.0
+    if workload is not None:
+        score += min(10, workload / 18.0)
+
+    score = round(_fs_matchup_clamp(score, 20, 92), 1)
+    label = "BULLPEN_TARGET" if score >= 68 else ("BULLPEN_AVOID" if score <= 38 else "BULLPEN_NEUTRAL")
+    return score, label
+
+def _fs_park_adj_score(ctx):
+    pf = _fs_self_float(ctx.get("Park Factor") or ctx.get("Park"), 1.0)
+    temp = _fs_self_float(ctx.get("Temp") or ctx.get("Temperature"), None)
+    wind = _fs_self_float(ctx.get("Wind Out") or ctx.get("Wind"), None)
+
+    score = 50 + (pf - 1.0) * 55
+    if temp is not None:
+        score += (temp - 72) * 0.20
+    if wind is not None:
+        score += wind * 0.25
+
+    score = round(_fs_matchup_clamp(score, 20, 92), 1)
+    label = "PARK_PLUS" if score >= 66 else ("PARK_MINUS" if score <= 40 else "PARK_NEUTRAL")
+    return score, label
+
+def _fs_pitcher_opp_k_score(r):
+    opp_k = _fs_self_float(r.get("Opp K%") or r.get("Opponent K%") or r.get("Lineup K%"), None)
+    if opp_k is None:
+        return 50.0, "OPP_K_UNKNOWN"
+    # MLB avg around 22%
+    score = 50 + (opp_k - 22.0) * 2.2
+    score = round(_fs_matchup_clamp(score, 20, 92), 1)
+    label = "K_UP_MATCHUP" if score >= 65 else ("K_DOWN_MATCHUP" if score <= 40 else "K_NEUTRAL")
+    return score, label
+
+def _fs_pitcher_opp_run_creation_score(r):
+    wrc = _fs_self_float(r.get("Opp wRC+") or r.get("Opponent wRC+") or r.get("Lineup wRC+"), None)
+    ops = _fs_self_float(r.get("Opp OPS") or r.get("Opponent OPS") or r.get("Lineup OPS"), None)
+    imp = _fs_self_float(r.get("Opp Implied Runs") or r.get("Opp Team Runs"), None)
+
+    score = 50.0
+    if wrc is not None:
+        score -= (wrc - 100) * 0.35
+    if ops is not None:
+        score -= (ops - 0.720) * 42
+    if imp is not None:
+        score -= (imp - 4.45) * 7.0
+
+    score = round(_fs_matchup_clamp(score, 20, 92), 1)
+    label = "RUN_SUPPRESS_PLUS" if score >= 65 else ("RUN_RISK" if score <= 40 else "RUN_NEUTRAL")
+    return score, label
+
+# Wrap batter component projection with matchup adjustments.
+_prev_fs_batter_component_projection_matchup = _fs_batter_component_projection
+
+def _fs_batter_component_projection(ctx):
+    row = _prev_fs_batter_component_projection_matchup(ctx)
+
+    hand_score, hand_label, hand = _fs_batter_vs_pitcher_hand_score(ctx)
+    quality_score, quality_label = _fs_batter_vs_pitcher_quality_score(ctx)
+    bullpen_score, bullpen_label = _fs_bullpen_adj_score(ctx)
+    park_score, park_label = _fs_park_adj_score(ctx)
+
+    # Add small capped matchup nudge to FS projection.
+    adj = 0.0
+    adj += _fs_matchup_clamp((hand_score - 50) / 80, -0.30, 0.40)
+    adj += _fs_matchup_clamp((quality_score - 50) / 90, -0.25, 0.35)
+    adj += _fs_matchup_clamp((bullpen_score - 50) / 120, -0.15, 0.25)
+    adj += _fs_matchup_clamp((park_score - 50) / 120, -0.15, 0.25)
+
+    base = _fs_self_float(row.get("FS Projection"), 0.0)
+    new_proj = round(max(0, base + adj), 2)
+    row["Base FS Projection"] = base
+    row["FS Projection"] = new_proj
+    row["Median"] = new_proj
+    row["Ceiling"] = round(_fs_self_float(row.get("Ceiling"), new_proj) + max(0, adj) * 1.5, 2)
+    row["Floor"] = round(max(0, _fs_self_float(row.get("Floor"), 0) + min(0, adj) * 1.2), 2)
+
+    row["Pitcher Hand"] = hand
+    row["Hand Split Score"] = hand_score
+    row["Hand Split"] = hand_label
+    row["Pitcher Quality Score"] = quality_score
+    row["Pitcher Quality"] = quality_label
+    row["Bullpen Score"] = bullpen_score
+    row["Bullpen Adj"] = bullpen_label
+    row["Park Score"] = park_score
+    row["Park Adj"] = park_label
+    row["Matchup Adj"] = round(adj, 2)
+    row["Fantasy Matchup Version"] = FANTASY_MATCHUP_LAYER_VERSION
+    return row
+
+# Wrap pitcher projection with opponent matchup adjustments.
+_prev_fs_pitcher_projection_from_row_matchup = _fs_pitcher_projection_from_row
+
+def _fs_pitcher_projection_from_row(r):
+    row = _prev_fs_pitcher_projection_from_row_matchup(r)
+
+    opp_k_score, opp_k_label = _fs_pitcher_opp_k_score(r)
+    run_score, run_label = _fs_pitcher_opp_run_creation_score(r)
+    park_score, park_label = _fs_park_adj_score(r)
+    bullpen_score, bullpen_label = _fs_bullpen_adj_score(r)
+
+    adj = 0.0
+    adj += _fs_matchup_clamp((opp_k_score - 50) / 75, -0.35, 0.45)
+    adj += _fs_matchup_clamp((run_score - 50) / 95, -0.30, 0.35)
+    adj += _fs_matchup_clamp((park_score - 50) / 130, -0.18, 0.15)
+    # For pitchers, strong offensive bullpen is less direct; use tiny support/risk effect only.
+    adj -= _fs_matchup_clamp((bullpen_score - 50) / 200, -0.08, 0.12)
+
+    base = _fs_self_float(row.get("FS Projection"), 0.0)
+    new_proj = round(max(0, base + adj), 2)
+    row["Base FS Projection"] = base
+    row["FS Projection"] = new_proj
+    row["Median"] = new_proj
+    row["Ceiling"] = round(_fs_self_float(row.get("Ceiling"), new_proj) + max(0, adj) * 1.2, 2)
+    row["Floor"] = round(max(0, _fs_self_float(row.get("Floor"), 0) + min(0, adj) * 1.2), 2)
+
+    row["Opp K Score"] = opp_k_score
+    row["Opp K Matchup"] = opp_k_label
+    row["Opp Run Creation Score"] = run_score
+    row["Opp Run Creation"] = run_label
+    row["Park Score"] = park_score
+    row["Park Adj"] = park_label
+    row["Bullpen Score"] = bullpen_score
+    row["Bullpen Adj"] = bullpen_label
+    row["Matchup Adj"] = round(adj, 2)
+    row["Fantasy Matchup Version"] = FANTASY_MATCHUP_LAYER_VERSION
+    return row
