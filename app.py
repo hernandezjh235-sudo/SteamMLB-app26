@@ -12684,11 +12684,11 @@ def _render_fantasy_score_table_and_cards(df, title):
 
 # Override renderer to separate Pitcher Fantasy and Batter Fantasy inside the Fantasy tab.
 def render_fantasy_score_tab(board_rows=None):
-    st.markdown('<div class="section-title-pro">Fantasy Points — Underdog Only</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title-pro">Self-Projected MLB Fantasy Points</div>', unsafe_allow_html=True)
     st.caption("Separate engines: Pitcher Fantasy reads K projection as an input only; Batter Fantasy uses Moneyball/run-creation logic. K Upside and Moneyline are untouched.")
     df = build_fantasy_score_board(board_rows=board_rows)
     if df.empty:
-        st.warning("No active Underdog MLB Fantasy Points rows found. This tab will stay empty rather than creating fake lines.")
+        st.warning("Self-projected Fantasy mode is enabled. If you see this message, the old inline Fantasy block is still routed above the forced renderer.")
         dbg = st.session_state.get("fantasy_ud_debug") if hasattr(st, "session_state") else None
         if isinstance(dbg, dict):
             st.caption(f"UD debug: urls={dbg.get('urls')} objects={dbg.get('objects')} candidates={dbg.get('candidates')} mlb_valid={dbg.get('mlb_valid')}")
@@ -14796,7 +14796,7 @@ def render_fantasy_points_tab():
 # FORCE FANTASY TAB TO MANUAL LINE MODE
 # Version: MANUAL_FP_FORCED_TAB_2026_06_10
 #
-# This disables the old "Fantasy Points — Underdog Only" renderer
+# This disables the old "Self-Projected MLB Fantasy Points" renderer
 # and forces the Fantasy tab to show manual line entry:
 #   Player/Matchup/Projection auto-load
 #   User enters Underdog line manually
@@ -16717,3 +16717,100 @@ def _fs_pitcher_projection_from_row(r):
     row["Matchup Adj"] = round(adj, 2)
     row["Fantasy Matchup Version"] = FANTASY_MATCHUP_LAYER_VERSION
     return row
+
+
+
+# ============================================================
+# FORCE FANTASY POINTS TAB TO SELF-PROJECTED FS
+# Version: SELF_PROJECTED_FS_FORCED_ROUTE_2026_06_10
+#
+# This is intentionally the LAST override in the file.
+# It prevents the old "Fantasy Points — Underdog Only" block from rendering.
+#
+# No Underdog Fantasy line pulling.
+# Separate tabs:
+#   ⚾ Pitcher FS
+#   🏆 Batter FS
+#
+# K Upside, Moneyline, and H+R+R are untouched.
+# ============================================================
+
+SELF_PROJECTED_FS_FORCED_ROUTE_VERSION = "SELF_PROJECTED_FS_FORCED_ROUTE_2026_06_10"
+
+def _render_self_projected_fs_forced():
+    st.subheader("Self-Projected MLB Fantasy Points")
+    st.caption(
+        f"Version: {SELF_PROJECTED_FS_FORCED_ROUTE_VERSION}. "
+        "No Underdog Fantasy line pulling. Uses true MLB stats, lineups, matchups, and Underdog scoring."
+    )
+
+    tab_p, tab_b = st.tabs(["⚾ Pitcher FS", "🏆 Batter FS"])
+
+    with tab_p:
+        try:
+            dfp = build_self_projected_pitcher_fs_board()
+        except Exception as e:
+            dfp = pd.DataFrame()
+            st.warning(f"Pitcher FS board could not build yet: {e}")
+
+        if dfp is None or len(dfp) == 0:
+            st.warning("No Pitcher FS rows yet. Refresh/open K PROJ / UPSIDE first so pitcher projections load.")
+        else:
+            cols = list(dfp.columns)
+            st.dataframe(
+                dfp.sort_values("FS Projection", ascending=False) if "FS Projection" in cols else dfp,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with tab_b:
+        try:
+            dfb = build_self_projected_batter_fs_board()
+        except Exception as e:
+            dfb = pd.DataFrame()
+            st.warning(f"Batter FS board could not build yet: {e}")
+
+        if dfb is None or len(dfb) == 0:
+            st.warning("No Batter FS rows yet. Load H+R+R/batter board or confirmed lineups first.")
+        else:
+            cols = list(dfb.columns)
+            st.dataframe(
+                dfb.sort_values("FS Projection", ascending=False) if "FS Projection" in cols else dfb,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+# Final forced renderer names.
+def render_fantasy_score_tab():
+    return _render_self_projected_fs_forced()
+
+def render_fantasy_points_tab():
+    return _render_self_projected_fs_forced()
+
+def render_fantasy_tab():
+    return _render_self_projected_fs_forced()
+
+def render_ud_fantasy_points_tab():
+    return _render_self_projected_fs_forced()
+
+def render_underdog_fantasy_points_tab():
+    return _render_self_projected_fs_forced()
+
+def render_manual_fantasy_points_tab():
+    return _render_self_projected_fs_forced()
+
+# Some versions call this table/cards function directly from the tab block.
+def _render_fantasy_score_table_and_cards(*args, **kwargs):
+    return _render_self_projected_fs_forced()
+
+# Some versions build the old UD-only board first. Make it harmless if called.
+def fetch_underdog_fantasy_score_rows():
+    return []
+
+def build_fantasy_score_board():
+    # If the app calls the old board-builder directly, return the self-projected batter board
+    # instead of an empty Underdog-only board.
+    try:
+        return build_self_projected_batter_fs_board()
+    except Exception:
+        return pd.DataFrame()
