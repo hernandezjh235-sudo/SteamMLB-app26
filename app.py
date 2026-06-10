@@ -12142,7 +12142,7 @@ def render_batter_prop_tab(market):
         st.warning(f"No active Underdog {cfg['label']} rows found. This tab will stay empty rather than creating fake lines.")
         dbg = st.session_state.get("hrr_ud_debug") if hasattr(st, "session_state") else None
         if isinstance(dbg, dict):
-            st.caption(f"UD debug: urls={dbg.get('urls')} objects={dbg.get('objects')} line_candidates={dbg.get('line_candidates')} hrr_hits={dbg.get('hrr_market_hits')} mlb_valid={dbg.get('mlb_valid')}")
+            st.caption(f" urls={dbg.get('urls')} objects={dbg.get('objects')} line_candidates={dbg.get('line_candidates')} hrr_hits={dbg.get('hrr_market_hits')} mlb_valid={dbg.get('mlb_valid')}")
             samples = dbg.get("sample_markets") or []
             if samples:
                 with st.expander("Underdog market text samples"):
@@ -12688,13 +12688,13 @@ def render_fantasy_score_tab(board_rows=None):
     st.caption("Separate engines: Pitcher Fantasy reads K projection as an input only; Batter Fantasy uses Moneyball/run-creation logic. K Upside and Moneyline are untouched.")
     df = build_fantasy_score_board(board_rows=board_rows)
     if df.empty:
-        st.warning("Self-projected Fantasy mode is enabled. If you see this message, the old inline Fantasy block is still routed above the forced renderer.")
+        st.warning("")
         dbg = st.session_state.get("fantasy_ud_debug") if hasattr(st, "session_state") else None
         if isinstance(dbg, dict):
-            st.caption(f"UD debug: urls={dbg.get('urls')} objects={dbg.get('objects')} candidates={dbg.get('candidates')} mlb_valid={dbg.get('mlb_valid')}")
+            st.caption(f" urls={dbg.get('urls')} objects={dbg.get('objects')} candidates={dbg.get('candidates')} mlb_valid={dbg.get('mlb_valid')}")
             samples = dbg.get("sample_markets") or []
             if samples:
-                with st.expander("Underdog fantasy market text samples"):
+                with st.expander(""):
                     for s in samples[:8]:
                         st.code(str(s)[:500])
         return
@@ -16810,6 +16810,91 @@ def fetch_underdog_fantasy_score_rows():
 def build_fantasy_score_board():
     # If the app calls the old board-builder directly, return the self-projected batter board
     # instead of an empty Underdog-only board.
+    try:
+        return build_self_projected_batter_fs_board()
+    except Exception:
+        return pd.DataFrame()
+
+
+
+# ============================================================
+# FINAL CLEAN ROUTE — SELF PROJECTED FS ONLY
+# Version: SELF_PROJECTED_FS_CLEAN_ROUTE_2026_06_10
+# ============================================================
+
+SELF_PROJECTED_FS_CLEAN_ROUTE_VERSION = "SELF_PROJECTED_FS_CLEAN_ROUTE_2026_06_10"
+
+def _render_self_projected_fs_clean_route():
+    st.subheader("Self-Projected MLB Fantasy Points")
+    st.caption(
+        f"Version: {SELF_PROJECTED_FS_CLEAN_ROUTE_VERSION}. "
+        "No Underdog Fantasy line pulling. Uses true MLB stats, lineups, matchups, and Underdog scoring."
+    )
+
+    tab_p, tab_b = st.tabs(["⚾ Pitcher FS", "🏆 Batter FS"])
+
+    with tab_p:
+        try:
+            dfp = build_self_projected_pitcher_fs_board()
+        except Exception as e:
+            dfp = pd.DataFrame()
+            st.warning(f"Pitcher FS board could not build yet: {e}")
+
+        if dfp is None or len(dfp) == 0:
+            st.warning("No Pitcher FS rows yet. Refresh/open K PROJ / UPSIDE first so pitcher projections load.")
+        else:
+            sort_col = "FS Projection" if "FS Projection" in dfp.columns else dfp.columns[0]
+            st.dataframe(dfp.sort_values(sort_col, ascending=False), use_container_width=True, hide_index=True)
+
+    with tab_b:
+        try:
+            dfb = build_self_projected_batter_fs_board()
+        except Exception as e:
+            dfb = pd.DataFrame()
+            st.warning(f"Batter FS board could not build yet: {e}")
+
+        if dfb is None or len(dfb) == 0:
+            st.warning("No Batter FS rows yet. Load H+R+R/batter board or confirmed lineups first.")
+        else:
+            sort_col = "FS Projection" if "FS Projection" in dfb.columns else dfb.columns[0]
+            st.dataframe(dfb.sort_values(sort_col, ascending=False), use_container_width=True, hide_index=True)
+
+def render_fantasy_score_tab():
+    _render_self_projected_fs_clean_route()
+    return None
+
+def render_fantasy_points_tab():
+    _render_self_projected_fs_clean_route()
+    return None
+
+def render_fantasy_tab():
+    _render_self_projected_fs_clean_route()
+    return None
+
+def render_ud_fantasy_points_tab():
+    _render_self_projected_fs_clean_route()
+    return None
+
+def render_underdog_fantasy_points_tab():
+    _render_self_projected_fs_clean_route()
+    return None
+
+def render_manual_fantasy_points_tab():
+    _render_self_projected_fs_clean_route()
+    return None
+
+def _render_fantasy_score_table_and_cards(*args, **kwargs):
+    _render_self_projected_fs_clean_route()
+    return None
+
+def fetch_underdog_fantasy_score_rows():
+    try:
+        st.session_state["fantasy_ud_debug"] = {}
+    except Exception:
+        pass
+    return []
+
+def build_fantasy_score_board():
     try:
         return build_self_projected_batter_fs_board()
     except Exception:
