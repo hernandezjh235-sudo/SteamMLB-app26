@@ -14279,3 +14279,246 @@ def fetch_underdog_fantasy_score_rows():
         pass
 
     return rows
+
+
+
+# ============================================================
+# PRACTICAL FANTASY POINTS FIX — NO MORE SILENT FAILURE
+# Version: FANTASY_POINTS_PRACTICAL_FIX_2026_06_10
+#
+# What this does:
+# 1. Searches ALL Underdog JSON URLs already configured in the app.
+# 2. Extracts Fantasy Points rows from options.selection_subheader.
+# 3. Rejects non-MLB names.
+# 4. Validates MLB players through MLB Stats API lookup.
+# 5. If MLB Fantasy Points are not present in the current Underdog feed,
+#    returns a clear debug reason instead of endless "no active rows".
+#
+# This does NOT touch:
+# - K Upside
+# - Moneyline
+# - K projections
+# - Fantasy projection formulas
+# ============================================================
+
+FANTASY_POINTS_LOADER_VERSION = "FANTASY_POINTS_PRACTICAL_FIX_2026_06_10"
+
+def _fpfx_norm(x):
+    try:
+        return normalize_name(x)
+    except Exception:
+        import re
+        return re.sub(r"[^a-z0-9]+", "", str(x or "").lower())
+
+def _fpfx_collect(data):
+    out = []
+    def walk(x, parent=""):
+        if isinstance(x, dict):
+            y = dict(x)
+            if parent and "_parent_key" not in y:
+                y["_parent_key"] = parent
+            out.append(y)
+            for k, v in x.items():
+                if isinstance(v, (dict, list)):
+                    walk(v, k)
+        elif isinstance(x, list):
+            for item in x:
+                walk(item, parent)
+    walk(data)
+    return out
+
+def _fpfx_attrs(obj):
+    if not isinstance(obj, dict):
+        return {}
+    out = {}
+    if isinstance(obj.get("attributes"), dict):
+        out.update(obj["attributes"])
+    for k, v in obj.items():
+        if k not in ("attributes", "relationships", "included", "data") and k not in out:
+            out[k] = v
+    return out
+
+def _fpfx_clean_name(name):
+    import re
+    s = str(name or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\s+(Fantasy Points|Fantasy Score|Higher|Lower).*$", "", s, flags=re.I).strip()
+    try:
+        return _fs_clean_player_name(s)
+    except Exception:
+        return s
+
+def _fpfx_bad_non_mlb(name):
+    bad = [
+        "wembanyama","lebron","jokic","doncic","durant","curry","giannis","tatum","booker",
+        "caitlin","aja wilson","ionescu","stewart",
+        "mcdavid","mackinnon","bedard","ovechkin",
+        "tourney","finishing position","shots","rebounds","assists","blocks","steals","saves",
+        "pga","ufc","tennis","soccer","golf"
+    ]
+    low = str(name or "").lower()
+    return any(b in low for b in bad)
+
+def _fpfx_line_from_sub(sub):
+    import re
+    m = re.search(r"(Higher|Lower)\s+([0-9]+(?:\.[0-9]+)?)\s+Fantasy\s+(Points|Score)", str(sub or ""), re.I)
+    if m:
+        return float(m.group(2))
+    m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s+Fantasy\s+(Points|Score)", str(sub or ""), re.I)
+    if m:
+        return float(m.group(1))
+    return None
+
+def _fpfx_mlb_lookup(name):
+    try:
+        pid = _mlb_search_player_id_by_name(name)
+    except Exception:
+        pid = None
+    pos = None
+    full = name
+    if pid:
+        try:
+            bio = safe_get_json(f"https://statsapi.mlb.com/api/v1/people/{pid}", timeout=8) or {}
+            people = bio.get("people") or []
+            if people:
+                full = people[0].get("fullName") or name
+                pos = ((people[0].get("primaryPosition") or {}).get("abbreviation") or "").upper()
+        except Exception:
+            pass
+    return pid, pos, full
+
+def _fpfx_known_pitcher_names():
+    names = set()
+    try:
+        for key in list(st.session_state.keys()):
+            obj = st.session_state.get(key)
+            if hasattr(obj, "columns"):
+                for col in ["Pitcher", "Away SP", "Home SP"]:
+                    if col in obj.columns:
+                        for v in obj[col].dropna().astype(str).tolist():
+                            v = str(v).strip()
+                            if v and v != "—":
+                                names.add(_fpfx_norm(v))
+    except Exception:
+        pass
+    return names
+
+def _fpfx_url_list():
+    urls = []
+    try:
+        urls.extend(list(UNDERDOG_URLS))
+    except Exception:
+        pass
+    # Add common Underdog endpoints as fallbacks. If one 404s/fails, safe_get_json simply fails and continues.
+    urls.extend([
+        "https://api.underdogfantasy.com/beta/v6/over_under_lines",
+        "https://api.underdogfantasy.com/beta/v5/over_under_lines",
+        "https://api.underdogfantasy.com/beta/v4/over_under_lines",
+        "https://api.underdogfantasy.com/v1/over_under_lines",
+    ])
+    # preserve order unique
+    seen = set()
+    out = []
+    for u in urls:
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+def fetch_underdog_fantasy_score_rows():
+    import re
+    rows, seen = [], set()
+    debug = {
+        "loader_version": FANTASY_POINTS_LOADER_VERSION,
+        "urls": 0,
+        "objects": 0,
+        "fantasy_options_seen": 0,
+        "non_mlb_rejected": 0,
+        "mlb_lookup_rejected": 0,
+        "mlb_valid": 0,
+        "sample_markets": []
+    }
+    pitcher_names = _fpfx_known_pitcher_names()
+
+    for url in _fpfx_url_list():
+        try:
+            data = safe_get_json(url, timeout=18)
+            debug["urls"] += 1
+        except Exception:
+            data = None
+        if not data:
+            continue
+
+        objs = _fpfx_collect(data)
+        debug["objects"] += len(objs)
+
+        for obj in objs:
+            a = _fpfx_attrs(obj)
+            header = str(a.get("selection_header") or a.get("player_name") or a.get("name") or "").strip()
+            sub = str(a.get("selection_subheader") or "").strip()
+            status = str(a.get("status") or "").lower()
+
+            if status and status != "active":
+                continue
+            if "fantasy points" not in sub.lower() and "fantasy score" not in sub.lower():
+                continue
+            if not header:
+                continue
+
+            debug["fantasy_options_seen"] += 1
+            player = _fpfx_clean_name(header)
+            line = _fpfx_line_from_sub(sub)
+            if line is None:
+                if len(debug["sample_markets"]) < 50:
+                    debug["sample_markets"].append(f"NO_LINE | {player} | {sub}")
+                continue
+
+            # Reject known non-MLB rows first.
+            if _fpfx_bad_non_mlb(f"{player} {sub}"):
+                debug["non_mlb_rejected"] += 1
+                if len(debug["sample_markets"]) < 50:
+                    debug["sample_markets"].append(f"REJECT_NON_MLB | {player} | {sub}")
+                continue
+
+            pid, pos, full = _fpfx_mlb_lookup(player)
+            known_pitcher = _fpfx_norm(player) in pitcher_names
+
+            if not pid and not known_pitcher:
+                debug["mlb_lookup_rejected"] += 1
+                if len(debug["sample_markets"]) < 50:
+                    debug["sample_markets"].append(f"REJECT_NO_MLB_LOOKUP | {player} | {sub}")
+                continue
+
+            is_pitcher = (pos == "P") or known_pitcher or float(line) >= 20
+            market = "PITCHER_FS" if is_pitcher else "BATTER_FS"
+            key = (_fpfx_norm(full or player), market, float(line))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            debug["mlb_valid"] += 1
+            if len(debug["sample_markets"]) < 50:
+                debug["sample_markets"].append(f"ACCEPT_MLB | {full or player} | {sub} | {market}")
+
+            rows.append({
+                "Source": "Underdog",
+                "Player": full or player,
+                "Player ID": pid,
+                "Market": market,
+                "Market Label": FANTASY_SCORE_MARKETS.get(market, {}).get("label", "Fantasy Points"),
+                "Line": float(line),
+                "Evidence": f"{player} | {sub}",
+            })
+
+    if not rows:
+        if debug["fantasy_options_seen"] == 0:
+            debug["sample_markets"].append("NO_FANTASY_POINTS_OPTIONS_FOUND_IN_ANY_UNDERDOG_ENDPOINT")
+        elif debug["mlb_valid"] == 0:
+            debug["sample_markets"].append("FANTASY_POINTS_EXIST_BUT_NONE_VALIDATED_AS_MLB_IN_CURRENT_FEED")
+
+    try:
+        st.session_state["fantasy_ud_debug"] = debug
+    except Exception:
+        pass
+
+    return rows
