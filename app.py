@@ -10150,6 +10150,26 @@ def render_kproj_pitcher_card(p):
     bf = safe_float(p.get("expected_bf"), 0.0) or 0.0
     line_display = "NO LINE" if d["line"] is None else f"{d['line']:.1f}"
     conf_display = "—" if d["confidence"] is None else f"{d['confidence']*100:.0f}%"
+    # Ace / Veteran / Rookie stability display. This is a confidence/workload label only;
+    # it does not directly boost strikeout skill.
+    exp_label_raw = str(p.get("pitcher_experience_label") or p.get("experience_label") or "EXPERIENCE_UNKNOWN")
+    exp_label_display = exp_label_raw.replace("_", " ").title()
+    exp_score_display = "—" if p.get("pitcher_experience_score") is None else f"{safe_float(p.get('pitcher_experience_score'), 50):.0f}/100"
+    exp_bf_factor_display = "—" if p.get("pitcher_experience_bf_factor") is None else f"BF x{safe_float(p.get('pitcher_experience_bf_factor'), 1.0):.3f}"
+    # Player average Ks display from recent logs. Prefer L10, then recent-form L10.
+    avg_k_display = "—"
+    avg_k_sub = "Recent K average"
+    try:
+        recent_ks_vals = [safe_float(x, None) for x in (p.get("last_10_ks") or [])[:10]]
+        recent_ks_vals = [x for x in recent_ks_vals if x is not None]
+        if recent_ks_vals:
+            avg_k_display = f"{float(np.mean(recent_ks_vals)):.2f}"
+            avg_k_sub = f"L10 Ks | L3 {p.get('recent_form_l3', '—')}"
+        elif p.get("recent_form_l10") is not None:
+            avg_k_display = f"{safe_float(p.get('recent_form_l10'), 0):.2f}"
+            avg_k_sub = "L10 recent form"
+    except Exception:
+        pass
     dist_display = f"F {dist.get('floor')} | M {dist.get('median')} | C {dist.get('ceiling')}"
     edge_display = d.get("edge_display", "—")
     edge_class = d.get("edge_class", "yellow-badge")
@@ -10198,6 +10218,8 @@ def render_kproj_pitcher_card(p):
         <div class="mobile-info-card"><div class="small-muted">Line Audit</div><div class="kpi-value" style="font-size:16px;">{p.get('line_history_grade', '—')}</div><div class="kpi-sub">L10 {p.get('line_l10_avg', '—')} | HR {'' if p.get('line_recent_hit_rate') is None else str(round((p.get('line_recent_hit_rate') or 0)*100))+'%'}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Innings</div><div class="kpi-value" style="font-size:18px;">{p.get('projected_ip', '—')} IP</div><div class="kpi-sub">Pull: {p.get('early_pull_label', '—')} | Pitches {p.get('projected_pitches', '—')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Pitch Count</div><div class="kpi-value" style="font-size:18px;">{p.get('pitch_count_score', '—')}</div><div class="kpi-sub">{p.get('pitch_count_label', '—')} | L3 {p.get('pitch_count_avg_l3', '—')}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Ace / Veteran / Rookie</div><div class="kpi-value" style="font-size:15px;">{html.escape(exp_label_display)}</div><div class="kpi-sub">Score {exp_score_display} | {exp_bf_factor_display}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Avg Ks</div><div class="kpi-value" style="font-size:18px;">{avg_k_display}</div><div class="kpi-sub">{avg_k_sub}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Form</div><div class="kpi-value" style="font-size:15px;">{p.get('recent_vs_season_flag', '—')}</div><div class="kpi-sub">L3 {p.get('recent_form_l3', '—')} | L10 {p.get('recent_form_l10', '—')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Velocity Trend</div><div class="kpi-value" style="font-size:18px;">{velo_display}</div><div class="kpi-sub">{velo_sub}</div></div>
         <div class="mobile-info-card"><div class="small-muted">F-Strike / Usage</div><div class="kpi-value" style="font-size:18px;">{fstrike_display}</div><div class="kpi-sub">{usage_note_display}</div></div>
