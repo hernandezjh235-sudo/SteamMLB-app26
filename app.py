@@ -10382,25 +10382,6 @@ def render_kproj_tab(board):
 
 
 # =========================
-# FANTASY POINTS SAFE RENDERER — RUN FIX
-# Keeps app from crashing where main code calls:
-# render_fantasy_score_tab(board)
-# K Upside / ML / H+R+R untouched.
-# =========================
-
-def render_fantasy_score_tab(board=None):
-    st.subheader("Fantasy Points")
-    st.info("Fantasy Points temporarily removed for clean rebuild.")
-    return None
-
-def render_fantasy_points_tab(board=None):
-    return render_fantasy_score_tab(board)
-
-def render_fantasy_tab(board=None):
-    return render_fantasy_score_tab(board)
-
-
-# =========================
 # MONEYLINE EDGE TAB — ISOLATED MODULE
 # Separate ML tab only. Does NOT change K projections, Underdog props,
 # simulations, light true leash/BF, or official K decisions.
@@ -12365,9 +12346,8 @@ def ml_factor_summary(factors):
         f"BSR {factors.get('BaseRuns/G','—')}"
     )
 
-tab_kproj, tab_fantasy, tab_moneyline, tab_calibration, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab_kproj, tab_moneyline, tab_calibration, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
-    "FANTASY SCORE",
     "MONEYLINE EDGE",
     "CALIBRATION AUDIT",
     "TOP PLAYS",
@@ -12381,9 +12361,6 @@ tab_kproj, tab_fantasy, tab_moneyline, tab_calibration, tab1, tab_best4, tab2, t
 
 with tab_kproj:
     render_kproj_tab(board)
-
-with tab_fantasy:
-    render_fantasy_score_tab(board)
 
 with tab_moneyline:
     render_moneyline_edge_tab(board, dates)
@@ -12725,7 +12702,6 @@ with tab6:
             save_json(LINEUP_CACHE_FILE, {})
             st.error("All logs cleared.")
 
-st.caption("Workflow: Refresh live board -> inspect lines -> save official before-game snapshot -> after games, grade and learn.")
 
 # =========================
 # ML FINAL REFINEMENT PATCH
