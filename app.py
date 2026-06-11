@@ -14949,14 +14949,1411 @@ def render_batter_fs_tab():
     except Exception:
         pass
 
-tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_moneyline, tab_calibration, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+
+# =========================
+# MONEYLINE 9.7 LATE-INNING / DEFENSE / BASERUNNING LAYER
+# Version: ML_97_LATE_EDGE_2026_06_10
+#
+# Moneyline only.
+# Adds:
+# 1. Bullpen leverage availability
+# 2. Last 3-day bullpen workload
+# 3. Team defensive runs saved proxy
+# 4. Baserunning value
+# 5. Catcher framing proxy
+# 6. Late-inning run prevention
+#
+# K Upside, Pitcher FS, Batter FS, and H+R+R are untouched.
+# =========================
+ML_97_LATE_EDGE_VERSION = "ML_97_LATE_EDGE_2026_06_10"
+
+def _ml97_num(x, default=0.0):
+    try:
+        if x in (None, "", "—"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _ml97_cap(x, lo, hi, default=0.0):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return default
+
+def _ml97_team_profile(team_abbr, row=None):
+    tid = None
+    hit = {}
+    pit = {}
+    try:
+        tid = ml_resolve_team_id(team_abbr, row if isinstance(row, dict) else {})
+    except Exception:
+        tid = None
+    try:
+        if tid:
+            hit = ml_team_hitting_profile(tid) or {}
+    except Exception:
+        hit = {}
+    try:
+        if tid:
+            pit = ml_team_pitching_allowed_profile(tid) or {}
+    except Exception:
+        pit = {}
+    return tid, hit, pit
+
+def _ml97_bullpen_availability(row=None):
+    row = row if isinstance(row, dict) else {}
+    closer = _ml97_num(row.get("Closer Available"), None)
+    setup = _ml97_num(row.get("Setup Available") or row.get("Top Setup Available"), None)
+    top3 = _ml97_num(row.get("Top 3 Relievers Available") or row.get("Top3 Available"), None)
+
+    # If explicit fields are missing, infer softly from bullpen/fatigue fields.
+    bullpen_score = _ml97_num(row.get("Bullpen Score") or row.get("Bullpen"), 50)
+    fatigue = _ml97_num(row.get("Bullpen Fatigue") or row.get("Bullpen Fatigue Score"), 50)
+
+    if closer is None:
+        closer = 1 if fatigue < 62 else 0.75
+    if setup is None:
+        setup = 1 if fatigue < 58 else 0.70
+    if top3 is None:
+        top3 = _ml97_cap(1 - max(0, fatigue - 50) / 80, 0.45, 1.0, 0.85)
+
+    score = 50
+    score += (closer - 0.75) * 35
+    score += (setup - 0.75) * 25
+    score += (top3 - 0.75) * 25
+    score += (bullpen_score - 50) * 0.15
+    score -= max(0, fatigue - 50) * 0.18
+
+    return round(_ml97_cap(score, 20, 90, 50), 1)
+
+def _ml97_bullpen_workload(row=None):
+    row = row if isinstance(row, dict) else {}
+    p1 = _ml97_num(row.get("Bullpen Pitches 1D") or row.get("BP Pitches 1D"), None)
+    p2 = _ml97_num(row.get("Bullpen Pitches 2D") or row.get("BP Pitches 2D"), None)
+    p3 = _ml97_num(row.get("Bullpen Pitches 3D") or row.get("BP Pitches 3D"), None)
+    b2b = _ml97_num(row.get("Back To Back Relievers") or row.get("B2B Relievers"), 0)
+    three_straight = _ml97_num(row.get("3 Straight Relievers") or row.get("Three Straight Relievers"), 0)
+
+    fatigue_field = _ml97_num(row.get("Bullpen Fatigue") or row.get("Bullpen Fatigue Score"), None)
+    if p1 is None and p2 is None and p3 is None and fatigue_field is not None:
+        score = fatigue_field
+    else:
+        p1 = 35 if p1 is None else p1
+        p2 = 75 if p2 is None else p2
+        p3 = 115 if p3 is None else p3
+        score = 35
+        score += _ml97_cap((p1 - 35) * 0.28, -8, 20, 0)
+        score += _ml97_cap((p2 - 75) * 0.13, -8, 18, 0)
+        score += _ml97_cap((p3 - 115) * 0.08, -8, 20, 0)
+        score += b2b * 4.0
+        score += three_straight * 7.0
+
+    score = _ml97_cap(score, 15, 90, 45)
+    label = "TIRED" if score >= 62 else "FRESH" if score <= 38 else "NORMAL"
+    return round(score, 1), label
+
+def _ml97_defense_score(team_abbr, row=None):
+    row = row if isinstance(row, dict) else {}
+    drs = _ml97_num(row.get("DRS") or row.get("Defensive Runs Saved"), None)
+    oaa = _ml97_num(row.get("OAA") or row.get("Outs Above Average"), None)
+    uzr = _ml97_num(row.get("UZR"), None)
+
+    # If no external defensive stats, use any existing defense score, else neutral.
+    if drs is None and oaa is None and uzr is None:
+        val = _ml97_num(row.get("Defense Score") or row.get("OAA Score") or row.get("DRS Score"), 50)
+        return round(_ml97_cap(val, 25, 80, 50), 1)
+
+    score = 50
+    if drs is not None:
+        score += _ml97_cap(drs * 0.35, -10, 10, 0)
+    if oaa is not None:
+        score += _ml97_cap(oaa * 0.45, -10, 10, 0)
+    if uzr is not None:
+        score += _ml97_cap(uzr * 0.30, -8, 8, 0)
+    return round(_ml97_cap(score, 25, 85, 50), 1)
+
+def _ml97_baserunning_score(team_abbr, row=None):
+    row = row if isinstance(row, dict) else {}
+    tid, hit, pit = _ml97_team_profile(team_abbr, row)
+
+    bsr = _ml97_num(row.get("BsR") or row.get("Baserunning Runs"), None)
+    sb = _ml97_num(row.get("SB%") or row.get("Stolen Base %"), None)
+    xbt = _ml97_num(row.get("XBT%") or row.get("Extra Bases Taken %"), None)
+
+    if bsr is None:
+        bsr = _ml97_num(hit.get("baserunning_runs") or hit.get("bsr"), 0)
+    if sb is None:
+        sb = _ml97_num(hit.get("sb_pct"), 70)
+    if xbt is None:
+        xbt = _ml97_num(hit.get("xbt_pct"), 41)
+
+    score = 50
+    score += _ml97_cap(bsr * 0.45, -10, 10, 0)
+    score += _ml97_cap((sb - 70) * 0.22, -6, 7, 0)
+    score += _ml97_cap((xbt - 41) * 0.28, -6, 7, 0)
+    return round(_ml97_cap(score, 25, 85, 50), 1)
+
+def _ml97_framing_score(team_abbr, row=None):
+    row = row if isinstance(row, dict) else {}
+    framing = _ml97_num(row.get("Framing Runs") or row.get("Catcher Framing Runs"), None)
+    csaa = _ml97_num(row.get("CSAA"), None)
+    strike_conv = _ml97_num(row.get("Strike Conversion") or row.get("Strike Conversion %"), None)
+
+    if framing is None and csaa is None and strike_conv is None:
+        val = _ml97_num(row.get("Framing Score") or row.get("Catcher Score"), 50)
+        return round(_ml97_cap(val, 30, 75, 50), 1)
+
+    score = 50
+    if framing is not None:
+        score += _ml97_cap(framing * 0.55, -9, 9, 0)
+    if csaa is not None:
+        score += _ml97_cap(csaa * 120, -8, 8, 0)
+    if strike_conv is not None:
+        score += _ml97_cap((strike_conv - 50) * 0.25, -7, 7, 0)
+    return round(_ml97_cap(score, 25, 85, 50), 1)
+
+def _ml97_late_inning_prevention(team_abbr, row=None):
+    availability = _ml97_bullpen_availability(row)
+    workload, workload_label = _ml97_bullpen_workload(row)
+    defense = _ml97_defense_score(team_abbr, row)
+    framing = _ml97_framing_score(team_abbr, row)
+    bullpen_quality = _ml97_num((row or {}).get("Bullpen Score") or (row or {}).get("Bullpen"), 50)
+
+    score = 50
+    score += (availability - 50) * 0.35
+    score -= (workload - 50) * 0.28
+    score += (defense - 50) * 0.22
+    score += (framing - 50) * 0.15
+    score += (bullpen_quality - 50) * 0.20
+    score = _ml97_cap(score, 20, 90, 50)
+
+    label = "ELITE_LATE" if score >= 65 else "WEAK_LATE" if score <= 40 else "AVG_LATE"
+    return {
+        "Bullpen Availability": availability,
+        "Bullpen Workload": workload,
+        "Bullpen Workload Label": workload_label,
+        "Defense Score": defense,
+        "Framing Score": framing,
+        "Late Inning Prevention": round(score, 1),
+        "Late Inning Label": label,
+    }
+
+def _ml97_adjust_runs_for_late_edge(team_runs, team_abbr, team_row, opp_team, opp_row):
+    """
+    Adjust runs scored by the opponent's late-inning prevention, and add team's baserunning creation.
+    """
+    opp_late = _ml97_late_inning_prevention(opp_team, opp_row)
+    bs = _ml97_baserunning_score(team_abbr, team_row)
+
+    runs = _ml97_num(team_runs, 4.45)
+    # Strong opponent late prevention suppresses scoring; weak late prevention boosts.
+    runs -= _ml97_cap((opp_late["Late Inning Prevention"] - 50) * 0.010, -0.35, 0.35, 0)
+    runs += _ml97_cap((bs - 50) * 0.006, -0.15, 0.18, 0)
+    runs = _ml97_cap(runs, 2.1, 7.5, team_runs)
+
+    return round(runs, 2), opp_late, bs
+
+# Wrap the current final ML board and apply the 9.7 late-inning layer.
+_prev_ml97_build_board = ml_build_board
+
+def ml_build_board(board):
+    df = _prev_ml97_build_board(board)
+    if df is None or df.empty:
+        return df
+
+    # Build game pitcher lookup from board.
+    lookup = {}
+    for p in board or []:
+        if not isinstance(p, dict):
+            continue
+        matchup = str(p.get("matchup") or p.get("Matchup") or "")
+        team = str(p.get("team") or p.get("Team") or "").upper()
+        if matchup and team:
+            lookup[(matchup, team)] = p
+
+    rows = []
+    for _, r in df.iterrows():
+        row = r.to_dict()
+        matchup = str(row.get("Matchup") or "")
+        try:
+            away, home = _ml95_split_matchup(matchup)
+        except Exception:
+            away, home = "", ""
+        if not away or not home:
+            rows.append(row)
+            continue
+
+        ap = lookup.get((matchup, away.upper()), {})
+        hp = lookup.get((matchup, home.upper()), {})
+
+        aruns0 = _ml97_num(row.get("Away Projected Runs"), 4.45)
+        hruns0 = _ml97_num(row.get("Home Projected Runs"), 4.45)
+
+        aruns, home_late, away_bsr = _ml97_adjust_runs_for_late_edge(aruns0, away, ap, home, hp)
+        hruns, away_late, home_bsr = _ml97_adjust_runs_for_late_edge(hruns0, home, hp, away, ap)
+
+        try:
+            amodel = _mlf_win_probability(aruns, hruns, {"Power Rating": row.get("Away Power Rating", 50)}, {"Power Rating": row.get("Home Power Rating", 50)})
+        except Exception:
+            try:
+                amodel = _to_projected_win_pct(aruns, hruns, 50)
+            except Exception:
+                amodel = 50.0
+        hmodel = 100 - amodel
+
+        amkt = row.get("Away Market %")
+        hmkt = row.get("Home Market %")
+        aedge = None if amkt in (None, "", "—") else round(amodel - _ml97_num(amkt), 1)
+        hedge = None if hmkt in (None, "", "—") else round(hmodel - _ml97_num(hmkt), 1)
+
+        score_pick = away if aruns >= hruns else home
+        score_edge = abs(aruns - hruns)
+
+        if aedge is None or hedge is None:
+            pick = away if amodel >= hmodel else home
+            edge = round(abs(amodel - hmodel), 1)
+            status = row.get("Status", "MODEL ONLY")
+            grade = f"MODEL LEAN — {pick}"
+        else:
+            pick, edge = (away, aedge) if aedge >= hedge else (home, hedge)
+            agrees_score = pick == score_pick
+            late_ok = True
+            if pick == away and away_late["Late Inning Label"] == "WEAK_LATE":
+                late_ok = False
+            if pick == home and home_late["Late Inning Label"] == "WEAK_LATE":
+                late_ok = False
+
+            if edge >= 6.0 and score_edge >= 0.45 and agrees_score and late_ok:
+                status = "PLAYABLE"
+                grade = f"🔥 ML EDGE — {pick}"
+            elif edge >= 4.0 and score_edge >= 0.30 and agrees_score:
+                status = "LEAN"
+                grade = f"✅ ML LEAN — {pick}"
+            else:
+                status = "PASS"
+                grade = f"🚫 PASS ML — {pick}"
+
+        row.update({
+            "Pick": pick,
+            "ML Grade": grade,
+            "Status": status,
+            "ML Edge %": round(edge, 1),
+            "Projected Score": f"{away} {aruns:.1f} - {home} {hruns:.1f}",
+            "Away Projected Runs": aruns,
+            "Home Projected Runs": hruns,
+            "Score Pick": score_pick,
+            "Score Edge": round(score_edge, 2),
+            "Away Model %": round(amodel, 1),
+            "Home Model %": round(hmodel, 1),
+
+            "Away Bullpen Availability": away_late["Bullpen Availability"],
+            "Home Bullpen Availability": home_late["Bullpen Availability"],
+            "Away Bullpen Workload": away_late["Bullpen Workload"],
+            "Home Bullpen Workload": home_late["Bullpen Workload"],
+            "Away Defense Score": away_late["Defense Score"],
+            "Home Defense Score": home_late["Defense Score"],
+            "Away Framing Score": away_late["Framing Score"],
+            "Home Framing Score": home_late["Framing Score"],
+            "Away Baserunning Score": away_bsr,
+            "Home Baserunning Score": home_bsr,
+            "Away Late Inning Prevention": away_late["Late Inning Prevention"],
+            "Home Late Inning Prevention": home_late["Late Inning Prevention"],
+            "Away Late Label": away_late["Late Inning Label"],
+            "Home Late Label": home_late["Late Inning Label"],
+            "ML97 Version": ML_97_LATE_EDGE_VERSION,
+        })
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+# Renderer override to put the ML97 columns up front.
+def render_moneyline_edge_tab(board, dates=None):
+    st.markdown("### 💰 Moneyline Edge")
+    st.caption("ML 9.7: final score engine plus bullpen availability/workload, defense, baserunning, framing, and late-inning prevention.")
+    df = ml_build_board(board)
+    if df is None or df.empty:
+        st.info("No ML board yet. Refresh the K board first.")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Games", len(df))
+    c2.metric("Playable", int((df["Status"] == "PLAYABLE").sum()) if "Status" in df else 0)
+    c3.metric("Leans", int((df["Status"] == "LEAN").sum()) if "Status" in df else 0)
+    c4.metric("Pass", int((df["Status"] == "PASS").sum()) if "Status" in df else 0)
+
+    st.markdown('<div class="section-title-pro">Moneyline 9.7 Late-Inning Board</div>', unsafe_allow_html=True)
+    try:
+        render_moneyline_pro_board(df.head(15))
+    except Exception:
+        pass
+
+    front = [c for c in [
+        "Matchup","Pick","Status","ML Grade","Projected Score","Score Pick","Score Edge","ML Edge %",
+        "Away Model %","Home Model %","Game Volatility",
+        "Away SP","Home SP","Away Projected Runs","Home Projected Runs",
+        "Away Bullpen Availability","Home Bullpen Availability",
+        "Away Bullpen Workload","Home Bullpen Workload",
+        "Away Defense Score","Home Defense Score",
+        "Away Baserunning Score","Home Baserunning Score",
+        "Away Framing Score","Home Framing Score",
+        "Away Late Inning Prevention","Home Late Inning Prevention",
+        "Away Late Label","Home Late Label","ML97 Version"
+    ] if c in df.columns]
+    rest = [c for c in df.columns if c not in front]
+    st.dataframe(df[front + rest], use_container_width=True, hide_index=True)
+
+
+# =========================
+# PITCHER FS TRUE PROJECTION 9.7 LAYER
+# Version: PITCHER_FS_97_TRUE_PROJECTION_2026_06_10
+#
+# Pitcher FS only.
+# Adds:
+# 1. Pitch-count efficiency
+# 2. Opponent chase/whiff/contact profile
+# 3. Ground-ball escape / hard-contact ER protection
+# 4. Times-through-order survival
+# 5. Team run support / bullpen support
+#
+# K Upside is NOT modified.
+# =========================
+PITCHER_FS_97_VERSION = "PITCHER_FS_97_TRUE_PROJECTION_2026_06_10"
+
+def _pfs97_num(x, default=0.0):
+    try:
+        if x in (None, "", "—"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _pfs97_cap(x, lo, hi, default=0.0):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return default
+
+def _pfs97_efficiency_score(p):
+    ppa = _pfs97_num(p.get("Pitches/PA") or p.get("Pitches Per PA") or p.get("Pitch/PA"), 3.92)
+    ppi = _pfs97_num(p.get("Pitches/Inning") or p.get("Pitches Per Inning"), 16.5)
+    fstrike = _pfs97_num(p.get("F-Strike%") or p.get("First Strike %"), 61.0)
+    zone = _pfs97_num(p.get("Zone%") or p.get("Zone %"), 42.0)
+
+    score = 50
+    score += _pfs97_cap((3.92 - ppa) * 16, -10, 10, 0)
+    score += _pfs97_cap((16.5 - ppi) * 1.6, -10, 10, 0)
+    score += _pfs97_cap((fstrike - 61) * 0.45, -8, 8, 0)
+    score += _pfs97_cap((zone - 42) * 0.35, -7, 7, 0)
+    return round(_pfs97_cap(score, 20, 85, 50), 1)
+
+def _pfs97_opp_chase_score(p):
+    opp_k = _pfs97_num(p.get("Opp K%") or p.get("opp_k") or p.get("Opponent K%"), 22.0)
+    if opp_k <= 1:
+        opp_k *= 100
+    chase = _pfs97_num(p.get("Opp Chase%") or p.get("Opponent Chase%") or p.get("O-Swing%"), 31.0)
+    zcontact = _pfs97_num(p.get("Opp Zone Contact%") or p.get("Zone Contact%"), 84.0)
+    whiff = _pfs97_num(p.get("Opp Whiff%") or p.get("Whiff%") or p.get("Putaway/Whiff"), 24.0)
+    if whiff <= 1:
+        whiff *= 100
+
+    score = 50
+    score += _pfs97_cap((opp_k - 22) * 1.2, -10, 12, 0)
+    score += _pfs97_cap((chase - 31) * 0.9, -8, 10, 0)
+    score += _pfs97_cap((84 - zcontact) * 0.7, -8, 10, 0)
+    score += _pfs97_cap((whiff - 24) * 0.8, -8, 10, 0)
+    return round(_pfs97_cap(score, 20, 90, 50), 1)
+
+def _pfs97_escape_score(p):
+    gb = _pfs97_num(p.get("GB%") or p.get("Ground Ball %"), 42.0)
+    hard = _pfs97_num(p.get("HardHit%") or p.get("Hard Hit%"), 39.0)
+    barrel = _pfs97_num(p.get("Barrel%") or p.get("Barrel %"), 7.5)
+    dp = _pfs97_num(p.get("DP%") or p.get("Double Play%"), 10.0)
+
+    score = 50
+    score += _pfs97_cap((gb - 42) * 0.55, -8, 10, 0)
+    score -= _pfs97_cap((hard - 39) * 0.55, -10, 10, 0)
+    score -= _pfs97_cap((barrel - 7.5) * 1.1, -10, 10, 0)
+    score += _pfs97_cap((dp - 10) * 0.45, -5, 6, 0)
+    return round(_pfs97_cap(score, 20, 85, 50), 1)
+
+def _pfs97_tto_survival(p):
+    # If exact TTO fields missing, infer from role/starter/IP/BF.
+    tto1 = _pfs97_num(p.get("1st TTO OPS") or p.get("TTO1 OPS"), 0.690)
+    tto2 = _pfs97_num(p.get("2nd TTO OPS") or p.get("TTO2 OPS"), 0.720)
+    tto3 = _pfs97_num(p.get("3rd TTO OPS") or p.get("TTO3 OPS"), 0.780)
+    exp_bf = _pfs97_num(p.get("expected_bf") or p.get("Exp BF"), 22)
+    ip_floor = _pfs97_num(p.get("ip_floor") or p.get("IP Floor"), 5.0)
+    role = _pfs97_num(p.get("role_score") or p.get("Role Score"), 50)
+    starter = _pfs97_num(p.get("starter_score") or p.get("Starter Score"), 50)
+
+    penalty = max(0, (tto3 - tto1) * 100)
+    score = 50
+    score += _pfs97_cap((exp_bf - 22) * 2.2, -8, 12, 0)
+    score += _pfs97_cap((ip_floor - 5.0) * 8.0, -8, 12, 0)
+    score += _pfs97_cap((role - 50) * 0.18, -7, 7, 0)
+    score += _pfs97_cap((starter - 50) * 0.15, -6, 6, 0)
+    score -= _pfs97_cap(penalty * 0.45, 0, 12, 0)
+    return round(_pfs97_cap(score, 20, 88, 50), 1)
+
+def _pfs97_run_support_context(p, all_rows=None):
+    team = str(p.get("team") or p.get("Team") or "").upper()
+    matchup = str(p.get("matchup") or p.get("Matchup") or "")
+    opp_row = None
+    for q in all_rows or []:
+        if not isinstance(q, dict):
+            continue
+        if str(q.get("matchup") or q.get("Matchup") or "") == matchup and str(q.get("team") or q.get("Team") or "").upper() != team:
+            opp_row = q
+            break
+
+    try:
+        a, h = _ml95_split_matchup(matchup)
+        opp_team = h if team == a else a if team == h else ""
+    except Exception:
+        opp_team = ""
+
+    try:
+        team_runs, _ = _to_team_runs(team, p, opp_row or {})
+    except Exception:
+        team_runs = _pfs97_num(p.get("Team Projected Runs") or p.get("Team Implied Runs"), 4.45)
+
+    try:
+        opp_runs, _ = _to_team_runs(opp_team, opp_row or {}, p)
+    except Exception:
+        opp_runs = _pfs97_num(p.get("Opp Projected Runs") or p.get("Opp Implied Runs"), 4.35)
+
+    try:
+        bp = _ml97_late_inning_prevention(team, p)
+        late_score = _pfs97_num(bp.get("Late Inning Prevention"), 50)
+    except Exception:
+        late_score = _pfs97_num(p.get("Late Inning Prevention") or p.get("Bullpen Stability"), 50)
+
+    run_support = 50 + (team_runs - opp_runs) * 10 + (late_score - 50) * 0.18
+    return round(_pfs97_cap(team_runs, 2.2, 7.5, 4.45), 2), round(_pfs97_cap(opp_runs, 2.2, 7.5, 4.35), 2), round(_pfs97_cap(run_support, 20, 85, 50), 1), round(late_score, 1)
+
+_prev_pfs97_build_pitcher_fs_board = build_pitcher_fs_board
+
+def build_pitcher_fs_board(board=None):
+    rows_raw = _fs_pitcher_rows_from_active_board(board) if "_fs_pitcher_rows_from_active_board" in globals() else (board or [])
+    base_df = _prev_pfs97_build_pitcher_fs_board(board)
+    base_rows = []
+    if base_df is not None and not base_df.empty:
+        base_rows = base_df.to_dict("records")
+
+    # Map base rows by pitcher name/matchup
+    base_map = {}
+    for r in base_rows:
+        k = (str(r.get("Pitcher") or "").lower(), str(r.get("Matchup") or ""))
+        base_map[k] = r
+
+    out = []
+    for p in rows_raw:
+        try:
+            name = str(p.get("pitcher") or p.get("Pitcher") or p.get("Player") or "").strip()
+            matchup = str(p.get("matchup") or p.get("Matchup") or "")
+            base = dict(base_map.get((name.lower(), matchup), {}))
+            if not base:
+                try:
+                    base = _pitcher_fs_from_k_context(p)
+                except Exception:
+                    base = {}
+
+            fs = _pfs97_num(base.get("FS Projection"), 18.0)
+            ip = _pfs97_num(base.get("IP Projection"), 5.3)
+            er = _pfs97_num(base.get("ER Projection"), 2.5)
+            win = _pfs97_num(base.get("Win %"), 50.0)
+            qs = _pfs97_num(base.get("QS %"), 18.0)
+
+            eff = _pfs97_efficiency_score(p)
+            chase = _pfs97_opp_chase_score(p)
+            escape = _pfs97_escape_score(p)
+            tto = _pfs97_tto_survival(p)
+            team_runs, opp_runs, support, late = _pfs97_run_support_context(p, rows_raw)
+
+            # Convert scores to small true-projection adjustments.
+            ip_adj = _pfs97_cap((eff - 50) * 0.010 + (tto - 50) * 0.008, -0.35, 0.38, 0)
+            er_adj = _pfs97_cap((50 - escape) * 0.018 + (opp_runs - 4.45) * 0.14, -0.45, 0.55, 0)
+            k_adj = _pfs97_cap((chase - 50) * 0.015, -0.35, 0.40, 0)
+            win_adj = _pfs97_cap((support - 50) * 0.16, -6.0, 7.0, 0)
+            qs_adj = _pfs97_cap((ip_adj * 18) + (tto - 50) * 0.08 + (escape - 50) * 0.05, -8.0, 9.0, 0)
+
+            k_proj = _pfs97_num(base.get("K Projection"), 4.5) + k_adj
+            ip2 = _pfs97_cap(ip + ip_adj, 3.0, 7.2, ip)
+            er2 = _pfs97_cap(er + er_adj, 0.2, 5.8, er)
+            win2 = _pfs97_cap(win + win_adj, 25, 78, win)
+            qs2 = _pfs97_cap(qs + qs_adj, 3, 75, qs)
+
+            matchup_adj = _pfs97_cap((chase - 50) * 0.010 + (escape - 50) * 0.008 + (support - 50) * 0.006, -0.85, 0.85, 0)
+
+            fs2 = (k_proj * 3.0) + (ip2 * 3.0) - (er2 * 3.0) + ((win2 / 100) * 5.0) + ((qs2 / 100) * 5.0) + matchup_adj
+            fs2 = _pfs97_cap(fs2, 4.0, 50.0, fs)
+
+            floor = _pfs97_cap(fs2 - 4.75, 0, fs2, fs2 * 0.72)
+            ceiling = _pfs97_cap(fs2 + 4.75 + k_proj * 0.25, fs2 + 1, 56, fs2 + 6)
+
+            base.update({
+                "Pitcher": name or base.get("Pitcher"),
+                "Matchup": matchup or base.get("Matchup"),
+                "FS Projection": round(fs2, 2),
+                "Floor": round(floor, 2),
+                "Median": round(fs2, 2),
+                "Ceiling": round(ceiling, 2),
+                "Confidence %": _fs_conf(fs2, floor, ceiling),
+                "K Projection": round(k_proj, 2),
+                "IP Projection": round(ip2, 2),
+                "ER Projection": round(er2, 2),
+                "Win %": round(win2, 1),
+                "QS %": round(qs2, 1),
+                "Team Projected Runs": team_runs,
+                "Opp Projected Runs": opp_runs,
+                "Pitch Efficiency Score": eff,
+                "Opponent Chase Score": chase,
+                "GB Escape Score": escape,
+                "TTO Survival Score": tto,
+                "Run Support Score": support,
+                "Late Support Score": late,
+                "Pitcher FS 97 Adj": round(fs2 - fs, 2),
+                "Pitcher FS 97 Version": PITCHER_FS_97_VERSION,
+            })
+            out.append(base)
+        except Exception:
+            continue
+    return pd.DataFrame(out)
+
+# Renderer override to surface the new true-projection columns.
+def render_pitcher_fs_tab(board=None):
+    st.subheader("Pitcher Fantasy — Self Projected")
+    st.caption("Pitcher FS 9.7: adds pitch efficiency, opponent chase/contact, GB escape, TTO survival, and run-support context. K Upside is untouched.")
+    df = build_pitcher_fs_board(board)
+    if df is None or df.empty:
+        st.info("No Pitcher FS rows yet. Refresh K PROJ / UPSIDE first.")
+        return
+    df = df.sort_values("FS Projection", ascending=False)
+    front = [c for c in [
+        "Pitcher","Matchup","FS Projection","Floor","Median","Ceiling","Confidence %",
+        "K Projection","IP Projection","ER Projection","Win %","QS %",
+        "Team Projected Runs","Opp Projected Runs",
+        "Pitch Efficiency Score","Opponent Chase Score","GB Escape Score","TTO Survival Score",
+        "Run Support Score","Late Support Score","Pitcher FS 97 Adj","Pitcher FS 97 Version"
+    ] if c in df.columns]
+    rest = [c for c in df.columns if c not in front]
+    st.dataframe(df[front + rest], use_container_width=True, hide_index=True)
+    try:
+        _render_fs_cards(df, kind="pitcher")
+    except Exception:
+        pass
+
+
+# =========================
+# K UPSIDE SAFETY + LEARNING FINAL LAYER
+# Version: K_SAFETY_LEARNING_97_2026_06_10
+#
+# Safe K Upside add-on only:
+# - Does NOT rewrite core K projection math.
+# - Adds Early Exit Risk and 2-Strike Conversion columns.
+# - Adds learning audit columns for situation/bias/play-quality tracking.
+# =========================
+K_SAFETY_LEARNING_97_VERSION = "K_SAFETY_LEARNING_97_2026_06_10"
+
+def _ks97_num(x, default=0.0):
+    try:
+        if x in (None, "", "—"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _ks97_cap(x, lo, hi, default=0.0):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return default
+
+def _ks97_projection(p):
+    try:
+        return _ks97_num(kproj_upside_projection(p), None)
+    except Exception:
+        return _ks97_num(p.get("K PROJ") or p.get("Median") or p.get("projection"), 0)
+
+def _ks97_early_exit_risk(p):
+    bb = _ks97_num(p.get("BB%") or p.get("Walk%") or p.get("Pitcher BB%"), 8.0)
+    pitch_trend = _ks97_num(p.get("Pitch Count Trend") or p.get("Pitch Count Δ") or p.get("Pitch Trend"), 0.0)
+    l3_ip = _ks97_num(p.get("Last 3 IP") or p.get("L3 IP") or p.get("Recent IP"), 5.2)
+    hook = _ks97_num(p.get("Manager Hook") or p.get("Team Hook Score") or p.get("Hook Score"), 50)
+    tto = _ks97_num(p.get("TTO Survival Score") or p.get("TTTO Score"), 50)
+    eff = _ks97_num(p.get("Pitch Efficiency Score"), 50)
+    opp_obp = _ks97_num(p.get("Opp OBP") or p.get("Opponent OBP"), 0.320)
+    exp_bf = _ks97_num(p.get("expected_bf") or p.get("Exp BF"), 22)
+    ip_floor = _ks97_num(p.get("ip_floor") or p.get("IP Floor"), 5.0)
+
+    risk = 35
+    risk += _ks97_cap((bb - 8.0) * 2.1, -8, 18, 0)
+    risk += _ks97_cap((-pitch_trend) * 3.0, -8, 12, 0)  # negative trend = more risk
+    risk += _ks97_cap((5.2 - l3_ip) * 9.0, -8, 20, 0)
+    risk += _ks97_cap((50 - hook) * 0.35, -10, 14, 0)
+    risk += _ks97_cap((50 - tto) * 0.28, -8, 12, 0)
+    risk += _ks97_cap((50 - eff) * 0.30, -8, 12, 0)
+    risk += _ks97_cap((opp_obp - 0.320) * 160, -8, 14, 0)
+    risk += _ks97_cap((22 - exp_bf) * 1.8, -6, 10, 0)
+    risk += _ks97_cap((5.0 - ip_floor) * 8.0, -6, 12, 0)
+
+    risk = _ks97_cap(risk, 0, 100, 35)
+    if risk >= 76:
+        label = "RED_EXIT"
+        tax = -0.08
+    elif risk >= 51:
+        label = "ORANGE_EXIT"
+        tax = -0.05
+    elif risk >= 26:
+        label = "YELLOW_EXIT"
+        tax = -0.02
+    else:
+        label = "GREEN_EXIT"
+        tax = 0.00
+    return round(risk, 1), label, tax
+
+def _ks97_two_strike_conversion(p):
+    csw = _ks97_num(p.get("CSW%") or p.get("statcast_csw") or p.get("CSW"), 28.0)
+    if csw <= 1:
+        csw *= 100
+    called = _ks97_num(p.get("Called Strike%") or p.get("Called Strike %"), 16.0)
+    whiff = _ks97_num(p.get("Whiff%") or p.get("Putaway/Whiff") or p.get("statcast_whiff"), 24.0)
+    if whiff <= 1:
+        whiff *= 100
+    putaway = _ks97_num(p.get("Putaway%") or p.get("PutAway%"), 19.0)
+    if putaway <= 1:
+        putaway *= 100
+
+    score = 50
+    score += _ks97_cap((csw - 28) * 1.0, -10, 12, 0)
+    score += _ks97_cap((called - 16) * 0.65, -6, 7, 0)
+    score += _ks97_cap((whiff - 24) * 0.85, -9, 10, 0)
+    score += _ks97_cap((putaway - 19) * 0.90, -9, 11, 0)
+    score = _ks97_cap(score, 20, 90, 50)
+
+    if score >= 65:
+        label = "ELITE_FINISHER"
+        nudge = 0.25
+    elif score >= 58:
+        label = "GOOD_FINISHER"
+        nudge = 0.12
+    elif score <= 38:
+        label = "POOR_FINISHER"
+        nudge = -0.25
+    elif score <= 45:
+        label = "WEAK_FINISHER"
+        nudge = -0.12
+    else:
+        label = "NEUTRAL_FINISHER"
+        nudge = 0.00
+    return round(score, 1), label, round(nudge, 2)
+
+def _ks97_situation_bucket(p, risk_label, conv_label):
+    home_road = "HOME" if str(p.get("Home/Away") or p.get("home_away") or "").upper().startswith("H") else "ROAD_OR_NEUTRAL"
+    opp_k = _ks97_num(p.get("Opp K%") or p.get("opp_k"), 22)
+    if opp_k <= 1:
+        opp_k *= 100
+    line = _ks97_num(p.get("Line") or p.get("UD/Line") or p.get("line"), 0)
+    proj = _ks97_projection(p)
+    edge = proj - line if line else 0
+    edge_bucket = "BIG_EDGE" if edge >= 1.25 else "MID_EDGE" if edge >= 0.65 else "SMALL_EDGE"
+    k_bucket = "HIGH_OPP_K" if opp_k >= 24 else "LOW_OPP_K" if opp_k <= 20 else "AVG_OPP_K"
+    return f"{risk_label}|{conv_label}|{edge_bucket}|{k_bucket}|{home_road}"
+
+def _ks97_learning_note(p, risk, risk_label, conv, conv_label):
+    proj = _ks97_projection(p)
+    line = _ks97_num(p.get("Line") or p.get("UD/Line") or p.get("line"), 0)
+    edge = proj - line if line else 0
+    notes = []
+    if risk >= 65 and edge > 0:
+        notes.append("TRACK_OVER_WITH_EXIT_RISK")
+    if conv <= 42 and edge > 0:
+        notes.append("TRACK_OVER_WITH_WEAK_FINISH")
+    if abs(edge) < 0.55:
+        notes.append("TRACK_TIGHT_LINE")
+    if risk <= 30 and conv >= 58:
+        notes.append("GREEN_VOLUME_FINISH")
+    return " | ".join(notes) if notes else "NORMAL_TRACK"
+
+# Wrap K table builder only to show added columns.
+_prev_ks97_build_kproj_table = build_kproj_table
+
+def build_kproj_table(board):
+    df = _prev_ks97_build_kproj_table(board)
+    try:
+        extra = []
+        for p in board or []:
+            risk, rlabel, tax = _ks97_early_exit_risk(p)
+            conv, clabel, nudge = _ks97_two_strike_conversion(p)
+            proj = _ks97_projection(p)
+            line = _ks97_num(p.get("Line") or p.get("UD/Line") or p.get("line"), 0)
+            edge = round(proj - line, 2) if line else 0.0
+            bucket = _ks97_situation_bucket(p, rlabel, clabel)
+            note = _ks97_learning_note(p, risk, rlabel, conv, clabel)
+            extra.append({
+                "Early Exit Risk": risk,
+                "Exit Risk Label": rlabel,
+                "Exit Risk Tax": tax,
+                "2K Conversion": conv,
+                "2K Label": clabel,
+                "2K Nudge": nudge,
+                "Learning Situation Bucket": bucket,
+                "Projection Bias Track": round(proj, 2),
+                "Line Edge Track": edge,
+                "Learning Note": note,
+                "K Safety Learning Version": K_SAFETY_LEARNING_97_VERSION,
+            })
+        ex = pd.DataFrame(extra)
+        if len(ex) == len(df):
+            df = pd.concat([df.reset_index(drop=True), ex.reset_index(drop=True)], axis=1)
+    except Exception:
+        pass
+    return df
+
+# Wrap decision safely. Projection stays mostly untouched; only marginal official confidence gets protected.
+_prev_ks97_kproj_decision = kproj_decision
+
+def kproj_decision(p):
+    d = dict(_prev_ks97_kproj_decision(p) or {})
+    try:
+        risk, rlabel, tax = _ks97_early_exit_risk(p)
+        conv, clabel, nudge = _ks97_two_strike_conversion(p)
+
+        side = str(d.get("lean_side") or d.get("decision") or d.get("Model Lean") or "").upper()
+        conf = _ks97_num(d.get("confidence") or d.get("Confidence %"), 0)
+        if conf > 1:
+            conf = conf / 100.0
+
+        warnings = []
+        if "OVER" in side and risk >= 65:
+            warnings.append("EARLY_EXIT_OVER_RISK")
+        if "OVER" in side and conv <= 42:
+            warnings.append("WEAK_2K_CONVERSION")
+        if "UNDER" in side and risk <= 25 and conv >= 60:
+            warnings.append("UNDER_RISK_STRONG_VOLUME_FINISH")
+
+        d["early_exit_risk"] = risk
+        d["exit_risk_label"] = rlabel
+        d["two_strike_conversion"] = conv
+        d["two_k_label"] = clabel
+        d["two_k_nudge"] = nudge
+        d["learning_situation_bucket"] = _ks97_situation_bucket(p, rlabel, clabel)
+        d["k_safety_learning_warning"] = " | ".join(warnings) if warnings else "NONE"
+
+        # Safe gating only: marginal official plays get moved to monitor/pass;
+        # no rewrite of the main projection engine.
+        if warnings and conf < 0.64:
+            d["decision"] = "PASS"
+            d["tier"] = "PASS_K_SAFETY_LEARNING"
+            d["confidence_note"] = (str(d.get("confidence_note") or "") + " | K safety learning gate").strip()
+    except Exception:
+        pass
+    return d
+
+# Optional learning audit helper for saved/graded history if dataframe exists.
+def k_learning_audit_from_history(df):
+    """
+    Safe audit helper. It does not train live picks.
+    If given graded rows with Projection/Actual/Decision/etc., it returns bias + situation summaries.
+    """
+    try:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        d = df.copy()
+        proj_col = next((c for c in ["Projection","K PROJ","Projection Bias Track","Median"] if c in d.columns), None)
+        actual_col = next((c for c in ["Actual","Actual K","Actual Ks","Result K"] if c in d.columns), None)
+        bucket_col = next((c for c in ["Learning Situation Bucket","Situation Bucket"] if c in d.columns), None)
+        if not proj_col or not actual_col:
+            return pd.DataFrame()
+        d["Projection Error"] = pd.to_numeric(d[proj_col], errors="coerce") - pd.to_numeric(d[actual_col], errors="coerce")
+        if bucket_col:
+            out = d.groupby(bucket_col).agg(
+                Rows=("Projection Error","count"),
+                Avg_Bias=("Projection Error","mean"),
+                Abs_Error=("Projection Error", lambda s: s.abs().mean())
+            ).reset_index()
+            return out.sort_values("Rows", ascending=False)
+        return pd.DataFrame({
+            "Rows":[len(d)],
+            "Avg_Bias":[round(d["Projection Error"].mean(), 3)],
+            "Abs_Error":[round(d["Projection Error"].abs().mean(), 3)]
+        })
+    except Exception:
+        return pd.DataFrame()
+
+
+# =========================
+# READ-ONLY BASEBALL IQ TAB
+# Version: BASEBALL_IQ_READ_ONLY_2026_06_10
+#
+# Informational only:
+# - Does NOT alter K Upside projections.
+# - Does NOT alter K Upside decisions.
+# - Does NOT alter Pitcher FS, Batter FS, or Moneyline projections.
+# - Creates one Baseball IQ tab for context, risk, and learning review.
+# =========================
+BASEBALL_IQ_VERSION = "BASEBALL_IQ_READ_ONLY_2026_06_10"
+
+def _iq_num(x, default=0.0):
+    try:
+        if x in (None, "", "—"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _iq_cap(x, lo, hi, default=0.0):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return default
+
+def _iq_label(score):
+    score = _iq_num(score, 50)
+    if score >= 78:
+        return "ELITE_IQ"
+    if score >= 65:
+        return "GOOD_IQ"
+    if score >= 50:
+        return "NEUTRAL_IQ"
+    if score >= 38:
+        return "RISKY_IQ"
+    return "FADE_IQ"
+
+def _baseball_iq_for_k_row(p):
+    try:
+        proj = _iq_num(_ks97_projection(p) if "_ks97_projection" in globals() else p.get("projection"), 0)
+    except Exception:
+        proj = _iq_num(p.get("projection") or p.get("K PROJ"), 0)
+    line = _iq_num(p.get("line") or p.get("Line") or p.get("UD/Line"), 0)
+    edge = proj - line if line else 0
+
+    risk, rlabel, _ = _ks97_early_exit_risk(p) if "_ks97_early_exit_risk" in globals() else (50, "UNK", 0)
+    conv, clabel, _ = _ks97_two_strike_conversion(p) if "_ks97_two_strike_conversion" in globals() else (50, "UNK", 0)
+
+    opp_k = _iq_num(p.get("opp_k") or p.get("Opp K%") or p.get("Opponent K%"), 22)
+    if opp_k <= 1:
+        opp_k *= 100
+    bf = _iq_num(p.get("expected_bf") or p.get("Exp BF"), 22)
+    role = _iq_num(p.get("role_score") or p.get("Role Score"), 50)
+    starter = _iq_num(p.get("starter_score") or p.get("Starter Score"), 50)
+    leash = _iq_num(p.get("leash_score") or p.get("Leash Score"), 50)
+
+    score = 50
+    score += _iq_cap(edge * 7, -10, 14, 0)
+    score += _iq_cap((opp_k - 22) * 1.0, -8, 10, 0)
+    score += _iq_cap((bf - 22) * 1.8, -6, 10, 0)
+    score += _iq_cap((role - 50) * 0.10, -5, 5, 0)
+    score += _iq_cap((starter - 50) * 0.10, -5, 5, 0)
+    score += _iq_cap((leash - 50) * 0.10, -5, 5, 0)
+    score -= _iq_cap((risk - 45) * 0.25, -8, 12, 0)
+    score += _iq_cap((conv - 50) * 0.22, -7, 8, 0)
+    score = _iq_cap(score, 10, 95, 50)
+
+    reasons = []
+    if edge >= 1.0: reasons.append("Strong line edge")
+    if opp_k >= 24: reasons.append("Opponent K-friendly")
+    if bf >= 24: reasons.append("Strong BF/volume")
+    if risk >= 65: reasons.append("Early-exit risk")
+    if conv >= 60: reasons.append("Strong 2K finishing")
+    if conv <= 42: reasons.append("Weak 2K finishing")
+    if not reasons: reasons.append("Neutral baseball context")
+
+    return {
+        "Module": "K Upside",
+        "Player": p.get("pitcher") or p.get("Pitcher") or p.get("Player"),
+        "Matchup": p.get("matchup") or p.get("Matchup"),
+        "Projection": round(proj, 2),
+        "Line": line,
+        "Model Pick": p.get("pick_side") or p.get("Decision") or p.get("bet_action"),
+        "Baseball IQ Score": round(score, 1),
+        "IQ Label": _iq_label(score),
+        "Main Reasons": " | ".join(reasons),
+        "Read Only": "YES",
+    }
+
+def _baseball_iq_for_pitcher_fs_row(r):
+    score = 50
+    score += _iq_cap((_iq_num(r.get("Pitch Efficiency Score"), 50) - 50) * 0.25, -8, 8, 0)
+    score += _iq_cap((_iq_num(r.get("Opponent Chase Score"), 50) - 50) * 0.25, -8, 8, 0)
+    score += _iq_cap((_iq_num(r.get("GB Escape Score"), 50) - 50) * 0.18, -6, 6, 0)
+    score += _iq_cap((_iq_num(r.get("TTO Survival Score"), 50) - 50) * 0.20, -7, 7, 0)
+    score += _iq_cap((_iq_num(r.get("Run Support Score"), 50) - 50) * 0.16, -6, 6, 0)
+    score = _iq_cap(score, 10, 95, 50)
+    return {
+        "Module": "Pitcher FS",
+        "Player": r.get("Pitcher"),
+        "Matchup": r.get("Matchup"),
+        "Projection": r.get("FS Projection"),
+        "Line": "",
+        "Model Pick": "",
+        "Baseball IQ Score": round(score, 1),
+        "IQ Label": _iq_label(score),
+        "Main Reasons": "Efficiency/Chase/Escape/TTO/Run support context",
+        "Read Only": "YES",
+    }
+
+def _baseball_iq_for_batter_fs_row(r):
+    score = 50
+    score += _iq_cap((_iq_num(r.get("Pitch-Type Matchup Score"), 50) - 50) * 0.25, -8, 8, 0)
+    score += _iq_cap((_iq_num(r.get("Recent Form Score"), 50) - 50) * 0.18, -6, 6, 0)
+    score += _iq_cap((_iq_num(r.get("Bullpen Exposure Score"), 50) - 50) * 0.18, -6, 6, 0)
+    score += _iq_cap((_iq_num(r.get("Park Hit/HR Score"), 50) - 50) * 0.15, -5, 5, 0)
+    score += _iq_cap((_iq_num(r.get("Team Run Env"), 4.45) - 4.45) * 6, -6, 8, 0)
+    if str(r.get("Lineup Weight", "")).upper().startswith("CONFIRMED"):
+        score += 4
+    if str(r.get("Pitcher Hand", "UNK")).upper() == "UNK":
+        score -= 5
+    score = _iq_cap(score, 10, 95, 50)
+    return {
+        "Module": "Batter FS",
+        "Player": r.get("Player"),
+        "Matchup": r.get("Matchup"),
+        "Projection": r.get("FS Projection"),
+        "Line": "",
+        "Model Pick": "",
+        "Baseball IQ Score": round(score, 1),
+        "IQ Label": _iq_label(score),
+        "Main Reasons": "Pitch-type/Form/Bullpen/Park/Run environment context",
+        "Read Only": "YES",
+    }
+
+def _baseball_iq_for_ml_row(r):
+    away_late = _iq_num(r.get("Away Late Inning Prevention"), 50)
+    home_late = _iq_num(r.get("Home Late Inning Prevention"), 50)
+    edge = _iq_num(r.get("Score Edge"), 0)
+    volatility = str(r.get("Game Volatility") or "").upper()
+    pick = str(r.get("Pick") or "")
+    score = 50
+    score += _iq_cap(edge * 12, 0, 18, 0)
+    if pick and str(r.get("Score Pick") or "") == pick:
+        score += 8
+    if volatility == "LOW":
+        score += 5
+    elif volatility == "HIGH":
+        score -= 8
+    if pick:
+        if pick in str(r.get("Matchup", "")).split("@")[0]:
+            score += _iq_cap((away_late - 50) * 0.18, -6, 7, 0)
+        else:
+            score += _iq_cap((home_late - 50) * 0.18, -6, 7, 0)
+    score = _iq_cap(score, 10, 95, 50)
+    return {
+        "Module": "Moneyline",
+        "Player": r.get("Pick"),
+        "Matchup": r.get("Matchup"),
+        "Projection": r.get("Projected Score"),
+        "Line": "",
+        "Model Pick": r.get("Pick"),
+        "Baseball IQ Score": round(score, 1),
+        "IQ Label": _iq_label(score),
+        "Main Reasons": "Score edge/volatility/late-inning context",
+        "Read Only": "YES",
+    }
+
+def build_baseball_iq_board(board):
+    rows = []
+
+    for p in board or []:
+        try:
+            rows.append(_baseball_iq_for_k_row(p))
+        except Exception:
+            pass
+
+    try:
+        pfs = build_pitcher_fs_board(board)
+        if pfs is not None and not pfs.empty:
+            for _, r in pfs.head(80).iterrows():
+                rows.append(_baseball_iq_for_pitcher_fs_row(r.to_dict()))
+    except Exception:
+        pass
+
+    try:
+        bfs = build_batter_fs_board()
+        if bfs is not None and not bfs.empty:
+            for _, r in bfs.head(120).iterrows():
+                rows.append(_baseball_iq_for_batter_fs_row(r.to_dict()))
+    except Exception:
+        pass
+
+    try:
+        ml = ml_build_board(board)
+        if ml is not None and not ml.empty:
+            for _, r in ml.iterrows():
+                rows.append(_baseball_iq_for_ml_row(r.to_dict()))
+    except Exception:
+        pass
+
+    return pd.DataFrame(rows)
+
+def render_baseball_iq_tab(board):
+    st.markdown("### 🧠 Baseball IQ")
+    st.caption("Read-only context layer. It does not change projections, picks, K Upside, FS, or Moneyline outputs.")
+    df = build_baseball_iq_board(board)
+    if df is None or df.empty:
+        st.info("No Baseball IQ rows yet. Refresh the board first.")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("IQ Rows", len(df))
+    c2.metric("Elite IQ", int((df["IQ Label"] == "ELITE_IQ").sum()))
+    c3.metric("Good IQ", int((df["IQ Label"] == "GOOD_IQ").sum()))
+    c4.metric("Risk/Fade", int(df["IQ Label"].isin(["RISKY_IQ", "FADE_IQ"]).sum()))
+
+    st.markdown("#### Smartest Spots")
+    smart = df.sort_values("Baseball IQ Score", ascending=False).head(20)
+    st.dataframe(smart, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Riskiest Spots")
+    risky = df.sort_values("Baseball IQ Score", ascending=True).head(20)
+    st.dataframe(risky, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Full IQ Board")
+    st.dataframe(df.sort_values(["Module", "Baseball IQ Score"], ascending=[True, False]), use_container_width=True, hide_index=True)
+
+    st.info("This tab is informational only. Use it to learn context and miss reasons before allowing any future influence.")
+
+
+# =========================
+# FINAL FS TRUE OUTCOME MICRO-LAYERS
+# Version: FS_FINAL_MICRO_98_2026_06_10
+#
+# Adds to Pitcher FS only:
+# - Team defense behind pitcher
+# - Bullpen inherited-run support
+# - Umpire run environment
+#
+# Adds to Batter FS only:
+# - Batter-specific park factors
+# - Barrel-to-HR conversion
+# - Team stack correlation
+# - Expected lineup protection
+#
+# Does NOT touch K Upside, K picks, Moneyline, or Baseball IQ logic.
+# =========================
+FS_FINAL_MICRO_98_VERSION = "FS_FINAL_MICRO_98_2026_06_10"
+
+def _fs98_num(x, default=0.0):
+    try:
+        if x in (None, "", "—"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _fs98_cap(x, lo, hi, default=0.0):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return default
+
+def _fs98_pitcher_defense_support(team, p=None):
+    p = p if isinstance(p, dict) else {}
+    # Uses explicit fields if available, else neutral/ML97 defensive proxy.
+    drs = _fs98_num(p.get("DRS") or p.get("Defensive Runs Saved"), None)
+    oaa = _fs98_num(p.get("OAA") or p.get("Outs Above Average"), None)
+    deff = _fs98_num(p.get("Defensive Efficiency") or p.get("Def Eff"), None)
+
+    if drs is None and oaa is None and deff is None:
+        try:
+            return _ml97_defense_score(team, p)
+        except Exception:
+            return _fs98_num(p.get("Defense Score"), 50)
+
+    score = 50
+    if drs is not None:
+        score += _fs98_cap(drs * 0.32, -10, 10, 0)
+    if oaa is not None:
+        score += _fs98_cap(oaa * 0.42, -10, 10, 0)
+    if deff is not None:
+        # defensive efficiency often .680-.720
+        score += _fs98_cap((deff - 0.695) * 150, -8, 8, 0)
+    return round(_fs98_cap(score, 25, 85, 50), 1)
+
+def _fs98_inherited_runner_support(team, p=None):
+    p = p if isinstance(p, dict) else {}
+    strand = _fs98_num(p.get("Bullpen Strand%") or p.get("Bullpen Strand %") or p.get("LOB%"), None)
+    inherited_scored = _fs98_num(p.get("Inherited Runner Scored%") or p.get("IRS%"), None)
+    bullpen_score = _fs98_num(p.get("Bullpen Score") or p.get("Bullpen"), 50)
+    late = _fs98_num(p.get("Late Inning Prevention"), None)
+    if late is None:
+        try:
+            late = _ml97_late_inning_prevention(team, p).get("Late Inning Prevention", 50)
+        except Exception:
+            late = 50
+
+    score = 50
+    if strand is not None:
+        if strand <= 1: strand *= 100
+        score += _fs98_cap((strand - 72) * 0.7, -10, 10, 0)
+    if inherited_scored is not None:
+        if inherited_scored <= 1: inherited_scored *= 100
+        score -= _fs98_cap((inherited_scored - 32) * 0.7, -10, 10, 0)
+    score += _fs98_cap((bullpen_score - 50) * 0.18, -7, 7, 0)
+    score += _fs98_cap((late - 50) * 0.16, -7, 7, 0)
+    return round(_fs98_cap(score, 25, 85, 50), 1)
+
+def _fs98_umpire_run_environment(p=None):
+    p = p if isinstance(p, dict) else {}
+    ump_strike = _fs98_num(p.get("Umpire Strike%") or p.get("Ump Strike%"), None)
+    ump_walk = _fs98_num(p.get("Umpire Walk%") or p.get("Ump Walk%"), None)
+    ump_run = _fs98_num(p.get("Umpire Run Factor") or p.get("Ump Run Factor"), None)
+    ump_nudge = _fs98_num(p.get("Umpire Micro K Nudge") or p.get("Umpire Micro Label"), 0)
+
+    score = 50
+    if ump_strike is not None:
+        score += _fs98_cap((ump_strike - 63) * 0.8, -8, 8, 0)
+    if ump_walk is not None:
+        score -= _fs98_cap((ump_walk - 8) * 1.0, -6, 6, 0)
+    if ump_run is not None:
+        score -= _fs98_cap((ump_run - 1.0) * 25, -8, 8, 0)
+    score += _fs98_cap(ump_nudge * 12, -6, 6, 0)
+    return round(_fs98_cap(score, 30, 75, 50), 1)
+
+_prev_fs98_build_pitcher_fs_board = build_pitcher_fs_board
+
+def build_pitcher_fs_board(board=None):
+    base_df = _prev_fs98_build_pitcher_fs_board(board)
+    if base_df is None or base_df.empty:
+        return base_df
+
+    rows_raw = _fs_pitcher_rows_from_active_board(board) if "_fs_pitcher_rows_from_active_board" in globals() else (board or [])
+    raw_map = {}
+    for p in rows_raw:
+        if isinstance(p, dict):
+            raw_map[(str(p.get("pitcher") or p.get("Pitcher") or "").lower(), str(p.get("matchup") or p.get("Matchup") or ""))] = p
+
+    out = []
+    for _, r in base_df.iterrows():
+        row = r.to_dict()
+        key = (str(row.get("Pitcher") or "").lower(), str(row.get("Matchup") or ""))
+        p = raw_map.get(key, {})
+        team = str(p.get("team") or p.get("Team") or "").upper()
+
+        defense = _fs98_pitcher_defense_support(team, p)
+        inherited = _fs98_inherited_runner_support(team, p)
+        umpire = _fs98_umpire_run_environment(p)
+
+        fs = _fs98_num(row.get("FS Projection"), 18)
+        er = _fs98_num(row.get("ER Projection"), 2.5)
+        ip = _fs98_num(row.get("IP Projection"), 5.3)
+        qs = _fs98_num(row.get("QS %"), 18)
+        win = _fs98_num(row.get("Win %"), 50)
+
+        # Small, safe micro-adjustments only.
+        er_adj = _fs98_cap((50 - defense) * 0.006 + (50 - inherited) * 0.005 + (50 - umpire) * 0.004, -0.18, 0.22, 0)
+        ip_adj = _fs98_cap((defense - 50) * 0.004 + (umpire - 50) * 0.003, -0.12, 0.14, 0)
+        qs_adj = _fs98_cap((defense - 50) * 0.05 + (inherited - 50) * 0.04 + (umpire - 50) * 0.04, -3.5, 4.0, 0)
+        win_adj = _fs98_cap((inherited - 50) * 0.035 + (defense - 50) * 0.025, -2.5, 3.0, 0)
+
+        er2 = _fs98_cap(er + er_adj, 0.2, 5.8, er)
+        ip2 = _fs98_cap(ip + ip_adj, 3.0, 7.2, ip)
+        qs2 = _fs98_cap(qs + qs_adj, 3, 78, qs)
+        win2 = _fs98_cap(win + win_adj, 25, 80, win)
+
+        k_proj = _fs98_num(row.get("K Projection"), 4.5)
+        matchup_adj = _fs98_num(row.get("Matchup Adj"), 0)
+        fs2 = (k_proj * 3.0) + (ip2 * 3.0) - (er2 * 3.0) + ((win2 / 100) * 5.0) + ((qs2 / 100) * 5.0) + matchup_adj
+        fs2 = _fs98_cap(fs2, 4, 52, fs)
+        floor = _fs98_cap(fs2 - 4.75, 0, fs2, fs2 * 0.72)
+        ceiling = _fs98_cap(fs2 + 4.75 + k_proj * 0.25, fs2 + 1, 56, fs2 + 6)
+
+        row.update({
+            "FS Projection": round(fs2, 2),
+            "Floor": round(floor, 2),
+            "Median": round(fs2, 2),
+            "Ceiling": round(ceiling, 2),
+            "Confidence %": _fs_conf(fs2, floor, ceiling),
+            "IP Projection": round(ip2, 2),
+            "ER Projection": round(er2, 2),
+            "Win %": round(win2, 1),
+            "QS %": round(qs2, 1),
+            "Defense Support Score": defense,
+            "Bullpen Inherited Support": inherited,
+            "Umpire Run Environment": umpire,
+            "Pitcher FS Final Adj": round(fs2 - fs, 2),
+            "FS Final Micro Version": FS_FINAL_MICRO_98_VERSION,
+        })
+        out.append(row)
+
+    return pd.DataFrame(out)
+
+# ---------- Batter FS final micro layers ----------
+
+def _fs98_batter_park_factor(ctx):
+    ctx = ctx if isinstance(ctx, dict) else {}
+    bats = str(ctx.get("Bat Side") or ctx.get("batSide") or ctx.get("Bats") or "").upper()
+    base_park = _fs98_num(ctx.get("Park Factor") or ctx.get("park_factor"), 1.0)
+    hr_pf = None
+    hit_pf = None
+    if bats.startswith("L"):
+        hr_pf = _fs98_num(ctx.get("LHB HR Park Factor") or ctx.get("LHB HR PF"), None)
+        hit_pf = _fs98_num(ctx.get("LHB Hit Park Factor") or ctx.get("LHB Hit PF"), None)
+    elif bats.startswith("R"):
+        hr_pf = _fs98_num(ctx.get("RHB HR Park Factor") or ctx.get("RHB HR PF"), None)
+        hit_pf = _fs98_num(ctx.get("RHB Hit Park Factor") or ctx.get("RHB Hit PF"), None)
+    if hr_pf is None:
+        hr_pf = _fs98_num(ctx.get("HR Park Factor") or ctx.get("Park HR Factor"), base_park)
+    if hit_pf is None:
+        hit_pf = _fs98_num(ctx.get("Hit Park Factor") or ctx.get("Park Hit Factor"), base_park)
+    score = 50 + (hr_pf - 1.0) * 45 + (hit_pf - 1.0) * 30
+    return round(_fs98_cap(score, 25, 85, 50), 1)
+
+def _fs98_barrel_hr_conversion(ctx):
+    ctx = ctx if isinstance(ctx, dict) else {}
+    barrel = _fs98_num(ctx.get("Barrel%") or ctx.get("Barrel %"), 7.0)
+    la = _fs98_num(ctx.get("Launch Angle") or ctx.get("LA"), 12.0)
+    pull = _fs98_num(ctx.get("Pull%") or ctx.get("Pull %"), 40.0)
+    hr_pf = _fs98_num(ctx.get("HR Park Factor") or ctx.get("Park HR Factor"), 1.0)
+    iso = _fs98_num(ctx.get("ISO"), 0.150)
+
+    score = 50
+    score += _fs98_cap((barrel - 7) * 1.4, -10, 14, 0)
+    # ideal HR launch range roughly 14-24 degrees
+    score += _fs98_cap((10 - abs(19 - la)) * 0.55, -6, 6, 0)
+    score += _fs98_cap((pull - 40) * 0.35, -6, 7, 0)
+    score += _fs98_cap((hr_pf - 1.0) * 35, -8, 9, 0)
+    score += _fs98_cap((iso - 0.150) * 65, -8, 10, 0)
+    return round(_fs98_cap(score, 20, 90, 50), 1)
+
+def _fs98_stack_correlation(ctx):
+    ctx = ctx if isinstance(ctx, dict) else {}
+    team_runs = _fs98_num(ctx.get("Team Run Env") or ctx.get("Team Implied Runs"), 4.45)
+    lineup_strength = _fs98_num(ctx.get("Lineup Strength") or ctx.get("Top6 Lineup Score") or ctx.get("Moneyball Score"), 50)
+    recent_team = _fs98_num(ctx.get("Recent Team Form") or ctx.get("Team Recent Runs"), 4.45)
+
+    score = 50
+    score += _fs98_cap((team_runs - 4.45) * 8, -10, 14, 0)
+    score += _fs98_cap((lineup_strength - 50) * 0.22, -8, 10, 0)
+    score += _fs98_cap((recent_team - 4.45) * 3.5, -6, 7, 0)
+    return round(_fs98_cap(score, 25, 90, 50), 1)
+
+def _fs98_lineup_protection(ctx):
+    ctx = ctx if isinstance(ctx, dict) else {}
+    slot = int(_fs98_cap(ctx.get("Lineup Slot"), 1, 9, 4))
+    ahead_obp = _fs98_num(ctx.get("Ahead OBP") or ctx.get("OBP Ahead"), 0.320)
+    behind_slg = _fs98_num(ctx.get("Behind SLG") or ctx.get("SLG Behind"), 0.400)
+    protection_ops = _fs98_num(ctx.get("Protection OPS") or ctx.get("Lineup Protection OPS"), 0.720)
+
+    score = 50
+    if slot in [2,3,4,5]:
+        score += 5
+    elif slot in [8,9]:
+        score -= 6
+    score += _fs98_cap((ahead_obp - 0.320) * 90, -7, 8, 0)
+    score += _fs98_cap((behind_slg - 0.400) * 55, -7, 8, 0)
+    score += _fs98_cap((protection_ops - 0.720) * 45, -7, 8, 0)
+    return round(_fs98_cap(score, 25, 90, 50), 1)
+
+_prev_fs98_batter_from_context = _batter_fs_from_context
+
+def _batter_fs_from_context(ctx):
+    row = _prev_fs98_batter_from_context(ctx)
+    try:
+        merged = {}
+        if isinstance(ctx, dict):
+            merged.update(ctx)
+        if isinstance(row, dict):
+            merged.update(row)
+
+        fs = _fs98_num(row.get("FS Projection"), 7.0)
+        conf = _fs98_num(row.get("Confidence %"), 60.0)
+
+        park = _fs98_batter_park_factor(merged)
+        barrel = _fs98_barrel_hr_conversion(merged)
+        stack = _fs98_stack_correlation(merged)
+        protection = _fs98_lineup_protection(merged)
+
+        adj = 0.0
+        adj += _fs98_cap((park - 50) / 170, -0.15, 0.20, 0)
+        adj += _fs98_cap((barrel - 50) / 155, -0.18, 0.25, 0)
+        adj += _fs98_cap((stack - 50) / 160, -0.18, 0.25, 0)
+        adj += _fs98_cap((protection - 50) / 180, -0.14, 0.20, 0)
+        adj = _fs98_cap(adj, -0.50, 0.65, 0)
+
+        fs2 = _fs98_cap(fs + adj, 1.0, 22.0, fs)
+        row["FS Projection"] = round(fs2, 2)
+        row["Median"] = round(fs2, 2)
+        row["Floor"] = round(_fs98_cap(_fs98_num(row.get("Floor"), fs2 * 0.45) + min(0, adj) * 1.2, 0, fs2, fs2 * 0.45), 2)
+        row["Ceiling"] = round(_fs98_cap(_fs98_num(row.get("Ceiling"), fs2 + 4) + max(0, adj) * 1.2, fs2 + 1, 30, fs2 + 4), 2)
+        row["Confidence %"] = round(_fs98_cap(conf + (1.0 if abs(adj) >= 0.20 else 0.0), 35, 92, conf), 1)
+
+        row["Batter Park Factor Score"] = park
+        row["Barrel HR Conversion Score"] = barrel
+        row["Team Stack Correlation"] = stack
+        row["Lineup Protection Score"] = protection
+        row["Batter FS Final Adj"] = round(adj, 2)
+        row["FS Final Micro Version"] = FS_FINAL_MICRO_98_VERSION
+    except Exception:
+        pass
+    return row
+
+# Render overrides to surface final micro columns.
+def render_pitcher_fs_tab(board=None):
+    st.subheader("Pitcher Fantasy — Self Projected")
+    st.caption("Pitcher FS final: defense support, inherited-run bullpen support, and umpire run environment added. K Upside is untouched.")
+    df = build_pitcher_fs_board(board)
+    if df is None or df.empty:
+        st.info("No Pitcher FS rows yet. Refresh K PROJ / UPSIDE first.")
+        return
+    df = df.sort_values("FS Projection", ascending=False)
+    front = [c for c in [
+        "Pitcher","Matchup","FS Projection","Floor","Median","Ceiling","Confidence %",
+        "K Projection","IP Projection","ER Projection","Win %","QS %",
+        "Defense Support Score","Bullpen Inherited Support","Umpire Run Environment",
+        "Pitcher FS Final Adj","FS Final Micro Version"
+    ] if c in df.columns]
+    rest = [c for c in df.columns if c not in front]
+    st.dataframe(df[front + rest], use_container_width=True, hide_index=True)
+    try:
+        _render_fs_cards(df, kind="pitcher")
+    except Exception:
+        pass
+
+def render_batter_fs_tab():
+    st.subheader("Batter Fantasy — Self Projected")
+    st.caption("Batter FS final: batter-specific park, barrel-to-HR conversion, stack correlation, and lineup protection added.")
+    df = build_batter_fs_board()
+    if df is None or df.empty:
+        st.info("No Batter FS rows yet. Refresh board or check MLB schedule feed.")
+        return
+    df = df.sort_values("FS Projection", ascending=False)
+    front = [c for c in [
+        "Player","Matchup","FS Projection","Floor","Median","Ceiling","Confidence %",
+        "PA","Lineup Slot","Lineup Weight","Pitcher Hand","Opposing Pitcher",
+        "Batter Park Factor Score","Barrel HR Conversion Score","Team Stack Correlation",
+        "Lineup Protection Score","Batter FS Final Adj","FS Final Micro Version"
+    ] if c in df.columns]
+    rest = [c for c in df.columns if c not in front]
+    st.dataframe(df[front + rest], use_container_width=True, hide_index=True)
+    try:
+        _render_fs_cards(df, kind="batter")
+    except Exception:
+        pass
+
+tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_moneyline, tab_iq, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
     "BATTER FS",
     "MONEYLINE EDGE",
+    "🧠 BASEBALL IQ",
     "CALIBRATION AUDIT",
-    "TOP PLAYS",
-    "BEST 4 BUILDER",
     "ALL PLAYERS",
     "REAL PROP BOARD",
     "STATCAST",
@@ -14976,28 +16373,11 @@ with tab_batter_fs:
 with tab_moneyline:
     render_moneyline_edge_tab(board, dates)
 
+with tab_iq:
+    render_baseball_iq_tab(board)
+
 with tab_calibration:
     render_calibration_audit_tab()
-
-with tab1:
-    st.markdown('<div class="section-title-pro">Top Plays</div>', unsafe_allow_html=True)
-    if not board:
-        st.info("Click 🔄 Refresh Live Board first.")
-    else:
-        top = sorted(
-            board,
-            key=lambda x: (
-                x.get("signal_type") == "good",
-                x.get("ev") if x.get("ev") is not None else -999,
-                x.get("fair_probability") if x.get("fair_probability") is not None else 0
-            ),
-            reverse=True
-        )
-        for p in top:
-            render_pick_card(p)
-
-with tab_best4:
-    render_best4_builder(board)
 
 with tab2:
     st.markdown('<div class="section-title-pro">All Players</div>', unsafe_allow_html=True)
