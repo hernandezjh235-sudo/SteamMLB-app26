@@ -13378,6 +13378,353 @@ def _batter_fs_from_context(ctx):
     return row
 
 
+
+# =========================
+# FS ACCURACY + CARD FIX
+# Version: FS_ACCURACY_CARD_FIX_2026_06_10
+#
+# Fixes:
+# 1) Pitcher FS cannot be empty if K Upside board/table has rows.
+# 2) Batter FS HR/FS projections are hard-capped to realistic ranges.
+# 3) Batter FS uses direct event projection, not runaway HR% math.
+# 4) Adds mobile/player cards like K Upside.
+# =========================
+FS_ACCURACY_CARD_FIX_VERSION = "FS_ACCURACY_CARD_FIX_2026_06_10"
+
+def _fs_cap(v, lo, hi, default=0.0):
+    try:
+        x = float(v)
+        if pd.isna(x):
+            return default
+        return max(lo, min(hi, x))
+    except Exception:
+        return default
+
+def _fs_pitcher_rows_from_active_board(board=None):
+    rows = []
+    if board:
+        for p in board:
+            try:
+                name = str(p.get("pitcher") or p.get("Pitcher") or p.get("Player") or "").strip()
+                if not name:
+                    continue
+                rows.append(p)
+            except Exception:
+                continue
+    if rows:
+        return rows
+
+    # Fallback: scan session_state for an existing K dataframe.
+    try:
+        for key in list(st.session_state.keys()):
+            obj = st.session_state.get(key)
+            if hasattr(obj, "columns") and "Pitcher" in obj.columns:
+                for _, r in obj.iterrows():
+                    d = r.to_dict()
+                    if str(d.get("Pitcher") or "").strip():
+                        rows.append(d)
+                if rows:
+                    return rows
+    except Exception:
+        pass
+    return rows
+
+def _pitcher_fs_from_k_context(p):
+    # Works with raw K board dicts or K table dataframe rows.
+    name = str(p.get("pitcher") or p.get("Pitcher") or p.get("Player") or "").strip()
+    matchup = str(p.get("matchup") or p.get("Matchup") or p.get("Game") or "").strip()
+
+    try:
+        k_proj = _fs_num(kproj_upside_projection(p), None)
+    except Exception:
+        k_proj = None
+    if k_proj is None or k_proj <= 0:
+        try:
+            d = kproj_decision(p)
+            k_proj = _fs_num(d.get("projection") or d.get("K PROJ") or d.get("Median"), 0.0)
+        except Exception:
+            k_proj = _fs_num(p.get("K PROJ") or p.get("Median") or p.get("Projection"), 0.0)
+
+    exp_bf = _fs_num(p.get("expected_bf") or p.get("Exp BF"), 22.0)
+    ip_floor = _fs_num(p.get("ip_floor") or p.get("IP Floor"), 5.0)
+    ip_proj = _fs_cap(max(ip_floor, exp_bf / 4.35), 3.0, 7.1, 5.3)
+
+    opp_runs = _fs_num(p.get("Opp Implied Runs") or p.get("opp_implied_runs") or p.get("Opp Team Runs"), 4.25)
+    er_proj = _fs_cap(p.get("ER Proj") or (opp_runs * (ip_proj / 9.0) * 0.82), 0.2, 5.5, 2.6)
+
+    win_prob = _fs_num(p.get("Win %") or p.get("Win Probability") or p.get("Team Win%"), None)
+    if win_prob is None:
+        team_runs = _fs_num(p.get("Team Implied Runs") or p.get("team_implied_runs"), 4.35)
+        win_prob = _fs_cap(0.50 + (team_runs - opp_runs) * 0.055, 0.30, 0.70, 0.47)
+    elif win_prob > 1:
+        win_prob = win_prob / 100.0
+    win_prob = _fs_cap(win_prob, 0.25, 0.78, 0.47)
+
+    qs_prob = _fs_num(p.get("QS %") or p.get("Quality Start %"), None)
+    if qs_prob is None:
+        qs_prob = _fs_cap((ip_proj - 5.25) * 0.32, 0.04, 0.62, 0.18)
+    elif qs_prob > 1:
+        qs_prob = qs_prob / 100.0
+    qs_prob = _fs_cap(qs_prob, 0.02, 0.75, 0.18)
+
+    opp_k = _fs_num(p.get("opp_k") or p.get("Opp K%") or p.get("Opponent K%"), 0.22)
+    if opp_k > 1:
+        opp_k = opp_k / 100.0
+    opp_wrc = _fs_num(p.get("Opp wRC+") or p.get("Opponent wRC+") or p.get("Lineup wRC+"), 100)
+    park = _fs_num(p.get("Park Factor") or p.get("park_factor"), 1.0)
+
+    matchup_adj = _fs_cap(((opp_k - 0.22) * 4.0) - ((opp_wrc - 100) * 0.01) - ((park - 1.0) * 0.35), -0.75, 0.75, 0)
+
+    fs = (k_proj * 3.0) + (ip_proj * 3.0) - (er_proj * 3.0) + (win_prob * 5.0) + (qs_prob * 5.0) + matchup_adj
+    fs = _fs_cap(fs, 4.0, 45.0, 18.0)
+
+    floor = _fs_cap(fs - 4.75, 0.0, fs, 0.0)
+    ceiling = _fs_cap(fs + 4.75 + k_proj * 0.25, fs, 55.0, fs + 6)
+
+    return {
+        "Pitcher": name,
+        "Matchup": matchup,
+        "FS Projection": round(fs, 2),
+        "Floor": round(floor, 2),
+        "Median": round(fs, 2),
+        "Ceiling": round(ceiling, 2),
+        "Confidence %": _fs_conf(fs, floor, ceiling),
+        "K Projection": round(k_proj, 2),
+        "IP Projection": round(ip_proj, 2),
+        "ER Projection": round(er_proj, 2),
+        "Win %": round(win_prob * 100, 1),
+        "QS %": round(qs_prob * 100, 1),
+        "Opp K%": round(opp_k * 100, 1),
+        "Opp wRC+": round(opp_wrc, 1),
+        "Matchup Adj": round(matchup_adj, 2),
+        "FS Version": FS_ACCURACY_CARD_FIX_VERSION,
+    }
+
+def build_pitcher_fs_board(board=None):
+    rows = []
+    for p in _fs_pitcher_rows_from_active_board(board):
+        try:
+            row = _pitcher_fs_from_k_context(p)
+            if row.get("Pitcher"):
+                rows.append(row)
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
+
+def _batter_fs_safe_projection(ctx):
+    name = str(ctx.get("Player") or ctx.get("Batter") or ctx.get("Hitter") or ctx.get("Name") or "").strip()
+    matchup = str(ctx.get("Matchup") or ctx.get("Game") or "").strip()
+
+    slot = int(_fs_cap(ctx.get("Lineup Slot"), 1, 9, 4))
+    team_runs = _fs_cap(ctx.get("Team Implied Runs") or ctx.get("ImpR") or ctx.get("Team Runs"), 2.5, 7.5, 4.45)
+
+    pa_base = {1:4.75,2:4.62,3:4.50,4:4.38,5:4.22,6:4.05,7:3.88,8:3.72,9:3.55}.get(slot, 4.05)
+    lineup_status = str(ctx.get("Lineup Status") or "").upper()
+    confirmed = ("FEED" in lineup_status or "CONFIRMED" in lineup_status)
+    pa = _fs_cap(pa_base + (team_runs - 4.45) * 0.10 + (0.05 if confirmed else -0.03), 3.3, 5.1, pa_base)
+
+    avg = _fs_cap(ctx.get("AVG"), 0.120, 0.390, 0.245)
+    obp = _fs_cap(ctx.get("OBP"), 0.180, 0.500, 0.320)
+    iso = _fs_cap(ctx.get("ISO"), 0.030, 0.380, 0.150)
+    bb_rate = _fs_cap(ctx.get("BB%") or ctx.get("Walk%"), 1.0, 22.0, 8.0) / 100.0
+    k_rate = _fs_cap(ctx.get("K%"), 5.0, 45.0, 22.0) / 100.0
+
+    # Critical fix: cap HR rate and HR/game projection.
+    hr_rate = _fs_num(ctx.get("HR%"), None)
+    if hr_rate is None:
+        hr_rate = iso * 0.22
+    elif hr_rate > 1:
+        hr_rate = hr_rate / 100.0
+    hr_rate = _fs_cap(hr_rate, 0.000, 0.120, 0.035)
+
+    hbp_rate = _fs_cap(ctx.get("HBP%"), 0.0, 3.0, 0.8) / 100.0
+
+    ab = _fs_cap(pa * (1 - bb_rate - hbp_rate), 2.5, 5.0, pa * 0.88)
+    total_hits = _fs_cap(ab * avg, 0.15, 1.75, 0.85)
+
+    hr = _fs_cap(pa * hr_rate, 0.0, 0.65, 0.12)
+    # HR cannot exceed total hit expectation by an unrealistic amount.
+    hr = min(hr, max(0.02, total_hits * 0.65))
+
+    non_hr_hits = max(0.0, total_hits - hr)
+    double_share = _fs_cap(0.16 + iso * 0.35, 0.10, 0.32, 0.18)
+    triple_share = _fs_cap(ctx.get("3B/G"), 0.002, 0.035, 0.008)
+    doubles = _fs_cap(non_hr_hits * double_share, 0.0, 0.55, 0.15)
+    triples = _fs_cap(non_hr_hits * triple_share, 0.0, 0.08, 0.01)
+    singles = _fs_cap(non_hr_hits - doubles - triples, 0.0, 1.45, 0.65)
+
+    walks = _fs_cap(pa * bb_rate, 0.02, 1.25, 0.32)
+    hbp = _fs_cap(pa * hbp_rate, 0.0, 0.18, 0.03)
+
+    # Runs/RBI from slot + team run env + HR.
+    runs = 0.42 + (team_runs - 4.45) * 0.12
+    rbi = 0.42 + (team_runs - 4.45) * 0.12
+    if slot in [1,2]:
+        runs += 0.18; rbi -= 0.05
+    elif slot in [3,4,5]:
+        runs += 0.05; rbi += 0.18
+    elif slot >= 8:
+        runs -= 0.12; rbi -= 0.12
+    runs = _fs_cap(runs + hr * 0.55, 0.05, 1.35, 0.5)
+    rbi = _fs_cap(rbi + hr * 0.75, 0.05, 1.35, 0.5)
+
+    sb_season = _fs_cap(ctx.get("SB") or ctx.get("Season SB"), 0, 80, 0)
+    sb_match = _fs_num(ctx.get("SB Matchup Score"), 50)
+    sb = _fs_cap((sb_season / 150.0) * (1 + (sb_match - 50) / 160), 0.0, 0.45, 0.03)
+
+    mb_score, mb_label = _moneyball_score(ctx)
+
+    hand_score = _fs_num(ctx.get("Hand Split Score"), 50)
+    pitch_quality = _fs_num(ctx.get("Pitcher Quality Score"), 50)
+    bullpen = _fs_num(ctx.get("Bullpen Score"), 50)
+    park_weather = _fs_num(ctx.get("Park/Weather Score") or ctx.get("Park Score"), 50)
+
+    matchup_adj = (
+        _fs_cap((hand_score - 50) / 120, -0.25, 0.30, 0) +
+        _fs_cap((pitch_quality - 50) / 140, -0.25, 0.30, 0) +
+        _fs_cap((bullpen - 50) / 180, -0.15, 0.20, 0) +
+        _fs_cap((park_weather - 50) / 190, -0.12, 0.18, 0)
+    )
+    matchup_adj = _fs_cap(matchup_adj, -0.55, 0.70, 0)
+
+    fs = (
+        singles * 3 +
+        doubles * 6 +
+        triples * 8 +
+        hr * 10 +
+        walks * 3 +
+        hbp * 3 +
+        rbi * 2 +
+        runs * 2 +
+        sb * 4 +
+        matchup_adj
+    )
+    fs = _fs_cap(fs, 1.0, 22.0, 7.5)
+
+    floor = _fs_cap(fs * 0.45, 0.0, fs, fs * 0.45)
+    ceiling = _fs_cap(fs + 3.2 + hr * 4.0 + sb * 1.5, fs + 1.0, 30.0, fs + 4)
+
+    conf = _fs_conf(fs, floor, ceiling)
+    if confirmed:
+        conf = min(92.0, conf + 3.0)
+        lineup_weight = "CONFIRMED_WEIGHT"
+    else:
+        conf = max(40.0, conf - 2.0)
+        lineup_weight = "PROJECTED_WEIGHT"
+
+    return {
+        "Player": name,
+        "Matchup": matchup,
+        "FS Projection": round(fs, 2),
+        "Floor": round(floor, 2),
+        "Median": round(fs, 2),
+        "Ceiling": round(ceiling, 2),
+        "Confidence %": round(conf, 1),
+        "PA": round(pa, 2),
+        "Singles": round(singles, 2),
+        "Doubles": round(doubles, 2),
+        "Triples": round(triples, 2),
+        "HR": round(hr, 2),
+        "Walks": round(walks, 2),
+        "HBP": round(hbp, 2),
+        "Runs": round(runs, 2),
+        "RBI": round(rbi, 2),
+        "SB": round(sb, 2),
+        "Moneyball": mb_label,
+        "Moneyball Score": mb_score,
+        "Team": ctx.get("Team", ""),
+        "Opponent": ctx.get("Opponent", ""),
+        "Opposing Pitcher": ctx.get("Opposing Pitcher", ""),
+        "Pitcher Hand": ctx.get("Pitcher Hand", "UNK"),
+        "Lineup Slot": slot,
+        "Lineup Status": ctx.get("Lineup Status", ""),
+        "Lineup Weight": lineup_weight,
+        "Split Source": ctx.get("Split Source", "SEASON"),
+        "Opp Catcher": ctx.get("Opp Catcher", ""),
+        "Opp Catcher CS%": ctx.get("Opp Catcher CS%", 27),
+        "Pitcher SB Allowed": ctx.get("Pitcher SB Allowed", 0),
+        "Matchup Adj": round(matchup_adj, 2),
+        "Base FS Projection": round(fs, 2),
+        "FS Accuracy Version": FS_ACCURACY_CARD_FIX_VERSION,
+    }
+
+# Override batter projection with safe capped formula.
+def _batter_fs_from_context(ctx):
+    return _batter_fs_safe_projection(ctx)
+
+def build_batter_fs_board():
+    rows = []
+    for ctx in _get_batter_context_rows():
+        try:
+            r = _batter_fs_from_context(ctx)
+            if r.get("Player"):
+                rows.append(r)
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
+
+def _render_fs_cards(df, kind="batter", limit=25):
+    if df is None or df.empty:
+        return
+    st.markdown("#### Player Cards")
+    for _, r in df.head(limit).iterrows():
+        name = html.escape(str(r.get("Player") or r.get("Pitcher") or ""))
+        matchup = html.escape(str(r.get("Matchup", "")))
+        fs = r.get("FS Projection", "—")
+        floor = r.get("Floor", "—")
+        med = r.get("Median", "—")
+        ceil = r.get("Ceiling", "—")
+        conf = r.get("Confidence %", "—")
+        if kind == "pitcher":
+            detail = f"K {r.get('K Projection','—')} • IP {r.get('IP Projection','—')} • ER {r.get('ER Projection','—')} • Win {r.get('Win %','—')}% • QS {r.get('QS %','—')}%"
+        else:
+            detail = f"PA {r.get('PA','—')} • Slot {r.get('Lineup Slot','—')} • {html.escape(str(r.get('Lineup Weight','')))} • vs {html.escape(str(r.get('Pitcher Hand','UNK')))} • Opp SP {html.escape(str(r.get('Opposing Pitcher','')))}"
+        st.markdown(f"""
+        <div class="pro-card" style="padding:18px;margin-bottom:12px;">
+          <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;">
+            <div>
+              <div style="font-size:24px;font-weight:900;">{name}</div>
+              <div class="small-muted">{matchup}</div>
+              <div class="small-muted" style="margin-top:6px;">{detail}</div>
+            </div>
+            <div style="text-align:right;">
+              <div class="small-muted">PROJ FS</div>
+              <div class="big-number green">{fs}</div>
+              <div class="small-muted">Conf {conf}%</div>
+            </div>
+          </div>
+          <div class="metric-grid" style="margin-top:12px;">
+            <div class="mobile-info-card"><div class="small-muted">Floor</div><div class="kpi-value">{floor}</div></div>
+            <div class="mobile-info-card"><div class="small-muted">Median</div><div class="kpi-value">{med}</div></div>
+            <div class="mobile-info-card"><div class="small-muted">Ceiling</div><div class="kpi-value">{ceil}</div></div>
+            <div class="mobile-info-card"><div class="small-muted">Context</div><div class="kpi-value">{r.get('Matchup Adj','—')}</div></div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+# Override tab renderers with cards.
+def render_pitcher_fs_tab(board=None):
+    st.subheader("Pitcher Fantasy — Self Projected")
+    st.caption("No Underdog Fantasy lines. Uses active K Upside board, K projection, IP, ER, Win%, QS%, opponent context, and Underdog scoring.")
+    df = build_pitcher_fs_board(board)
+    if df is None or df.empty:
+        st.info("No Pitcher FS rows yet. Refresh K PROJ / UPSIDE first.")
+        return
+    df = df.sort_values("FS Projection", ascending=False)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    _render_fs_cards(df, kind="pitcher")
+
+def render_batter_fs_tab():
+    st.subheader("Batter Fantasy — Self Projected")
+    st.caption("No Underdog Fantasy lines. Uses real/projection lineup pool, PA, pitcher hand, split-aware rates, matchup context, and capped Underdog scoring.")
+    df = build_batter_fs_board()
+    if df is None or df.empty:
+        st.info("No Batter FS rows yet. Refresh board or check MLB schedule feed.")
+        return
+    df = df.sort_values("FS Projection", ascending=False)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    _render_fs_cards(df, kind="batter")
+
 tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_moneyline, tab_calibration, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
