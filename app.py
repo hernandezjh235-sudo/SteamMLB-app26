@@ -12837,6 +12837,547 @@ def _batter_fs_from_context(ctx):
     return row
 
 
+
+# =========================
+# FS POOL + K SAFETY FIX — 2026_06_10
+# Batter FS pulls MLB schedule/lineup/roster directly. No H+R+R dependency.
+# Pitcher FS still uses K Upside board.
+# K Upside gets safety columns + light marginal PASS gate only.
+# =========================
+FS_POOL_AND_K_SAFETY_VERSION = "FS_POOL_AND_K_SAFETY_2026_06_10"
+
+def _fs_json(url, timeout=10):
+    try:
+        r = requests.get(url, timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return {}
+
+def _fs_season():
+    try:
+        return int(datetime.now().year)
+    except Exception:
+        return 2026
+
+def _fs_app_dates():
+    try:
+        ds = globals().get("dates")
+        if isinstance(ds, list) and ds:
+            return ds
+    except Exception:
+        pass
+    try:
+        return [(datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")]
+    except Exception:
+        return []
+
+def _fs_schedule_games():
+    games = []
+    for d in _fs_app_dates():
+        js = _fs_json(f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={d}&hydrate=probablePitcher,venue")
+        for db in js.get("dates", []) or []:
+            for g in db.get("games", []) or []:
+                try:
+                    away = g.get("teams", {}).get("away", {}) or {}
+                    home = g.get("teams", {}).get("home", {}) or {}
+                    away_team = away.get("team", {}) or {}
+                    home_team = home.get("team", {}) or {}
+                    games.append({
+                        "gamePk": g.get("gamePk"),
+                        "date": d,
+                        "away_id": away_team.get("id"),
+                        "home_id": home_team.get("id"),
+                        "away": away_team.get("abbreviation") or away_team.get("teamName") or away_team.get("name"),
+                        "home": home_team.get("abbreviation") or home_team.get("teamName") or home_team.get("name"),
+                        "away_probable": (away.get("probablePitcher") or {}).get("fullName", ""),
+                        "home_probable": (home.get("probablePitcher") or {}).get("fullName", ""),
+                        "venue": (g.get("venue") or {}).get("name", ""),
+                        "game_time": g.get("gameDate", ""),
+                    })
+                except Exception:
+                    continue
+    return games
+
+_FS_HIT_STAT_CACHE = {}
+
+def _fs_hitting_stat(pid):
+    if not pid:
+        return {}
+    if pid in _FS_HIT_STAT_CACHE:
+        return _FS_HIT_STAT_CACHE[pid]
+    js = _fs_json(f"https://statsapi.mlb.com/api/v1/people/{pid}/stats?stats=season&group=hitting&season={_fs_season()}")
+    stat = {}
+    try:
+        splits = js.get("stats", [{}])[0].get("splits", [])
+        if splits:
+            stat = splits[0].get("stat", {}) or {}
+    except Exception:
+        pass
+    _FS_HIT_STAT_CACHE[pid] = stat
+    return stat
+
+def _fs_row_from_hitter(pid, name, slot, game, team_side):
+    stat = _fs_hitting_stat(pid)
+    pa = _fs_num(stat.get("plateAppearances"), 0)
+    avg = _fs_num(stat.get("avg"), 0.245)
+    slg = _fs_num(stat.get("slg"), 0.395)
+    bb = _fs_num(stat.get("baseOnBalls"), 0)
+    so = _fs_num(stat.get("strikeOuts"), 0)
+    hr = _fs_num(stat.get("homeRuns"), 0)
+    side_opp = "home" if team_side == "away" else "away"
+    return {
+        "Player": name,
+        "person_id": pid,
+        "Team": game.get(team_side),
+        "Opponent": game.get(side_opp),
+        "Matchup": f"{game.get('away')} @ {game.get('home')}",
+        "Game Time": game.get("game_time"),
+        "Park": game.get("venue"),
+        "Opposing Pitcher": game.get(f"{side_opp}_probable"),
+        "Lineup Slot": slot,
+        "AVG": avg,
+        "OBP": _fs_num(stat.get("obp"), 0.320),
+        "ISO": max(0.050, slg - avg),
+        "BB%": round((bb / max(1, pa)) * 100, 1),
+        "K%": round((so / max(1, pa)) * 100, 1),
+        "HR%": round((hr / max(1, pa)) * 100, 2),
+        "SB": _fs_num(stat.get("stolenBases"), 0),
+        "Season PA": pa,
+    }
+
+def _fs_feed_hitters(game):
+    rows = []
+    gp = game.get("gamePk")
+    if not gp:
+        return rows
+    js = _fs_json(f"https://statsapi.mlb.com/api/v1.1/game/{gp}/feed/live")
+    teams = (((js.get("liveData") or {}).get("boxscore") or {}).get("teams") or {})
+    for side in ["away", "home"]:
+        tb = teams.get(side, {}) or {}
+        batters = tb.get("batters") or []
+        players = tb.get("players") or {}
+        if not batters:
+            continue
+        for slot, pid in enumerate(batters[:9], start=1):
+            pobj = players.get(f"ID{pid}", {}) or {}
+            name = ((pobj.get("person") or {}).get("fullName") or "").strip()
+            if name:
+                r = _fs_row_from_hitter(pid, name, slot, game, side)
+                r["Lineup Status"] = "FEED_LINEUP"
+                rows.append(r)
+    return rows
+
+def _fs_roster_hitters(team_id, game, side):
+    if not team_id:
+        return []
+    js = _fs_json(f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster?rosterType=active&season={_fs_season()}")
+    pool = []
+    for item in js.get("roster", []) or []:
+        try:
+            pos = (item.get("position") or {}).get("abbreviation", "")
+            if pos == "P":
+                continue
+            person = item.get("person") or {}
+            pid = person.get("id")
+            name = person.get("fullName", "")
+            if not pid or not name:
+                continue
+            stat = _fs_hitting_stat(pid)
+            pa = _fs_num(stat.get("plateAppearances"), 0)
+            if pa <= 0:
+                continue
+            pool.append((pa, pid, name))
+        except Exception:
+            continue
+    pool = sorted(pool, key=lambda x: x[0], reverse=True)[:9]
+    rows = []
+    for slot, (_, pid, name) in enumerate(pool, start=1):
+        r = _fs_row_from_hitter(pid, name, slot, game, side)
+        r["Lineup Status"] = "PROJECTED_TOP_PA"
+        rows.append(r)
+    return rows
+
+def _fs_build_batter_pool():
+    rows, seen = [], set()
+    for g in _fs_schedule_games():
+        feed = _fs_feed_hitters(g)
+        if feed:
+            candidates = feed
+        else:
+            candidates = _fs_roster_hitters(g.get("away_id"), g, "away") + _fs_roster_hitters(g.get("home_id"), g, "home")
+        for r in candidates:
+            key = (_fs_norm(r.get("Player")), r.get("Matchup"))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(r)
+    return rows
+
+# Override Batter FS source. It no longer calls H+R+R board builders.
+def _get_batter_context_rows():
+    rows = _fs_build_batter_pool()
+    if rows:
+        return rows
+    return []
+
+# K safety helper columns
+def _k_deep_leash(p):
+    bf = _fs_num(p.get("expected_bf") or p.get("Exp BF"), 22.0)
+    ipf = _fs_num(p.get("ip_floor") or p.get("IP Floor"), 5.0)
+    role = _fs_num(p.get("role_score") or p.get("Role Score"), 50)
+    starter = _fs_num(p.get("starter_score") or p.get("Starter Score"), 50)
+    score = max(20, min(95, 50 + max(0, bf - 22) * 4 + max(0, ipf - 5) * 10 + (role - 50) * 0.20 + (starter - 50) * 0.15))
+    label = "DEEP_LEASH_UNDER_RISK" if score >= 68 else ("SHORT_LEASH" if score < 42 else "NORMAL_LEASH")
+    return round(score, 1), label
+
+def _k_recent_conversion(p):
+    l10 = _fs_num(p.get("line_l10_avg") or p.get("L10 Avg"), None)
+    try:
+        proj = _fs_num(kproj_upside_projection(p), None)
+    except Exception:
+        proj = None
+    if l10 is None or proj is None:
+        return 50.0, "CONVERSION_UNKNOWN"
+    score = max(20, min(90, 50 + (l10 - proj) * 9))
+    label = "RECENT_OVER_CONVERTING" if score >= 62 else ("RECENT_UNDER_CONVERTING" if score <= 40 else "RECENT_NEUTRAL")
+    return round(score, 1), label
+
+def _k_contact_suppression(p):
+    oppk = _fs_num(p.get("opp_k") or p.get("Opp K%"), 0.22)
+    if oppk > 1:
+        oppk /= 100.0
+    whiff = _fs_num(p.get("statcast_whiff") or p.get("statcast_csw"), 0.24)
+    if whiff > 1:
+        whiff /= 100.0
+    score = max(20, min(90, 50 + ((0.22 - oppk) * 180) - max(0, whiff - 0.25) * 60))
+    label = "CONTACT_SUPPRESSION" if score >= 62 else ("K_FRIENDLY_CONTACT" if score <= 40 else "CONTACT_NEUTRAL")
+    return round(score, 1), label
+
+_prev_build_kproj_table_pool_safety = build_kproj_table
+def build_kproj_table(board):
+    df = _prev_build_kproj_table_pool_safety(board)
+    try:
+        add = []
+        for p in board or []:
+            ls, ll = _k_deep_leash(p)
+            cs, cl = _k_recent_conversion(p)
+            ss, sl = _k_contact_suppression(p)
+            add.append({
+                "Deep Leash Risk": ls,
+                "Leash Label": ll,
+                "Recent Conversion": cs,
+                "Conversion Label": cl,
+                "Contact Suppression": ss,
+                "Contact Label": sl,
+                "K Safety Note": "UNDER_RISK" if ls >= 68 else ("OVER_TAX" if ss >= 62 else "NEUTRAL")
+            })
+        extra = pd.DataFrame(add)
+        if len(extra) == len(df):
+            df = pd.concat([df.reset_index(drop=True), extra.reset_index(drop=True)], axis=1)
+    except Exception:
+        pass
+    return df
+
+_prev_kproj_decision_pool_safety = kproj_decision
+def kproj_decision(p):
+    d = dict(_prev_kproj_decision_pool_safety(p) or {})
+    try:
+        side = str(d.get("lean_side") or d.get("decision") or "").upper()
+        conf = _fs_num(d.get("confidence"), 0)
+        if conf > 1:
+            conf /= 100.0
+        ls, ll = _k_deep_leash(p)
+        cs, cl = _k_recent_conversion(p)
+        ss, sl = _k_contact_suppression(p)
+        warn = []
+        if "UNDER" in side and ls >= 72:
+            warn.append("DEEP_LEASH_UNDER_RISK")
+        if "OVER" in side and ss >= 66:
+            warn.append("CONTACT_SUPPRESSION_OVER_RISK")
+        if "OVER" in side and cs <= 38:
+            warn.append("RECENT_CONVERSION_OVER_RISK")
+        d["k_safety_warning"] = " | ".join(warn) if warn else "NONE"
+        if warn and conf < 0.64:
+            d["decision"] = "PASS"
+            d["tier"] = "PASS_SAFETY"
+    except Exception:
+        pass
+    return d
+
+
+
+# =========================
+# BATTER FS REAL LINEUP + HAND/SPLIT/SB UPGRADE
+# Version: BATTER_FS_REAL_LINEUP_HAND_SPLIT_2026_06_10
+#
+# Batter FS only:
+# - Real MLB feed lineup first
+# - Projected top-PA fallback if lineup not posted
+# - Opposing pitcher id/name/hand
+# - Confirmed lineup weighting
+# - Best-effort LHP/RHP split stats
+# - Catcher / pitcher SB suppression
+#
+# K Upside, Pitcher FS, Moneyline untouched.
+# =========================
+BATTER_FS_REAL_LINEUP_VERSION = "BATTER_FS_REAL_LINEUP_HAND_SPLIT_2026_06_10"
+
+_FS_PERSON_CACHE = {}
+_FS_SPLIT_CACHE = {}
+
+def _fs_person_info(pid):
+    if not pid:
+        return {}
+    if pid in _FS_PERSON_CACHE:
+        return _FS_PERSON_CACHE[pid]
+    js = _fs_json(f"https://statsapi.mlb.com/api/v1/people/{pid}")
+    info = {}
+    try:
+        people = js.get("people", []) or []
+        if people:
+            p = people[0]
+            info = {
+                "id": pid,
+                "fullName": p.get("fullName", ""),
+                "pitchHand": ((p.get("pitchHand") or {}).get("code") or (p.get("pitchHand") or {}).get("description") or ""),
+                "batSide": ((p.get("batSide") or {}).get("code") or (p.get("batSide") or {}).get("description") or ""),
+            }
+    except Exception:
+        pass
+    _FS_PERSON_CACHE[pid] = info
+    return info
+
+def _fs_hitter_split_stat(pid, pitcher_hand):
+    """
+    Best-effort MLB split lookup. If unavailable, caller falls back to season stat.
+    """
+    if not pid:
+        return {}
+    h = str(pitcher_hand or "").upper()[:1]
+    if h not in ["L", "R"]:
+        return {}
+    key = (pid, h)
+    if key in _FS_SPLIT_CACHE:
+        return _FS_SPLIT_CACHE[key]
+
+    season = _fs_season()
+    stat = {}
+
+    # MLB Stats API split sitCodes are not always consistent across environments,
+    # so try a few common forms safely.
+    sit_codes = ["vl" if h == "L" else "vr", "vsLHP" if h == "L" else "vsRHP"]
+    for sit in sit_codes:
+        url = f"https://statsapi.mlb.com/api/v1/people/{pid}/stats?stats=statSplits&group=hitting&season={season}&sitCodes={sit}"
+        js = _fs_json(url)
+        try:
+            splits = js.get("stats", [{}])[0].get("splits", []) or []
+            if splits:
+                stat = splits[0].get("stat", {}) or {}
+                if stat:
+                    break
+        except Exception:
+            pass
+
+    _FS_SPLIT_CACHE[key] = stat
+    return stat
+
+def _fs_pitcher_sb_allowed(pid):
+    # Best-effort proxy from pitching stats; if unavailable returns neutral.
+    if not pid:
+        return 0.0
+    stat = {}
+    try:
+        js = _fs_json(f"https://statsapi.mlb.com/api/v1/people/{pid}/stats?stats=season&group=pitching&season={_fs_season()}")
+        splits = js.get("stats", [{}])[0].get("splits", []) or []
+        if splits:
+            stat = splits[0].get("stat", {}) or {}
+    except Exception:
+        pass
+    # MLB stat key may differ; use multiple guesses.
+    return _fs_num(stat.get("stolenBases") or stat.get("stolenBasesAllowed") or stat.get("sb") or 0, 0)
+
+def _fs_extract_catcher_from_feed(game, team_side):
+    """
+    Return catcher info for the defensive team. Used for SB suppression.
+    team_side is the batter team; opposing defensive side is the catcher side.
+    """
+    gp = game.get("gamePk")
+    if not gp:
+        return {}
+    opp_side = "home" if team_side == "away" else "away"
+    js = _fs_json(f"https://statsapi.mlb.com/api/v1.1/game/{gp}/feed/live")
+    box = (((js.get("liveData") or {}).get("boxscore") or {}).get("teams") or {}).get(opp_side, {}) or {}
+    players = box.get("players") or {}
+    try:
+        for _, pobj in players.items():
+            pos = ((pobj.get("position") or {}).get("abbreviation") or "")
+            if pos == "C":
+                person = pobj.get("person") or {}
+                return {
+                    "Opp Catcher": person.get("fullName", ""),
+                    "Opp Catcher ID": person.get("id"),
+                    # Default neutral; public API does not always include CS% in boxscore.
+                    "Opp Catcher CS%": 27.0,
+                }
+    except Exception:
+        pass
+    return {}
+
+# Override schedule to retain probable pitcher IDs/hand candidates.
+def _fs_schedule_games():
+    games = []
+    for d in _fs_app_dates():
+        js = _fs_json(f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={d}&hydrate=probablePitcher,venue")
+        for db in js.get("dates", []) or []:
+            for g in db.get("games", []) or []:
+                try:
+                    away = g.get("teams", {}).get("away", {}) or {}
+                    home = g.get("teams", {}).get("home", {}) or {}
+                    away_team = away.get("team", {}) or {}
+                    home_team = home.get("team", {}) or {}
+                    away_pp = away.get("probablePitcher") or {}
+                    home_pp = home.get("probablePitcher") or {}
+                    away_pid = away_pp.get("id")
+                    home_pid = home_pp.get("id")
+                    away_info = _fs_person_info(away_pid)
+                    home_info = _fs_person_info(home_pid)
+                    games.append({
+                        "gamePk": g.get("gamePk"),
+                        "date": d,
+                        "away_id": away_team.get("id"),
+                        "home_id": home_team.get("id"),
+                        "away": away_team.get("abbreviation") or away_team.get("teamName") or away_team.get("name"),
+                        "home": home_team.get("abbreviation") or home_team.get("teamName") or home_team.get("name"),
+                        "away_probable": away_pp.get("fullName", ""),
+                        "home_probable": home_pp.get("fullName", ""),
+                        "away_probable_id": away_pid,
+                        "home_probable_id": home_pid,
+                        "away_pitch_hand": away_info.get("pitchHand", ""),
+                        "home_pitch_hand": home_info.get("pitchHand", ""),
+                        "venue": (g.get("venue") or {}).get("name", ""),
+                        "game_time": g.get("gameDate", ""),
+                    })
+                except Exception:
+                    continue
+    return games
+
+def _fs_row_from_hitter(pid, name, slot, game, team_side):
+    stat = _fs_hitting_stat(pid)
+    side_opp = "home" if team_side == "away" else "away"
+    opp_pid = game.get(f"{side_opp}_probable_id")
+    opp_hand = game.get(f"{side_opp}_pitch_hand") or (_fs_person_info(opp_pid).get("pitchHand", ""))
+    split_stat = _fs_hitter_split_stat(pid, opp_hand)
+
+    # Use split values when available, otherwise season.
+    src = split_stat if split_stat else stat
+    pa = _fs_num(src.get("plateAppearances"), 0)
+    season_pa = _fs_num(stat.get("plateAppearances"), 0)
+    avg = _fs_num(src.get("avg"), _fs_num(stat.get("avg"), 0.245))
+    slg = _fs_num(src.get("slg"), _fs_num(stat.get("slg"), 0.395))
+    bb = _fs_num(src.get("baseOnBalls"), _fs_num(stat.get("baseOnBalls"), 0))
+    so = _fs_num(src.get("strikeOuts"), _fs_num(stat.get("strikeOuts"), 0))
+    hr = _fs_num(src.get("homeRuns"), _fs_num(stat.get("homeRuns"), 0))
+    denom_pa = max(1, pa if pa > 0 else season_pa)
+
+    row = {
+        "Player": name,
+        "person_id": pid,
+        "Team": game.get(team_side),
+        "Opponent": game.get(side_opp),
+        "Matchup": f"{game.get('away')} @ {game.get('home')}",
+        "Game Time": game.get("game_time"),
+        "Park": game.get("venue"),
+        "Opposing Pitcher": game.get(f"{side_opp}_probable"),
+        "Opposing Pitcher ID": opp_pid,
+        "Pitcher Hand": opp_hand or "UNK",
+        "Lineup Slot": slot,
+        "AVG": avg,
+        "OBP": _fs_num(src.get("obp"), _fs_num(stat.get("obp"), 0.320)),
+        "ISO": max(0.050, slg - avg),
+        "BB%": round((bb / denom_pa) * 100, 1),
+        "K%": round((so / denom_pa) * 100, 1),
+        "HR%": round((hr / denom_pa) * 100, 2),
+        "SB": _fs_num(stat.get("stolenBases"), 0),
+        "Season PA": season_pa,
+        "Split Source": f"vs {opp_hand}" if split_stat else "SEASON",
+        "Pitcher SB Allowed": _fs_pitcher_sb_allowed(opp_pid),
+    }
+    row.update(_fs_extract_catcher_from_feed(game, team_side))
+    return row
+
+# Wrap batter projection to apply confirmed/projected lineup weighting and hand/split quality.
+_prev_batter_fs_from_context_real_lineup = _batter_fs_from_context
+
+def _batter_fs_from_context(ctx):
+    row = _prev_batter_fs_from_context_real_lineup(ctx)
+
+    status = str(ctx.get("Lineup Status") or "").upper()
+    hand = str(ctx.get("Pitcher Hand") or "UNK").upper()
+    split_source = str(ctx.get("Split Source") or "SEASON")
+    slot = _fs_num(ctx.get("Lineup Slot"), 4)
+
+    base_fs = _fs_num(row.get("FS Projection"), 0)
+    adj = 0.0
+    conf_bonus = 0.0
+
+    # Confirmed lineup/feed rows are more trustworthy than projected top-PA fallback.
+    if "FEED" in status or "CONFIRMED" in status:
+        adj += 0.08
+        conf_bonus += 3.0
+        lineup_weight = "CONFIRMED_WEIGHT"
+    else:
+        # Top-PA projection is useful but less certain.
+        adj -= 0.05
+        conf_bonus -= 2.0
+        lineup_weight = "PROJECTED_WEIGHT"
+
+    # Batting order importance.
+    if slot in [1, 2]:
+        adj += 0.12
+    elif slot in [3, 4, 5]:
+        adj += 0.08
+    elif slot >= 8:
+        adj -= 0.10
+
+    # Real pitcher hand and split source.
+    if hand.startswith(("L", "R")) and split_source != "SEASON":
+        adj += 0.06
+        conf_bonus += 1.5
+    elif not hand.startswith(("L", "R")):
+        adj -= 0.04
+
+    # SB suppression/boost.
+    sb_score = _fs_num(row.get("SB Matchup Score"), 50)
+    catcher_cs = _fs_num(ctx.get("Opp Catcher CS%"), 27.0)
+    pitcher_sb_allowed = _fs_num(ctx.get("Pitcher SB Allowed"), 0)
+    sb_adj = max(-0.08, min(0.10, ((sb_score - 50) / 500) + ((27.0 - catcher_cs) / 350) + min(pitcher_sb_allowed, 20) / 500))
+    adj += sb_adj
+
+    new_fs = max(0, base_fs + adj)
+    row["Base FS Projection"] = round(base_fs, 2)
+    row["FS Projection"] = round(new_fs, 2)
+    row["Median"] = round(new_fs, 2)
+    row["Floor"] = round(max(0, _fs_num(row.get("Floor"), 0) + min(0, adj) * 1.2), 2)
+    row["Ceiling"] = round(_fs_num(row.get("Ceiling"), new_fs) + max(0, adj) * 1.2, 2)
+
+    try:
+        row["Confidence %"] = round(max(40, min(92, _fs_num(row.get("Confidence %"), 60) + conf_bonus)), 1)
+    except Exception:
+        pass
+
+    row["Lineup Weight"] = lineup_weight
+    row["Pitcher Hand"] = hand
+    row["Split Source"] = split_source
+    row["Opposing Pitcher"] = ctx.get("Opposing Pitcher", row.get("Opposing Pitcher", ""))
+    row["Opp Catcher"] = ctx.get("Opp Catcher", "")
+    row["Opp Catcher CS%"] = catcher_cs
+    row["Pitcher SB Allowed"] = pitcher_sb_allowed
+    row["Real Lineup Upgrade"] = BATTER_FS_REAL_LINEUP_VERSION
+    return row
+
+
 tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_moneyline, tab_calibration, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
