@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 # ============================================================
 # MLB STRIKEOUT PROP ENGINE — ONE FILE — v11.9
@@ -17252,18 +17251,18 @@ def _baseball_iq_for_k_row(p):
 
 
 # =========================
-# FINAL UI CARD POLISH LAYER
-# Version: FINAL_UI_CARDS_2026_06_11
+# MONEYLINE UI ONLY FINAL POLISH
+# Version: ML_UI_ONLY_FINAL_2026_06_11
 #
-# UI-only:
-# - Does NOT change projections.
-# - Does NOT change picks.
-# - Does NOT change K Upside / FS / ML logic.
-# - Adds compact, mobile-friendly cards with team logo support where possible.
+# UI ONLY:
+# - Improves Moneyline cards.
+# - Adds projected score, model win %, edge, confidence.
+# - Adds correct team logos based on matchup teams.
+# - Leaves K Upside, Pitcher FS, Batter FS, Moneyline logic, and all projections unchanged.
 # =========================
-FINAL_UI_CARDS_VERSION = "FINAL_UI_CARDS_2026_06_11"
+ML_UI_ONLY_FINAL_VERSION = "ML_UI_ONLY_FINAL_2026_06_11"
 
-MLB_LOGO_URLS = {
+_ML_UI_LOGOS = {
     "ARI": "https://www.mlbstatic.com/team-logos/109.svg", "AZ": "https://www.mlbstatic.com/team-logos/109.svg",
     "ATL": "https://www.mlbstatic.com/team-logos/144.svg",
     "BAL": "https://www.mlbstatic.com/team-logos/110.svg",
@@ -17296,7 +17295,7 @@ MLB_LOGO_URLS = {
     "WSH": "https://www.mlbstatic.com/team-logos/120.svg", "WAS": "https://www.mlbstatic.com/team-logos/120.svg",
 }
 
-TEAM_NAME_TO_ABBR = {
+_ML_UI_TEAM_NAMES = {
     "ARIZONA DIAMONDBACKS": "ARI", "ATLANTA BRAVES": "ATL", "BALTIMORE ORIOLES": "BAL",
     "BOSTON RED SOX": "BOS", "CHICAGO CUBS": "CHC", "CHICAGO WHITE SOX": "CWS",
     "CINCINNATI REDS": "CIN", "CLEVELAND GUARDIANS": "CLE", "COLORADO ROCKIES": "COL",
@@ -17310,14 +17309,14 @@ TEAM_NAME_TO_ABBR = {
     "TORONTO BLUE JAYS": "TOR", "WASHINGTON NATIONALS": "WSH",
 }
 
-def _ui_html(x):
+def _mlui_html(x):
     try:
         import html
         return html.escape("" if x is None else str(x))
     except Exception:
         return "" if x is None else str(x)
 
-def _ui_num(x, default=0.0):
+def _mlui_num(x, default=0.0):
     try:
         if x in (None, "", "—"):
             return default
@@ -17328,557 +17327,198 @@ def _ui_num(x, default=0.0):
     except Exception:
         return default
 
-def _ui_pct(x):
-    v = _ui_num(x, 0)
-    if abs(v) <= 1 and v != 0:
-        v *= 100
-    return f"{v:.1f}%"
-
-def _ui_team_abbr(x):
+def _mlui_abbr(x):
     s = str(x or "").strip()
     if not s:
         return ""
     up = s.upper().replace(".", "")
-    if up in MLB_LOGO_URLS:
+    if up in _ML_UI_LOGOS:
         return up
-    if up in TEAM_NAME_TO_ABBR:
-        return TEAM_NAME_TO_ABBR[up]
-    # matchup/text fallback
-    parts = re.findall(r"\b[A-Z]{2,3}\b", up)
-    for p in parts:
-        if p in MLB_LOGO_URLS:
-            return p
+    if up in _ML_UI_TEAM_NAMES:
+        return _ML_UI_TEAM_NAMES[up]
+    found = re.findall(r"\b[A-Z]{2,3}\b", up)
+    for f in found:
+        if f in _ML_UI_LOGOS:
+            return f
     return up[:3]
 
-def _ui_logo(team, size=46):
-    ab = _ui_team_abbr(team)
-    url = MLB_LOGO_URLS.get(ab, "")
-    if url:
-        return f'<img class="owp-logo" src="{url}" style="width:{size}px;height:{size}px;object-fit:contain;" />'
-    return f'<div class="owp-logo-fallback" style="width:{size}px;height:{size}px;">{_ui_html(ab[:3])}</div>'
-
-def _ui_split_matchup(matchup):
+def _mlui_split_matchup(matchup):
     try:
         if "@" in str(matchup):
             a, h = str(matchup).split("@", 1)
-            return _ui_team_abbr(a.strip()), _ui_team_abbr(h.strip())
+            return _mlui_abbr(a.strip()), _mlui_abbr(h.strip())
     except Exception:
         pass
-    return "", ""
+    try:
+        return ml_split_matchup(matchup)
+    except Exception:
+        return "", ""
 
-def _ui_card_css():
+def _mlui_logo(team, size=46):
+    ab = _mlui_abbr(team)
+    url = _ML_UI_LOGOS.get(ab, "")
+    if url:
+        return f'<img src="{url}" style="width:{size}px;height:{size}px;object-fit:contain;" />'
+    return f'<div class="mlui-logo-fallback" style="width:{size}px;height:{size}px;">{_mlui_html(ab)}</div>'
+
+def _mlui_pick_side(row, away, home):
+    pick = _mlui_abbr(row.get("Pick") or row.get("Model Pick") or row.get("Score Pick") or row.get("Lean") or "")
+    if pick not in [away, home] and pick:
+        # allow exact abbreviation still
+        return pick
+    return pick or _mlui_abbr(row.get("Score Pick") or away)
+
+def _mlui_pick_pct(row, pick, away, home):
+    if pick == away:
+        return row.get("Away Model %") or row.get("Away Win %") or row.get("Model Win %") or row.get("Win %")
+    if pick == home:
+        return row.get("Home Model %") or row.get("Home Win %") or row.get("Model Win %") or row.get("Win %")
+    return row.get("Model Win %") or row.get("Win %") or row.get("Away Model %") or row.get("Home Model %")
+
+def _mlui_opp_pct(row, pick, away, home):
+    if pick == away:
+        return row.get("Home Model %") or row.get("Home Win %")
+    if pick == home:
+        return row.get("Away Model %") or row.get("Away Win %")
+    return ""
+
+def _mlui_pct(x):
+    if x in (None, "", "—"):
+        return "—"
+    v = _mlui_num(x, 0)
+    if abs(v) <= 1 and v != 0:
+        v *= 100
+    return f"{v:.1f}%"
+
+def _mlui_edge(row):
+    val = row.get("ML Edge %")
+    if val in (None, "", "—"):
+        val = row.get("Model Edge %") or row.get("Edge %") or row.get("Score Edge")
+    if val in (None, "", "—"):
+        return "—"
+    try:
+        return f"{float(val):+.1f}%"
+    except Exception:
+        return str(val)
+
+def _mlui_score(row, away, home):
+    val = row.get("Projected Score") or row.get("Score Projection") or row.get("Predicted Score")
+    if val not in (None, "", "—"):
+        return str(val)
+    ar = row.get("Away Projected Runs") or row.get("Away Runs")
+    hr = row.get("Home Projected Runs") or row.get("Home Runs")
+    if ar not in (None, "", "—") and hr not in (None, "", "—"):
+        return f"{away} {_mlui_num(ar):.1f} - {home} {_mlui_num(hr):.1f}"
+    return "—"
+
+def _mlui_conf(row):
+    return row.get("Confidence") or row.get("Confidence Label") or row.get("ML Grade") or row.get("Grade") or row.get("Status") or "—"
+
+def _mlui_css():
     st.markdown("""
 <style>
-.owp-card-grid{display:grid;grid-template-columns:1fr;gap:14px;margin:8px 0 18px 0;}
-.owp-card{border:1px solid rgba(255,77,77,.34);background:linear-gradient(135deg,rgba(120,0,20,.34),rgba(6,13,22,.92));border-radius:20px;padding:16px 16px 14px 16px;box-shadow:0 10px 30px rgba(0,0,0,.32);overflow:hidden;}
-.owp-card.blue{border-color:rgba(40,160,255,.45);background:linear-gradient(135deg,rgba(0,78,140,.28),rgba(6,13,22,.94));}
-.owp-head{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:center;border-bottom:1px solid rgba(255,255,255,.10);padding-bottom:12px;margin-bottom:12px;}
-.owp-team{display:flex;align-items:center;gap:10px;min-width:0;}
-.owp-team.right{justify-content:flex-end;text-align:right;}
-.owp-abbr{font-size:30px;font-weight:900;letter-spacing:.5px;color:#fff;line-height:1;}
-.owp-sub{font-size:12px;color:rgba(255,255,255,.64);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:135px;}
-.owp-at{font-size:20px;font-weight:900;color:#fff;background:rgba(255,255,255,.07);border-radius:50%;width:38px;height:38px;display:flex;align-items:center;justify-content:center;}
-.owp-pickrow{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:12px;margin:4px 0 12px 0;}
-.owp-win{font-size:30px;font-weight:900;color:#ff405f;line-height:1;}
-.owp-win.blue{color:#2f9cff;}
-.owp-label{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:rgba(255,255,255,.58);margin-top:4px;}
-.owp-center{text-align:center;}
-.owp-pick{font-size:24px;font-weight:900;font-style:italic;color:#fff;}
-.owp-pill{display:inline-block;border:1px solid rgba(255,255,255,.16);border-radius:999px;padding:4px 10px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#ff405f;background:rgba(255,255,255,.05);margin-bottom:7px;}
-.owp-metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;border-top:1px solid rgba(255,255,255,.10);padding-top:12px;}
-.owp-metric{text-align:center;border-right:1px solid rgba(255,255,255,.09);min-width:0;}
-.owp-metric:last-child{border-right:0;}
-.owp-mval{font-size:18px;font-weight:900;color:#fff;white-space:nowrap;}
-.owp-mval.hot{color:#ff405f}.owp-mval.good{color:#2ecc71}.owp-mval.warn{color:#f7c948}.owp-mval.blue{color:#2f9cff}
-.owp-k-card{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;border:1px solid rgba(255,255,255,.12);background:rgba(12,18,27,.82);border-radius:16px;padding:12px;margin:8px 0;}
-.owp-k-name{font-size:18px;font-weight:900;color:#fff;line-height:1.1;}
-.owp-k-meta{font-size:12px;color:rgba(255,255,255,.62);margin-top:4px;}
-.owp-k-proj{font-size:24px;font-weight:900;color:#fff;text-align:right;}
-.owp-k-pick{font-size:13px;font-weight:900;text-align:right;color:#2ecc71;}
-.owp-logo-fallback{border-radius:50%;background:rgba(255,255,255,.08);display:flex;align-items:center;justify-content:center;font-weight:900;color:#fff;font-size:12px;}
+.mlui-wrap{display:grid;grid-template-columns:1fr;gap:14px;margin:10px 0 18px 0;}
+.mlui-card{border:1px solid rgba(255,77,77,.34);background:linear-gradient(135deg,rgba(115,0,22,.38),rgba(7,13,21,.95));border-radius:20px;padding:15px;box-shadow:0 10px 30px rgba(0,0,0,.30);overflow:hidden;}
+.mlui-card.blue{border-color:rgba(47,156,255,.45);background:linear-gradient(135deg,rgba(0,86,155,.28),rgba(7,13,21,.96));}
+.mlui-head{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:center;border-bottom:1px solid rgba(255,255,255,.10);padding-bottom:11px;margin-bottom:11px;}
+.mlui-team{display:flex;align-items:center;gap:9px;min-width:0;}
+.mlui-team.right{justify-content:flex-end;text-align:right;}
+.mlui-abbr{font-size:28px;font-weight:950;color:#fff;line-height:1;}
+.mlui-sp{font-size:12px;color:rgba(255,255,255,.62);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:130px;}
+.mlui-at{font-size:19px;font-weight:900;color:#fff;background:rgba(255,255,255,.07);border-radius:50%;width:36px;height:36px;display:flex;align-items:center;justify-content:center;}
+.mlui-main{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:center;margin-bottom:12px;}
+.mlui-pct{font-size:29px;font-weight:950;color:#ff405f;line-height:1;}
+.mlui-pct.blue{color:#2f9cff;}
+.mlui-small{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:rgba(255,255,255,.55);margin-top:4px;}
+.mlui-center{text-align:center;}
+.mlui-pill{display:inline-block;border:1px solid rgba(255,255,255,.16);border-radius:999px;padding:4px 10px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#ff405f;background:rgba(255,255,255,.05);margin-bottom:7px;}
+.mlui-pick{font-size:26px;font-weight:950;font-style:italic;color:#fff;}
+.mlui-score{font-size:18px;font-weight:950;color:#fff;}
+.mlui-metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;border-top:1px solid rgba(255,255,255,.10);padding-top:11px;}
+.mlui-metric{text-align:center;border-right:1px solid rgba(255,255,255,.08);min-width:0;}
+.mlui-metric:last-child{border-right:0;}
+.mlui-mval{font-size:17px;font-weight:950;color:#fff;white-space:nowrap;}
+.mlui-mval.hot{color:#ff405f}.mlui-mval.good{color:#2ecc71}.mlui-mval.warn{color:#f7c948}.mlui-mval.blue{color:#2f9cff}
+.mlui-logo-fallback{border-radius:50%;background:rgba(255,255,255,.08);display:flex;align-items:center;justify-content:center;font-weight:900;color:#fff;font-size:12px;}
 @media(max-width:520px){
-  .owp-card{padding:13px;border-radius:18px}
-  .owp-abbr{font-size:25px}
-  .owp-sub{max-width:95px}
-  .owp-win{font-size:25px}
-  .owp-metrics{grid-template-columns:repeat(2,1fr)}
-  .owp-metric{border-right:0;border-top:1px solid rgba(255,255,255,.06);padding-top:7px}
+  .mlui-card{padding:13px;border-radius:18px}
+  .mlui-abbr{font-size:25px}
+  .mlui-sp{max-width:90px}
+  .mlui-pct{font-size:24px}
+  .mlui-pick{font-size:22px}
+  .mlui-metrics{grid-template-columns:repeat(2,1fr)}
+  .mlui-metric{border-right:0;border-top:1px solid rgba(255,255,255,.06);padding-top:7px}
 }
 </style>
 """, unsafe_allow_html=True)
 
-def _ui_find_col(row, names, default=""):
-    for n in names:
-        if n in row and row.get(n) not in (None, ""):
-            return row.get(n)
-    return default
-
-def _ui_projected_score(row):
-    for c in ["Projected Score", "Score Projection", "Predicted Score"]:
-        val = row.get(c)
-        if val not in (None, ""):
-            return str(val)
-    ar = row.get("Away Projected Runs") or row.get("Away Runs") or row.get("Away Score")
-    hr = row.get("Home Projected Runs") or row.get("Home Runs") or row.get("Home Score")
-    if ar not in (None, "") and hr not in (None, ""):
-        return f"{_ui_num(ar):.2f} - {_ui_num(hr):.2f}"
-    return "—"
-
-def _ui_render_moneyline_cards(df, max_cards=18):
+def _mlui_render_cards(df, max_cards=20):
     if df is None or df.empty:
         st.info("No Moneyline rows yet.")
         return
-    _ui_card_css()
+    _mlui_css()
     cards = []
     for _, rr in df.head(max_cards).iterrows():
         row = rr.to_dict()
         matchup = str(row.get("Matchup") or "")
-        away, home = _ui_split_matchup(matchup)
-        pick = _ui_team_abbr(row.get("Pick") or row.get("Model Pick") or row.get("Score Pick") or "")
-        if not pick:
-            pick = _ui_team_abbr(row.get("Lean") or row.get("Model Lean") or "")
-        win = _ui_find_col(row, ["Model Win %", "Win %", "Win Probability", "Model Probability", "Home Model %", "Away Model %"], "")
-        edge = _ui_find_col(row, ["Model Edge %", "Edge %", "ML Edge %", "Score Edge", "Edge"], "")
-        conf = _ui_find_col(row, ["Confidence", "Confidence Label", "ML Grade", "Grade"], "—")
-        away_sp = _ui_find_col(row, ["Away SP", "Away Pitcher", "away_sp"], "")
-        home_sp = _ui_find_col(row, ["Home SP", "Home Pitcher", "home_sp"], "")
-        score = _ui_projected_score(row)
-        color_class = "blue" if (_ui_num(win, 50) >= 50 or str(pick) == str(home)) else ""
-        win_txt = _ui_pct(win) if win != "" else "—"
-        edge_txt = f"{_ui_num(edge):+.1f}%" if edge != "" and abs(_ui_num(edge)) < 100 else (str(edge) if edge != "" else "—")
+        away, home = _mlui_split_matchup(matchup)
+        pick = _mlui_pick_side(row, away, home)
+        pick_pct = _mlui_pick_pct(row, pick, away, home)
+        opp_pct = _mlui_opp_pct(row, pick, away, home)
+        score = _mlui_score(row, away, home)
+        edge = _mlui_edge(row)
+        conf = _mlui_conf(row)
+        away_sp = row.get("Away SP") or row.get("Away Pitcher") or "—"
+        home_sp = row.get("Home SP") or row.get("Home Pitcher") or "—"
+        is_blue = pick == home
         cards.append(f"""
-<div class="owp-card {color_class}">
-  <div class="owp-head">
-    <div class="owp-team">{_ui_logo(away,48)}<div><div class="owp-abbr">{_ui_html(away)}</div><div class="owp-sub">{_ui_html(away_sp)}</div></div></div>
-    <div class="owp-at">@</div>
-    <div class="owp-team right"><div><div class="owp-abbr">{_ui_html(home)}</div><div class="owp-sub">{_ui_html(home_sp)}</div></div>{_ui_logo(home,48)}</div>
+<div class="mlui-card {'blue' if is_blue else ''}">
+  <div class="mlui-head">
+    <div class="mlui-team">{_mlui_logo(away,48)}<div><div class="mlui-abbr">{_mlui_html(away)}</div><div class="mlui-sp">{_mlui_html(away_sp)}</div></div></div>
+    <div class="mlui-at">@</div>
+    <div class="mlui-team right"><div><div class="mlui-abbr">{_mlui_html(home)}</div><div class="mlui-sp">{_mlui_html(home_sp)}</div></div>{_mlui_logo(home,48)}</div>
   </div>
-  <div class="owp-pickrow">
-    <div><div class="owp-win">{win_txt}</div><div class="owp-label">Model Win %</div></div>
-    <div class="owp-center"><div class="owp-pill">ML Projection</div><div class="owp-pick">{_ui_html(pick or 'LEAN')}</div></div>
-    <div style="text-align:right;"><div class="owp-win blue">{_ui_html(row.get('Market %') or row.get('Implied Win %') or '')}</div><div class="owp-label">{_ui_html('Projected Score')}</div><div class="owp-mval">{_ui_html(score)}</div></div>
+  <div class="mlui-main">
+    <div><div class="mlui-pct">{_mlui_pct(pick_pct)}</div><div class="mlui-small">Model Win %</div></div>
+    <div class="mlui-center"><div class="mlui-pill">ML Projection</div><div class="mlui-pick">{_mlui_html(pick)}</div></div>
+    <div style="text-align:right;"><div class="mlui-pct blue">{_mlui_pct(opp_pct) if opp_pct not in (None,'','—') else ''}</div><div class="mlui-small">Projected Score</div><div class="mlui-score">{_mlui_html(score)}</div></div>
   </div>
-  <div class="owp-metrics">
-    <div class="owp-metric"><div class="owp-label">Edge</div><div class="owp-mval hot">{_ui_html(edge_txt)}</div></div>
-    <div class="owp-metric"><div class="owp-label">Win Prob</div><div class="owp-mval">{_ui_html(win_txt)}</div></div>
-    <div class="owp-metric"><div class="owp-label">Score</div><div class="owp-mval">{_ui_html(score)}</div></div>
-    <div class="owp-metric"><div class="owp-label">Confidence</div><div class="owp-mval warn">{_ui_html(conf)}</div></div>
-  </div>
-</div>
-""")
-    st.markdown('<div class="owp-card-grid">' + "\n".join(cards) + "</div>", unsafe_allow_html=True)
-
-def _ui_render_k_cards(df, max_cards=30):
-    if df is None or df.empty:
-        return
-    _ui_card_css()
-    html = []
-    for _, rr in df.head(max_cards).iterrows():
-        row = rr.to_dict()
-        matchup = str(row.get("Matchup") or row.get("matchup") or "")
-        away, home = _ui_split_matchup(matchup)
-        team = _ui_team_abbr(row.get("Team") or row.get("team") or away)
-        name = row.get("Pitcher") or row.get("Player") or row.get("pitcher") or ""
-        proj = row.get("K PROJ") or row.get("Projection") or row.get("Median") or row.get("K Projection") or ""
-        line = row.get("UD/Line") or row.get("Line") or row.get("line") or ""
-        decision = row.get("Decision") or row.get("Pick") or row.get("Model Lean") or ""
-        conf = row.get("Confidence %") or row.get("Confidence") or ""
-        html.append(f"""
-<div class="owp-k-card">
-  <div>{_ui_logo(team,42)}</div>
-  <div>
-    <div class="owp-k-name">{_ui_html(name)}</div>
-    <div class="owp-k-meta">{_ui_html(matchup)} • Line {_ui_html(line)} • Conf {_ui_html(conf)}</div>
-  </div>
-  <div>
-    <div class="owp-k-proj">{_ui_html(proj)}</div>
-    <div class="owp-k-pick">{_ui_html(decision)}</div>
+  <div class="mlui-metrics">
+    <div class="mlui-metric"><div class="mlui-small">Edge</div><div class="mlui-mval hot">{_mlui_html(edge)}</div></div>
+    <div class="mlui-metric"><div class="mlui-small">Win Prob</div><div class="mlui-mval">{_mlui_pct(pick_pct)}</div></div>
+    <div class="mlui-metric"><div class="mlui-small">Score</div><div class="mlui-mval">{_mlui_html(score)}</div></div>
+    <div class="mlui-metric"><div class="mlui-small">Confidence</div><div class="mlui-mval warn">{_mlui_html(conf)}</div></div>
   </div>
 </div>
 """)
-    st.markdown("\n".join(html), unsafe_allow_html=True)
+    st.markdown('<div class="mlui-wrap">' + "\n".join(cards) + "</div>", unsafe_allow_html=True)
 
-def _ui_render_fs_cards(df, kind="pitcher", max_cards=24):
-    if df is None or df.empty:
-        return
-    _ui_card_css()
-    html = []
-    for _, rr in df.head(max_cards).iterrows():
-        row = rr.to_dict()
-        matchup = str(row.get("Matchup") or "")
-        away, home = _ui_split_matchup(matchup)
-        team = _ui_team_abbr(row.get("Team") or row.get("team") or away)
-        name = row.get("Pitcher") if kind == "pitcher" else row.get("Player")
-        if not name:
-            name = row.get("Player") or row.get("Pitcher") or ""
-        proj = row.get("FS Projection") or row.get("Projection") or ""
-        floor = row.get("Floor") or ""
-        ceil = row.get("Ceiling") or ""
-        extra = row.get("Moneyball") or row.get("Win %") or row.get("Lineup Slot") or ""
-        html.append(f"""
-<div class="owp-k-card">
-  <div>{_ui_logo(team,42)}</div>
-  <div>
-    <div class="owp-k-name">{_ui_html(name)}</div>
-    <div class="owp-k-meta">{_ui_html(matchup)} • Floor {_ui_html(floor)} / Ceiling {_ui_html(ceil)} • {_ui_html(extra)}</div>
-  </div>
-  <div>
-    <div class="owp-k-proj">{_ui_html(proj)}</div>
-    <div class="owp-k-pick">FS PROJ</div>
-  </div>
-</div>
-""")
-    st.markdown("\n".join(html), unsafe_allow_html=True)
-
-# UI renderer wrappers. They show polished cards first and then keep the full tables below.
-_prev_ui_render_moneyline_edge_tab = render_moneyline_edge_tab
+_prev_mlui_render_moneyline_edge_tab = render_moneyline_edge_tab
 
 def render_moneyline_edge_tab(board, dates=None):
+    st.markdown("### 💰 Moneyline Edge")
+    st.caption("UI-only moneyline cards. Projections and model logic are unchanged.")
     try:
         render_official_recalc_banner(board)
     except Exception:
         pass
-    st.markdown("### Moneyline Edge")
     try:
         df = ml_build_board(board)
-        if df is not None and not df.empty:
-            _ui_render_moneyline_cards(df, max_cards=20)
-            with st.expander("Full Moneyline Table", expanded=False):
-                st.dataframe(df, use_container_width=True, hide_index=True)
+        if df is None or df.empty:
+            st.info("No ML board yet. Refresh the K board first.")
             return
-    except Exception:
-        pass
-    _prev_ui_render_moneyline_edge_tab(board, dates)
-
-_prev_ui_render_kproj_tab = render_kproj_tab
-
-def render_kproj_tab(board):
-    try:
-        df = build_kproj_table(board)
-        if df is not None and not df.empty:
-            st.markdown("### K PROJ / UPSIDE")
-            _ui_render_k_cards(df, max_cards=30)
-            with st.expander("Full K Projection Table", expanded=True):
-                st.dataframe(df, use_container_width=True, hide_index=True)
-            return
-    except Exception:
-        pass
-    _prev_ui_render_kproj_tab(board)
-
-_prev_ui_render_pitcher_fs_tab = render_pitcher_fs_tab
-
-def render_pitcher_fs_tab(board=None):
-    try:
-        render_official_recalc_banner(board)
-    except Exception:
-        pass
-    st.markdown("### Pitcher Fantasy — Self Projected")
-    try:
-        df = build_pitcher_fs_board(board)
-        if df is not None and not df.empty:
-            df = df.sort_values("FS Projection", ascending=False)
-            _ui_render_fs_cards(df, kind="pitcher", max_cards=24)
-            with st.expander("Full Pitcher FS Table", expanded=False):
-                st.dataframe(df, use_container_width=True, hide_index=True)
-            return
-    except Exception:
-        pass
-    _prev_ui_render_pitcher_fs_tab(board)
-
-_prev_ui_render_batter_fs_tab = render_batter_fs_tab
-
-def render_batter_fs_tab():
-    st.markdown("### Batter Fantasy — Self Projected")
-    try:
-        df = build_batter_fs_board()
-        if df is not None and not df.empty:
-            df = df.sort_values("FS Projection", ascending=False)
-            _ui_render_fs_cards(df, kind="batter", max_cards=30)
-            with st.expander("Full Batter FS Table", expanded=False):
-                st.dataframe(df, use_container_width=True, hide_index=True)
-            return
-    except Exception:
-        pass
-    _prev_ui_render_batter_fs_tab()
-
-
-# =========================
-# FINAL K CARD DETAIL + TEAM LOGO FIX
-# Version: FINAL_K_CARD_DETAILS_TEAM_FIX_2026_06_11
-#
-# UI-only:
-# - Fixes wrong pitcher logo/team bug by matching pitcher to actual team/probable starter fields.
-# - Adds important K card details back: BF, IP, floor/median/ceiling, L10 Ks, pitch count, form, last 10.
-# - Does NOT change model projections or picks.
-# =========================
-FINAL_K_CARD_DETAILS_TEAM_FIX_VERSION = "FINAL_K_CARD_DETAILS_TEAM_FIX_2026_06_11"
-
-def _ui_norm_name(x):
-    s = str(x or "").strip().lower()
-    s = re.sub(r"[^a-z0-9\s'-]", "", s)
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-# Small fallback map only for rare UI team fields missing. Normal flow uses raw board fields first.
-PITCHER_TEAM_FALLBACK = {
-    "mitch keller": "PIT",
-    "hunter dobbins": "STL",
-    "christian scott": "NYM",
-    "zebby matthews": "MIN",
-    "keider montero": "DET",
-    "merrill kelly": "ARI",
-    "tyler phillips": "MIA",
-    "martin perez": "ATL",
-    "martín pérez": "ATL",
-    "ryan feltner": "COL",
-    "edward cabrera": "CHC",
-    "justin wrobleski": "LAD",
-    "reid detmers": "LAA",
-    "peter lambert": "HOU",
-    "bryan woo": "SEA",
-    "george kirby": "SEA",
-    "kyle bradish": "BAL",
-    "kumar rocker": "TEX",
-    "michael wacha": "KC",
-}
-
-def _ui_pitcher_team_from_row(row, board=None):
-    # 1) Direct team columns are always preferred.
-    direct_cols = [
-        "Pitcher Team", "pitcher_team", "Team", "team", "team_abbr", "Team Abbr",
-        "PitcherTeam", "player_team", "Player Team"
-    ]
-    for c in direct_cols:
-        val = row.get(c)
-        if val not in (None, "", "—"):
-            return _ui_team_abbr(val)
-
-    pitcher = row.get("Pitcher") or row.get("Player") or row.get("pitcher") or ""
-    pname = _ui_norm_name(pitcher)
-    matchup = str(row.get("Matchup") or row.get("matchup") or "")
-    away, home = _ui_split_matchup(matchup)
-
-    # 2) If row has away/home probable starters, match name to side.
-    away_sp = _ui_norm_name(row.get("Away SP") or row.get("Away Pitcher") or row.get("away_sp"))
-    home_sp = _ui_norm_name(row.get("Home SP") or row.get("Home Pitcher") or row.get("home_sp"))
-    if pname and away_sp and pname == away_sp:
-        return away
-    if pname and home_sp and pname == home_sp:
-        return home
-
-    # 3) Search raw board row for direct team or probable fields.
-    try:
-        for p in board or []:
-            if not isinstance(p, dict):
-                continue
-            bpitcher = _ui_norm_name(p.get("Pitcher") or p.get("pitcher") or p.get("Player"))
-            if bpitcher and bpitcher == pname:
-                for c in direct_cols:
-                    val = p.get(c)
-                    if val not in (None, "", "—"):
-                        return _ui_team_abbr(val)
-                bmatch = str(p.get("Matchup") or p.get("matchup") or matchup)
-                baw, bhome = _ui_split_matchup(bmatch)
-                baw_sp = _ui_norm_name(p.get("Away SP") or p.get("Away Pitcher") or p.get("away_sp"))
-                bhome_sp = _ui_norm_name(p.get("Home SP") or p.get("Home Pitcher") or p.get("home_sp"))
-                if baw_sp and pname == baw_sp:
-                    return baw
-                if bhome_sp and pname == bhome_sp:
-                    return bhome
-    except Exception:
-        pass
-
-    # 4) Known fallback for cases where table lost team fields.
-    if pname in PITCHER_TEAM_FALLBACK:
-        return PITCHER_TEAM_FALLBACK[pname]
-
-    # 5) Last resort only: if no other signal exists.
-    return away or _ui_team_abbr(row.get("Opponent") or "")
-
-def _ui_first_present(row, names, default="—"):
-    for n in names:
-        val = row.get(n)
-        if val not in (None, "", "—"):
-            return val
-    return default
-
-def _ui_fmt_num(x, dec=2, default="—"):
-    try:
-        if x in (None, "", "—"):
-            return default
-        v = float(x)
-        if pd.isna(v):
-            return default
-        if abs(v - round(v)) < 0.005 and dec == 0:
-            return str(int(round(v)))
-        return f"{v:.{dec}f}".rstrip("0").rstrip(".")
-    except Exception:
-        return str(x) if x not in (None, "") else default
-
-def _ui_l10_text(row):
-    # Accept list-like, string-like, or separate L10 fields.
-    val = _ui_first_present(row, ["Last 10", "L10", "Last 10 Starts", "L10 Ks", "Recent Ks"], "")
-    if isinstance(val, (list, tuple)):
-        vals = [str(int(float(x))) if str(x).replace(".","",1).isdigit() else str(x) for x in val]
-        return " • ".join(vals[-10:])
-    s = str(val or "").strip()
-    if s and s != "—":
-        # Normalize commas/spaces to bullets but keep short.
-        nums = re.findall(r"-?\d+(?:\.\d+)?", s)
-        if len(nums) >= 3:
-            return " • ".join(nums[-10:])
-        return s[:80]
-    # individual columns fallback
-    vals = []
-    for i in range(1, 11):
-        for c in [f"L10_{i}", f"L10 {i}", f"Game {i} K"]:
-            if c in row and row.get(c) not in (None, "", "—"):
-                vals.append(str(row.get(c)))
-                break
-    return " • ".join(vals[-10:]) if vals else "—"
-
-def _ui_l10_bars(row):
-    txt = _ui_l10_text(row)
-    nums = []
-    for n in re.findall(r"-?\d+(?:\.\d+)?", txt):
-        try:
-            nums.append(float(n))
-        except Exception:
-            pass
-    nums = nums[-10:]
-    if not nums:
-        return '<div class="owp-l10-empty">Last 10: —</div>'
-    mx = max(max(nums), 1)
-    bars = []
-    for v in nums:
-        h = 18 + int((v / mx) * 34)
-        cls = "good" if v >= mx * 0.70 else "warn" if v >= mx * 0.40 else "bad"
-        bars.append(f'<div class="owp-l10-bar {cls}" style="height:{h}px"><span>{_ui_fmt_num(v,0)}</span></div>')
-    return '<div class="owp-l10"><div class="owp-l10-title">Last 10 Ks</div><div class="owp-l10-bars">' + "".join(bars) + "</div></div>"
-
-def _ui_card_grade_label(row):
-    decision = str(row.get("Decision") or row.get("Pick") or row.get("Model Lean") or "").upper()
-    if "PASS" in decision:
-        return "PASS"
-    if "OVER" in decision:
-        return "OVER"
-    if "UNDER" in decision:
-        return "UNDER"
-    return decision or "LEAN"
-
-# CSS extension for detailed K cards.
-def _ui_k_detail_css():
-    _ui_card_css()
-    st.markdown("""
-<style>
-.owp-k-detail{border:1px solid rgba(255,255,255,.13);background:linear-gradient(135deg,rgba(12,18,27,.94),rgba(9,13,20,.98));border-radius:18px;padding:14px;margin:10px 0;box-shadow:0 8px 22px rgba(0,0,0,.25);}
-.owp-k-top{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;}
-.owp-k-title{font-size:20px;font-weight:900;color:#fff;line-height:1.08;}
-.owp-k-sub{font-size:12px;color:rgba(255,255,255,.62);margin-top:5px;}
-.owp-k-main{text-align:right;}
-.owp-k-main .proj{font-size:30px;font-weight:950;color:#fff;line-height:1;}
-.owp-k-main .pick{font-size:14px;font-weight:950;color:#2ecc71;margin-top:8px;}
-.owp-k-main .pick.pass{color:#f7c948}.owp-k-main .pick.risk{color:#ff405f}
-.owp-k-statgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:12px;border-top:1px solid rgba(255,255,255,.08);padding-top:11px;}
-.owp-k-stat{background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.06);border-radius:12px;padding:8px 6px;text-align:center;}
-.owp-k-stat .lab{font-size:10px;color:rgba(255,255,255,.50);letter-spacing:.06em;text-transform:uppercase;}
-.owp-k-stat .val{font-size:17px;font-weight:900;color:#fff;margin-top:2px;}
-.owp-dist{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:10px;}
-.owp-dist div{background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.06);border-radius:10px;padding:7px;text-align:center;}
-.owp-dist .lab{font-size:10px;color:rgba(255,255,255,.50);text-transform:uppercase;}
-.owp-dist .val{font-size:15px;font-weight:900;color:#fff;}
-.owp-l10{margin-top:12px;border-top:1px solid rgba(255,255,255,.08);padding-top:10px;}
-.owp-l10-title{font-size:11px;color:rgba(255,255,255,.58);text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;}
-.owp-l10-bars{display:flex;gap:5px;align-items:flex-end;height:58px;}
-.owp-l10-bar{flex:1;min-width:12px;border-radius:6px 6px 3px 3px;display:flex;align-items:flex-end;justify-content:center;position:relative;background:#f7c948;}
-.owp-l10-bar.good{background:#2ecc71}.owp-l10-bar.warn{background:#f7c948}.owp-l10-bar.bad{background:#ff405f}
-.owp-l10-bar span{font-size:9px;color:#101010;font-weight:900;margin-bottom:2px;}
-.owp-l10-empty{font-size:12px;color:rgba(255,255,255,.55);margin-top:8px;}
-@media(max-width:520px){
-  .owp-k-statgrid{grid-template-columns:repeat(2,1fr)}
-  .owp-dist{grid-template-columns:repeat(3,1fr)}
-  .owp-k-title{font-size:18px}
-  .owp-k-main .proj{font-size:27px}
-}
-</style>
-""", unsafe_allow_html=True)
-
-def _ui_render_k_cards(df, board=None, max_cards=30):
-    if df is None or df.empty:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Games", len(df))
+        c2.metric("Playable", int((df.get("Status") == "PLAYABLE").sum()) if "Status" in df else 0)
+        c3.metric("Leans", int((df.get("Status") == "LEAN").sum()) if "Status" in df else 0)
+        c4.metric("Avg Edge", round(_mlui_num(df["ML Edge %"].mean(), 0), 2) if "ML Edge %" in df else "—")
+        _mlui_render_cards(df, max_cards=20)
+        with st.expander("Full Moneyline Table", expanded=False):
+            st.dataframe(df, use_container_width=True, hide_index=True)
         return
-    _ui_k_detail_css()
-    html = []
-    for _, rr in df.head(max_cards).iterrows():
-        row = rr.to_dict()
-        matchup = str(row.get("Matchup") or row.get("matchup") or "")
-        team = _ui_pitcher_team_from_row(row, board=board)
-        name = row.get("Pitcher") or row.get("Player") or row.get("pitcher") or ""
-        proj = _ui_first_present(row, ["K PROJ", "Projection", "Median", "K Projection"], "—")
-        line = _ui_first_present(row, ["UD/Line", "Line", "line"], "—")
-        decision = row.get("Decision") or row.get("Pick") or row.get("Model Lean") or ""
-        conf = _ui_first_present(row, ["Confidence %", "Confidence"], "—")
-        bf = _ui_first_present(row, ["Exp BF", "expected_bf", "BF"], "—")
-        ip = _ui_first_present(row, ["IP Projection", "IP Floor", "ip_floor"], "—")
-        pitch_count = _ui_first_present(row, ["Pitch Count", "Pitch Count Avg", "Pitch Count Avg L3", "Pitches"], "—")
-        form = _ui_first_present(row, ["Recent Form", "Form", "Pitch Trend Label", "Volume Learning Label"], "—")
-        whiff = _ui_first_present(row, ["Putaway/Whiff", "Whiff%", "Whiff %"], "—")
-        oppk = _ui_first_present(row, ["Opp K%", "Opponent K%", "opp_k"], "—")
-        floor = _ui_first_present(row, ["Floor"], "—")
-        median = _ui_first_present(row, ["Median", "K PROJ", "Projection"], "—")
-        ceiling = _ui_first_present(row, ["Ceiling"], "—")
-        vol_label = _ui_first_present(row, ["Volume Safety Label", "Exit Risk Label", "Volume Learning Label"], "")
-        pick_cls = "pass" if "PASS" in str(decision).upper() else "risk" if "DANGER" in str(vol_label).upper() else ""
-        html.append(f"""
-<div class="owp-k-detail">
-  <div class="owp-k-top">
-    <div>{_ui_logo(team,48)}</div>
-    <div>
-      <div class="owp-k-title">{_ui_html(name)}</div>
-      <div class="owp-k-sub">{_ui_html(team)} • {_ui_html(matchup)} • Line {_ui_html(line)} • Conf {_ui_html(conf)}</div>
-    </div>
-    <div class="owp-k-main">
-      <div class="proj">{_ui_fmt_num(proj,2)}</div>
-      <div class="pick {pick_cls}">{_ui_html(decision)}</div>
-    </div>
-  </div>
-
-  <div class="owp-k-statgrid">
-    <div class="owp-k-stat"><div class="lab">BF</div><div class="val">{_ui_fmt_num(bf,1)}</div></div>
-    <div class="owp-k-stat"><div class="lab">IP</div><div class="val">{_ui_fmt_num(ip,2)}</div></div>
-    <div class="owp-k-stat"><div class="lab">Pitch Count</div><div class="val">{_ui_fmt_num(pitch_count,0)}</div></div>
-    <div class="owp-k-stat"><div class="lab">Form</div><div class="val">{_ui_html(form)}</div></div>
-    <div class="owp-k-stat"><div class="lab">Whiff</div><div class="val">{_ui_html(whiff)}</div></div>
-    <div class="owp-k-stat"><div class="lab">Opp K%</div><div class="val">{_ui_html(oppk)}</div></div>
-    <div class="owp-k-stat"><div class="lab">Volume</div><div class="val">{_ui_html(vol_label)}</div></div>
-    <div class="owp-k-stat"><div class="lab">Version</div><div class="val">FINAL</div></div>
-  </div>
-
-  <div class="owp-dist">
-    <div><div class="lab">Floor</div><div class="val">{_ui_fmt_num(floor,2)}</div></div>
-    <div><div class="lab">Median</div><div class="val">{_ui_fmt_num(median,2)}</div></div>
-    <div><div class="lab">Ceiling</div><div class="val">{_ui_fmt_num(ceiling,2)}</div></div>
-  </div>
-
-  {_ui_l10_bars(row)}
-</div>
-""")
-    st.markdown("\n".join(html), unsafe_allow_html=True)
-
-# Override K tab once more so it passes raw board into the logo resolver.
-_prev_teamfix_render_kproj_tab = render_kproj_tab
-
-def render_kproj_tab(board):
-    try:
-        df = build_kproj_table(board)
-        if df is not None and not df.empty:
-            st.markdown("### K PROJ / UPSIDE")
-            _ui_render_k_cards(df, board=board, max_cards=30)
-            with st.expander("Full K Projection Table", expanded=True):
-                st.dataframe(df, use_container_width=True, hide_index=True)
-            return
     except Exception:
         pass
-    _prev_teamfix_render_kproj_tab(board)
+    _prev_mlui_render_moneyline_edge_tab(board, dates)
 
 tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_moneyline, tab_iq, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
