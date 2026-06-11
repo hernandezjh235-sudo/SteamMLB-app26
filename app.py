@@ -12346,8 +12346,501 @@ def ml_factor_summary(factors):
         f"BSR {factors.get('BaseRuns/G','—')}"
     )
 
-tab_kproj, tab_moneyline, tab_calibration, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+
+
+# =========================
+# SELF-PROJECTED FANTASY TABS — CLEAN MODULE
+# No Underdog fantasy line pulling.
+# Uses existing app board/context only.
+# K Upside, Moneyline, H+R+R untouched.
+# =========================
+SELF_PROJECTED_FS_VERSION = "SELF_PROJECTED_FS_CLEAN_2026_06_10"
+
+def _fs_num(x, default=0.0):
+    try:
+        if x is None or x == "" or x == "—":
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+def _fs_norm(x):
+    try:
+        return normalize_name(x)
+    except Exception:
+        import re
+        return re.sub(r"[^a-z0-9]+", "", str(x or "").lower())
+
+def _fs_conf(proj, floor, ceiling):
+    spread = max(0.1, float(ceiling) - float(floor))
+    return round(max(45.0, min(88.0, 80.0 - spread * 2.0)), 1)
+
+def _pitcher_fs_from_board_row(p):
+    name = str(p.get("Pitcher") or p.get("player_name") or p.get("name") or p.get("Player") or "").strip()
+    matchup = str(p.get("Matchup") or p.get("matchup") or p.get("Game") or "").strip()
+
+    # K projection from existing K engine only
+    k_proj = None
+    try:
+        k_proj = _fs_num(kproj_upside_projection(p), None)
+    except Exception:
+        k_proj = None
+    if k_proj is None:
+        try:
+            dec = kproj_decision(p)
+            k_proj = _fs_num(dec.get("projection") or dec.get("K PROJ") or dec.get("median"), 0.0)
+        except Exception:
+            k_proj = _fs_num(p.get("K PROJ") or p.get("Projection") or p.get("Median"), 0.0)
+
+    exp_bf = _fs_num(p.get("Exp BF") or p.get("expected_bf") or p.get("BF"), 22.0)
+    ip_floor = _fs_num(p.get("IP Floor") or p.get("ip_floor"), 5.0)
+    ip_proj = max(ip_floor, min(7.2, exp_bf / 4.35))
+
+    opp_runs = _fs_num(p.get("Opp Implied Runs") or p.get("Opp Team Runs") or p.get("opp_implied_runs"), 4.25)
+    er_proj = _fs_num(p.get("ER Proj") or p.get("Earned Runs Projection"), opp_runs * (ip_proj / 9.0) * 0.82)
+
+    win_prob = _fs_num(p.get("Win %") or p.get("Win Probability") or p.get("Team Win%"), 47.0)
+    if win_prob > 1:
+        win_prob = win_prob / 100.0
+
+    qs_prob = _fs_num(p.get("QS %") or p.get("Quality Start %"), None)
+    if qs_prob is None:
+        qs_prob = max(0.05, min(0.65, (ip_proj - 5.4) * 0.35))
+    elif qs_prob > 1:
+        qs_prob = qs_prob / 100.0
+
+    opp_k = _fs_num(p.get("Opp K%") or p.get("Opponent K%") or p.get("Lineup K%"), 22.0)
+    opp_wrc = _fs_num(p.get("Opp wRC+") or p.get("Opponent wRC+") or p.get("Lineup wRC+"), 100.0)
+    park = _fs_num(p.get("Park Factor") or p.get("park_factor"), 1.0)
+
+    matchup_adj = max(-0.75, min(0.75, ((opp_k - 22.0) * 0.04) - ((opp_wrc - 100.0) * 0.01) - ((park - 1.0) * 0.35)))
+
+    # Underdog scoring from user screenshot:
+    # Win +5, QS +5, K +3, IP +3, ER -3
+    fs = (k_proj * 3.0) + (ip_proj * 3.0) - (er_proj * 3.0) + (win_prob * 5.0) + (qs_prob * 5.0) + matchup_adj
+    floor = max(0.0, fs - 4.5)
+    ceiling = fs + 4.5 + (k_proj * 0.35)
+
+    return {
+        "Pitcher": name,
+        "Matchup": matchup,
+        "FS Projection": round(fs, 2),
+        "Floor": round(floor, 2),
+        "Median": round(fs, 2),
+        "Ceiling": round(ceiling, 2),
+        "Confidence %": _fs_conf(fs, floor, ceiling),
+        "K Projection": round(k_proj, 2),
+        "IP Projection": round(ip_proj, 2),
+        "ER Projection": round(er_proj, 2),
+        "Win %": round(win_prob * 100, 1),
+        "QS %": round(qs_prob * 100, 1),
+        "Opp K%": round(opp_k, 1),
+        "Opp wRC+": round(opp_wrc, 1),
+        "Matchup Adj": round(matchup_adj, 2),
+    }
+
+def build_pitcher_fs_board(board=None):
+    rows = []
+    for p in (board or []):
+        try:
+            row = _pitcher_fs_from_board_row(p)
+            if row.get("Pitcher"):
+                rows.append(row)
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
+
+def _get_batter_context_rows():
+    rows, seen = [], set()
+
+    # Prefer an existing H+R+R/batter board if the file has one.
+    for fn_name in ["build_hrr_restored_board", "build_batter_prop_board", "build_batter_board"]:
+        try:
+            fn = globals().get(fn_name)
+            if not callable(fn):
+                continue
+            df = fn()
+            if not hasattr(df, "columns"):
+                continue
+            for _, r in df.iterrows():
+                name = str(r.get("Player") or r.get("Batter") or r.get("Hitter") or r.get("Name") or "").strip()
+                if not name or name == "—":
+                    continue
+                nk = _fs_norm(name)
+                if nk in seen:
+                    continue
+                seen.add(nk)
+                d = r.to_dict()
+                d["Player"] = name
+                rows.append(d)
+        except Exception:
+            continue
+
+    # Fallback: scan session_state for batter-like dataframes.
+    try:
+        for key in list(st.session_state.keys()):
+            obj = st.session_state.get(key)
+            if not hasattr(obj, "columns"):
+                continue
+            if "Pitcher" in obj.columns:
+                continue
+            for col in ["Player", "Batter", "Hitter", "Name"]:
+                if col not in obj.columns:
+                    continue
+                for _, r in obj.iterrows():
+                    name = str(r.get(col) or "").strip()
+                    if not name or name == "—":
+                        continue
+                    nk = _fs_norm(name)
+                    if nk in seen:
+                        continue
+                    seen.add(nk)
+                    d = r.to_dict()
+                    d["Player"] = name
+                    rows.append(d)
+    except Exception:
+        pass
+
+    return rows
+
+def _moneyball_score(ctx):
+    obp = _fs_num(ctx.get("OBP"), 0.320)
+    wrc = _fs_num(ctx.get("wRC+") or ctx.get("Team wRC+") or ctx.get("Lineup wRC+"), 100.0)
+    iso = _fs_num(ctx.get("ISO"), 0.150)
+    bb = _fs_num(ctx.get("BB%") or ctx.get("Walk%"), 8.0)
+    k = _fs_num(ctx.get("K%"), 22.0)
+    score = 50 + (obp - 0.320) * 120 + (wrc - 100) * 0.25 + (iso - 0.150) * 55 + (bb - 8) * 0.8 - max(0, k - 22) * 0.35
+    score = round(max(20, min(95, score)), 1)
+    label = "ELITE" if score >= 75 else ("GOOD" if score >= 62 else ("NEUTRAL" if score >= 45 else "POOR"))
+    return score, label
+
+def _batter_fs_from_context(ctx):
+    name = str(ctx.get("Player") or ctx.get("Batter") or ctx.get("Hitter") or ctx.get("Name") or "").strip()
+    matchup = str(ctx.get("Matchup") or ctx.get("Game") or "").strip()
+
+    slot = ctx.get("Lineup Slot") or ctx.get("Batting Order") or ctx.get("Order") or ctx.get("Slot")
+    team_runs = _fs_num(ctx.get("Team Implied Runs") or ctx.get("ImpR") or ctx.get("Team Runs"), 4.45)
+
+    try:
+        s = int(slot) if _fs_num(slot, None) else 4
+    except Exception:
+        s = 4
+    pa = {1:4.75, 2:4.65, 3:4.50, 4:4.35, 5:4.20, 6:4.05, 7:3.90, 8:3.75, 9:3.60}.get(s, 4.05)
+    pa = max(3.3, min(5.1, pa + ((team_runs - 4.45) * 0.10)))
+
+    avg = _fs_num(ctx.get("AVG"), 0.245)
+    iso = _fs_num(ctx.get("ISO"), 0.150)
+    bb_rate = _fs_num(ctx.get("BB%") or ctx.get("Walk%"), 8.0) / 100.0
+    hbp_rate = _fs_num(ctx.get("HBP%"), 1.0) / 100.0
+
+    hr_rate = _fs_num(ctx.get("HR%"), None)
+    if hr_rate is None:
+        hr_rate = max(0.015, min(0.075, iso * 0.22))
+    elif hr_rate > 1:
+        hr_rate = hr_rate / 100.0
+
+    ab = max(0.1, pa * (1 - bb_rate - hbp_rate))
+    hits = max(0.0, ab * avg)
+    hr = max(0.0, pa * hr_rate)
+    non_hr_hits = max(0.0, hits - hr)
+
+    double_share = max(0.12, min(0.32, 0.16 + iso * 0.35))
+    triple_share = max(0.005, min(0.035, _fs_num(ctx.get("3B/G"), 0.01)))
+    doubles = max(0.0, non_hr_hits * double_share)
+    triples = max(0.0, non_hr_hits * triple_share)
+    singles = max(0.0, non_hr_hits - doubles - triples)
+
+    walks = max(0.0, pa * bb_rate)
+    hbp = max(0.0, pa * hbp_rate)
+
+    runs = 0.45 + (team_runs - 4.45) * 0.10
+    rbi = 0.45 + (team_runs - 4.45) * 0.10
+    if s in [1, 2]:
+        runs += 0.18
+        rbi -= 0.05
+    elif s in [3, 4, 5]:
+        rbi += 0.18
+        runs += 0.05
+    elif s >= 7:
+        runs -= 0.10
+        rbi -= 0.10
+
+    runs = max(0.05, min(1.35, runs + hr * 0.55))
+    rbi = max(0.05, min(1.35, rbi + hr * 0.75))
+
+    sb = _fs_num(ctx.get("SB/G") or ctx.get("SB Rate"), None)
+    if sb is None:
+        sb = min(0.30, _fs_num(ctx.get("SB") or ctx.get("Season SB"), 0.0) / 120.0)
+
+    mb_score, mb_label = _moneyball_score(ctx)
+
+    hand_score = _fs_num(ctx.get("Hand Split Score"), 50.0)
+    pitcher_quality = _fs_num(ctx.get("Pitcher Attack Score") or ctx.get("Pitcher Quality Score"), 50.0)
+    park_score = _fs_num(ctx.get("Park Score") or ctx.get("Run Environment Score"), 50.0)
+    matchup_adj = max(-0.65, min(0.75, ((hand_score - 50) / 100) + ((pitcher_quality - 50) / 120) + ((park_score - 50) / 150)))
+
+    # Underdog hitter scoring from user screenshot:
+    # 1B +3, 2B +6, 3B +8, HR +10, BB +3, HBP +3, RBI +2, R +2, SB +4
+    fs = (
+        singles * 3
+        + doubles * 6
+        + triples * 8
+        + hr * 10
+        + walks * 3
+        + hbp * 3
+        + rbi * 2
+        + runs * 2
+        + sb * 4
+        + matchup_adj
+    )
+    floor = max(0.0, fs * 0.45)
+    ceiling = fs + 3.0 + hr * 5.0 + sb * 2.0
+
+    return {
+        "Player": name,
+        "Matchup": matchup,
+        "FS Projection": round(fs, 2),
+        "Floor": round(floor, 2),
+        "Median": round(fs, 2),
+        "Ceiling": round(ceiling, 2),
+        "Confidence %": _fs_conf(fs, floor, ceiling),
+        "PA": round(pa, 2),
+        "Singles": round(singles, 2),
+        "Doubles": round(doubles, 2),
+        "Triples": round(triples, 2),
+        "HR": round(hr, 2),
+        "Walks": round(walks, 2),
+        "HBP": round(hbp, 2),
+        "Runs": round(runs, 2),
+        "RBI": round(rbi, 2),
+        "SB": round(sb, 2),
+        "Moneyball": mb_label,
+        "Moneyball Score": mb_score,
+        "Matchup Adj": round(matchup_adj, 2),
+    }
+
+def build_batter_fs_board():
+    rows = []
+    for ctx in _get_batter_context_rows():
+        try:
+            row = _batter_fs_from_context(ctx)
+            if row.get("Player"):
+                rows.append(row)
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
+
+def render_pitcher_fs_tab(board=None):
+    st.subheader("Pitcher Fantasy — Self Projected")
+    st.caption("No Underdog Fantasy lines. Uses K projection, IP, ER, Win%, QS%, opponent K/run context, and Underdog scoring.")
+    df = build_pitcher_fs_board(board)
+    if df is None or df.empty:
+        st.info("No Pitcher FS rows yet. Refresh K PROJ / UPSIDE first.")
+        return
+    st.dataframe(df.sort_values("FS Projection", ascending=False), use_container_width=True, hide_index=True)
+
+def render_batter_fs_tab():
+    st.subheader("Batter Fantasy — Self Projected")
+    st.caption("No Underdog Fantasy lines. Uses PA, Moneyball, lineup slot, team runs, matchup context, and Underdog scoring.")
+    df = build_batter_fs_board()
+    if df is None or df.empty:
+        st.info("No Batter FS rows yet. Load H+R+R/batter data or confirmed lineups first.")
+        return
+    st.dataframe(df.sort_values("FS Projection", ascending=False), use_container_width=True, hide_index=True)
+
+
+
+
+# =========================
+# SELF-PROJECTED FS MATCHUP UPGRADES — FS ONLY
+# Adds:
+# Pitcher FS: bullpen, umpire, weather, team run support, implied win probability
+# Batter FS: pitcher hand, pitcher quality, matchup split, bullpen, SB/catcher/pitcher context
+# Does NOT change K Upside, Moneyline, or H+R+R.
+# =========================
+SELF_PROJECTED_FS_UPGRADE_VERSION = "FS_MATCHUP_UPGRADES_2026_06_10"
+
+def _fs_pick_first(row, keys, default=None):
+    for k in keys:
+        try:
+            v = row.get(k)
+            if v not in (None, "", "—"):
+                return v
+        except Exception:
+            pass
+    return default
+
+def _fs_grade_label(score, plus="PLUS", neutral="NEUTRAL", bad="RISK"):
+    s = _fs_num(score, 50)
+    if s >= 68:
+        return plus
+    if s <= 40:
+        return bad
+    return neutral
+
+def _fs_team_from_matchup(row, player_type=""):
+    team = _fs_pick_first(row, ["Team", "team", "Pitcher Team", "Player Team", "Bat Team", "Batter Team", "Tm"], "")
+    opp = _fs_pick_first(row, ["Opponent", "Opp", "Opp Team", "opponent"], "")
+    matchup = str(_fs_pick_first(row, ["Matchup", "matchup", "Game"], "") or "")
+    return str(team or "").strip(), str(opp or "").strip(), matchup.strip()
+
+def _fs_pitcher_context_scores(row):
+    # Run support / implied win chance
+    team_runs = _fs_num(_fs_pick_first(row, ["Team Implied Runs", "Team Runs", "Run Support", "Projected Team Runs", "ImpR"], 4.45), 4.45)
+    opp_runs = _fs_num(_fs_pick_first(row, ["Opp Implied Runs", "Opp Team Runs", "Opponent Implied Runs"], 4.25), 4.25)
+    win_prob = _fs_num(_fs_pick_first(row, ["Win %", "Win Probability", "Team Win%", "Vegas Win %", "Moneyline Win %"], None), None)
+    if win_prob is None:
+        # logistic-ish estimate from run support edge
+        win_prob = max(0.30, min(0.70, 0.50 + (team_runs - opp_runs) * 0.055))
+    elif win_prob > 1:
+        win_prob = win_prob / 100.0
+
+    # Bullpen support: for pitcher fantasy, good own bullpen helps win hold
+    bp_score = _fs_num(_fs_pick_first(row, ["Bullpen Score", "Team Bullpen Score", "Own Bullpen Score"], 50), 50)
+    opp_bp_score = _fs_num(_fs_pick_first(row, ["Opp Bullpen Score", "Opponent Bullpen Score", "Bullpen Attack Score"], 50), 50)
+    bullpen_adj = max(-0.35, min(0.35, (bp_score - 50) / 180))
+
+    # Umpire: strike-friendly helps pitcher
+    ump_score = _fs_num(_fs_pick_first(row, ["Umpire Score", "Umpire K Score", "Umpire Micro Score"], 50), 50)
+    ump_adj = max(-0.25, min(0.25, (ump_score - 50) / 160))
+
+    # Weather/park: pitcher-friendly park/weather helps suppress ER
+    park = _fs_num(_fs_pick_first(row, ["Park Factor", "park_factor"], 1.0), 1.0)
+    weather_score = _fs_num(_fs_pick_first(row, ["Weather Score", "Weather K Score", "Weather Upgrade Score"], 50), 50)
+    weather_adj = max(-0.30, min(0.30, ((50 - (park - 1.0) * 100) - 50) / 180 + (weather_score - 50) / 220))
+
+    run_support_adj = max(-0.40, min(0.45, (team_runs - 4.45) * 0.12))
+
+    return {
+        "Team Implied Runs": round(team_runs, 2),
+        "Opp Implied Runs": round(opp_runs, 2),
+        "Win Probability": round(win_prob * 100, 1),
+        "Bullpen Adj": round(bullpen_adj, 2),
+        "Umpire Adj": round(ump_adj, 2),
+        "Weather/Park Adj": round(weather_adj, 2),
+        "Run Support Adj": round(run_support_adj, 2),
+        "Pitcher FS Context Adj": round(bullpen_adj + ump_adj + weather_adj + run_support_adj, 2),
+    }
+
+# Save original FS functions and wrap them.
+_prev_pitcher_fs_from_board_row = _pitcher_fs_from_board_row
+
+def _pitcher_fs_from_board_row(p):
+    row = _prev_pitcher_fs_from_board_row(p)
+    ctx = _fs_pitcher_context_scores(p)
+
+    # Replace win % if stronger implied win is available
+    fs_base = _fs_num(row.get("FS Projection"), 0)
+    old_win = _fs_num(row.get("Win %"), 47) / 100.0
+    new_win = _fs_num(ctx.get("Win Probability"), old_win * 100) / 100.0
+    win_delta_pts = (new_win - old_win) * 5.0
+
+    total_adj = ctx["Pitcher FS Context Adj"] + win_delta_pts
+    new_fs = max(0, fs_base + total_adj)
+
+    floor = max(0, _fs_num(row.get("Floor"), 0) + min(0, total_adj) * 1.2)
+    ceiling = _fs_num(row.get("Ceiling"), new_fs) + max(0, total_adj) * 1.2
+
+    row.update(ctx)
+    row["Base FS Projection"] = round(fs_base, 2)
+    row["FS Projection"] = round(new_fs, 2)
+    row["Median"] = round(new_fs, 2)
+    row["Floor"] = round(floor, 2)
+    row["Ceiling"] = round(ceiling, 2)
+    row["Win %"] = ctx["Win Probability"]
+    row["FS Upgrade Version"] = SELF_PROJECTED_FS_UPGRADE_VERSION
+    return row
+
+def _fs_batter_context_scores(ctx):
+    # Player/team/matchup fields
+    team, opp, matchup = _fs_team_from_matchup(ctx, "batter")
+
+    # Pitcher hand / split
+    hand = str(_fs_pick_first(ctx, ["Opp SP Hand", "Pitcher Hand", "SP Hand", "Opp Hand", "Throws"], "UNK") or "UNK").upper()
+    if hand.startswith("L"):
+        split_wrc = _fs_num(_fs_pick_first(ctx, ["wRC+ vs LHP", "vs LHP wRC+", "LHP wRC+"], 100), 100)
+        split_ops = _fs_num(_fs_pick_first(ctx, ["OPS vs LHP", "vs LHP OPS"], 0.720), 0.720)
+    elif hand.startswith("R"):
+        split_wrc = _fs_num(_fs_pick_first(ctx, ["wRC+ vs RHP", "vs RHP wRC+", "RHP wRC+"], 100), 100)
+        split_ops = _fs_num(_fs_pick_first(ctx, ["OPS vs RHP", "vs RHP OPS"], 0.720), 0.720)
+    else:
+        split_wrc = _fs_num(_fs_pick_first(ctx, ["wRC+", "Team wRC+", "Lineup wRC+"], 100), 100)
+        split_ops = _fs_num(_fs_pick_first(ctx, ["OPS"], 0.720), 0.720)
+
+    hand_score = max(20, min(92, 50 + (split_wrc - 100) * 0.45 + (split_ops - 0.720) * 45))
+
+    # Pitcher quality: high score means better hitter matchup
+    sp_era = _fs_num(_fs_pick_first(ctx, ["Opp SP ERA", "Pitcher ERA"], 4.20), 4.20)
+    sp_fip = _fs_num(_fs_pick_first(ctx, ["Opp SP FIP", "Pitcher FIP", "xFIP"], 4.20), 4.20)
+    sp_whip = _fs_num(_fs_pick_first(ctx, ["Opp SP WHIP", "Pitcher WHIP"], 1.28), 1.28)
+    sp_k9 = _fs_num(_fs_pick_first(ctx, ["Opp SP K/9", "Pitcher K/9"], 8.5), 8.5)
+    hard_allowed = _fs_num(_fs_pick_first(ctx, ["HardHit% Allowed", "Opp SP HardHit%"], 39.0), 39.0)
+    pitcher_quality_score = max(20, min(92, 50 + (sp_era - 4.20) * 3.4 + (sp_fip - 4.20) * 2.8 + (sp_whip - 1.28) * 16 - (sp_k9 - 8.5) * 1.4 + (hard_allowed - 39) * 0.45))
+
+    # Opposing bullpen
+    opp_bp = _fs_num(_fs_pick_first(ctx, ["Opp Bullpen Score", "Opponent Bullpen Score", "Bullpen Attack Score"], 50), 50)
+    opp_bp_era = _fs_num(_fs_pick_first(ctx, ["Opp Bullpen ERA", "Opponent Bullpen ERA"], None), None)
+    bullpen_score = opp_bp
+    if opp_bp_era is not None:
+        bullpen_score += (opp_bp_era - 4.10) * 3.0
+    bullpen_score = max(20, min(92, bullpen_score))
+
+    # Park/weather
+    park = _fs_num(_fs_pick_first(ctx, ["Park Factor", "park_factor"], 1.0), 1.0)
+    weather_score = _fs_num(_fs_pick_first(ctx, ["Weather Score", "Weather Hitter Score", "Weather Upgrade Score"], 50), 50)
+    park_weather_score = max(20, min(92, 50 + (park - 1.0) * 55 + (weather_score - 50) * 0.25))
+
+    # SB vs catcher/pitcher matchup
+    sb = _fs_num(_fs_pick_first(ctx, ["SB", "Season SB"], 0), 0)
+    sprint = _fs_num(_fs_pick_first(ctx, ["Sprint Speed", "SprintSpeed"], 27.0), 27.0)
+    catcher_cs = _fs_num(_fs_pick_first(ctx, ["Opp Catcher CS%", "Catcher CS%"], 27.0), 27.0)
+    pitcher_sb_allowed = _fs_num(_fs_pick_first(ctx, ["Pitcher SB Allowed", "Opp SP SB Allowed"], 0), 0)
+    sb_score = max(20, min(92, 50 + min(sb, 35) * 0.55 + (sprint - 27) * 2.5 + (27 - catcher_cs) * 0.35 + min(pitcher_sb_allowed, 20) * 0.35))
+
+    total_adj = (
+        max(-0.35, min(0.45, (hand_score - 50) / 90)) +
+        max(-0.30, min(0.35, (pitcher_quality_score - 50) / 105)) +
+        max(-0.20, min(0.25, (bullpen_score - 50) / 140)) +
+        max(-0.18, min(0.22, (park_weather_score - 50) / 150)) +
+        max(-0.05, min(0.12, (sb_score - 50) / 300))
+    )
+
+    return {
+        "Team": team,
+        "Opponent": opp,
+        "Pitcher Hand": hand,
+        "Hand Split Score": round(hand_score, 1),
+        "Pitcher Quality Score": round(pitcher_quality_score, 1),
+        "Bullpen Score": round(bullpen_score, 1),
+        "Park/Weather Score": round(park_weather_score, 1),
+        "SB Matchup Score": round(sb_score, 1),
+        "Batter FS Context Adj": round(total_adj, 2),
+    }
+
+_prev_batter_fs_from_context = _batter_fs_from_context
+
+def _batter_fs_from_context(ctx):
+    row = _prev_batter_fs_from_context(ctx)
+    c = _fs_batter_context_scores(ctx)
+
+    fs_base = _fs_num(row.get("FS Projection"), 0)
+    total_adj = c["Batter FS Context Adj"]
+    new_fs = max(0, fs_base + total_adj)
+
+    row.update(c)
+    row["Base FS Projection"] = round(fs_base, 2)
+    row["FS Projection"] = round(new_fs, 2)
+    row["Median"] = round(new_fs, 2)
+    row["Floor"] = round(max(0, _fs_num(row.get("Floor"), 0) + min(0, total_adj) * 1.2), 2)
+    row["Ceiling"] = round(_fs_num(row.get("Ceiling"), new_fs) + max(0, total_adj) * 1.2, 2)
+    row["FS Upgrade Version"] = SELF_PROJECTED_FS_UPGRADE_VERSION
+    return row
+
+
+tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_moneyline, tab_calibration, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
+    "PITCHER FS",
+    "BATTER FS",
     "MONEYLINE EDGE",
     "CALIBRATION AUDIT",
     "TOP PLAYS",
@@ -12361,6 +12854,12 @@ tab_kproj, tab_moneyline, tab_calibration, tab1, tab_best4, tab2, tab3, tab4, ta
 
 with tab_kproj:
     render_kproj_tab(board)
+
+with tab_pitcher_fs:
+    render_pitcher_fs_tab(board)
+
+with tab_batter_fs:
+    render_batter_fs_tab()
 
 with tab_moneyline:
     render_moneyline_edge_tab(board, dates)
