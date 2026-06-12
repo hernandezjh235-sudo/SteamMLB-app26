@@ -18782,6 +18782,191 @@ def render_mlb30_auto_puller():
         st.markdown("**Bullpen Run Prevention 14d**")
         st.dataframe(st.session_state.get("team_14d_bullpen_df", pd.DataFrame()), use_container_width=True, hide_index=True)
 
+
+# =========================
+# TIER 1 + TIER 2 PITCHER IQ ADDON
+# Version: TIER12_PITCHER_IQ_2026_06_11
+#
+# Tier 1:
+# - CSW%
+# - SwStr%
+# - First Strike %
+#
+# Tier 2:
+# - Days Rest
+#
+# Safe design:
+# - Uses values only when available.
+# - Days Rest is calculated from 30-day pitcher logs.
+# - Does not rewrite K skill engine.
+# - Adds small IQ/readiness signal only.
+# =========================
+TIER12_PITCHER_IQ_VERSION = "TIER12_PITCHER_IQ_2026_06_11"
+
+def _t12_num(x, default=0.0):
+    try:
+        if x in (None, "", "—"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _t12_cap(x, lo, hi):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return 0.0
+
+def _t12_norm(x):
+    s = str(x or "").strip().lower()
+    s = re.sub(r"[^a-z0-9\s'-]", "", s)
+    return re.sub(r"\s+", " ", s)
+
+def _t12_pitcher_rest_days(pitcher):
+    try:
+        df = st.session_state.get("pitcher_30_day_logs", pd.DataFrame())
+        if not isinstance(df, pd.DataFrame) or df.empty or "Pitcher" not in df.columns or "Date" not in df.columns:
+            return None
+        d = df.copy()
+        d["_name"] = d["Pitcher"].map(_t12_norm)
+        d = d[d["_name"] == _t12_norm(pitcher)].copy()
+        if d.empty:
+            return None
+        d["_date"] = pd.to_datetime(d["Date"], errors="coerce")
+        d = d.dropna(subset=["_date"]).sort_values("_date")
+        if d.empty:
+            return None
+        last_date = d["_date"].max()
+        today = pd.Timestamp.today().normalize()
+        return int((today - last_date.normalize()).days)
+    except Exception:
+        return None
+
+def _t12_recent_pitcher_profile(pitcher):
+    try:
+        df = st.session_state.get("pitcher_30_day_logs", pd.DataFrame())
+        if not isinstance(df, pd.DataFrame) or df.empty or "Pitcher" not in df.columns:
+            return {}
+        d = df.copy()
+        d["_name"] = d["Pitcher"].map(_t12_norm)
+        d = d[d["_name"] == _t12_norm(pitcher)].copy()
+        if d.empty:
+            return {}
+        for c in ["K", "BF", "IP", "Pitch Count", "BB", "ER", "HR", "WHIP"]:
+            if c in d.columns:
+                d[c] = pd.to_numeric(d[c], errors="coerce")
+        return {
+            "T12 30D Starts": int(len(d)),
+            "T12 30D Avg K": round(d["K"].mean(), 2) if "K" in d else None,
+            "T12 30D Avg BF": round(d["BF"].mean(), 2) if "BF" in d else None,
+            "T12 30D Avg IP": round(d["IP"].mean(), 2) if "IP" in d else None,
+            "T12 30D Avg Pitch Count": round(d["Pitch Count"].mean(), 1) if "Pitch Count" in d else None,
+            "T12 30D WHIP": round(d["WHIP"].mean(), 2) if "WHIP" in d else None,
+            "T12 Days Rest": _t12_pitcher_rest_days(pitcher),
+        }
+    except Exception:
+        return {}
+
+def _t12_pitch_skill_iq(row):
+    """
+    Uses pitch-quality indicators when already present in the board.
+    If missing, neutral values are used; no fake edge is created.
+    """
+    csw = _t12_num(row.get("CSW%") or row.get("CSW") or row.get("Called+Swinging Strike%"), 29.0)
+    swstr = _t12_num(row.get("SwStr%") or row.get("Swinging Strike%") or row.get("Whiff Strike%"), 11.5)
+    fstrike = _t12_num(row.get("F-Strike%") or row.get("First Strike %") or row.get("FirstStrike%"), 61.0)
+    days_rest = row.get("T12 Days Rest")
+    if days_rest in (None, "", "—"):
+        days_rest = None
+    else:
+        days_rest = _t12_num(days_rest, None)
+
+    score = 50.0
+    score += _t12_cap((csw - 29.0) * 1.4, -10, 12)
+    score += _t12_cap((swstr - 11.5) * 1.8, -10, 12)
+    score += _t12_cap((fstrike - 61.0) * 0.55, -8, 8)
+
+    rest_label = "REST_UNKNOWN"
+    if days_rest is not None:
+        if days_rest < 4:
+            score -= 6
+            rest_label = "SHORT_REST"
+        elif days_rest in [4, 5]:
+            score += 2
+            rest_label = "NORMAL_REST"
+        elif days_rest >= 6:
+            score += 1
+            rest_label = "EXTRA_REST"
+
+    score = round(max(0, min(100, score)), 1)
+    if score >= 65:
+        label = "PITCH_IQ_UP"
+    elif score <= 38:
+        label = "PITCH_IQ_DOWN"
+    else:
+        label = "PITCH_IQ_NEUTRAL"
+
+    return {
+        "T12 CSW%": round(csw, 1),
+        "T12 SwStr%": round(swstr, 1),
+        "T12 First Strike%": round(fstrike, 1),
+        "T12 Days Rest Label": rest_label,
+        "T12 Pitch IQ Score": score,
+        "T12 Pitch IQ Label": label,
+        "T12 Version": TIER12_PITCHER_IQ_VERSION,
+    }
+
+if "build_kproj_table" in globals():
+    _prev_t12_build_kproj_table = build_kproj_table
+
+    def build_kproj_table(board):
+        df = _prev_t12_build_kproj_table(board)
+        try:
+            if df is None or df.empty:
+                return df
+            d = df.copy()
+            profiles = []
+            iq_rows = []
+            for _, rr in d.iterrows():
+                row = rr.to_dict()
+                pitcher = row.get("Pitcher") or row.get("Player") or row.get("Name") or ""
+                prof = _t12_recent_pitcher_profile(pitcher)
+                row.update(prof)
+                iq = _t12_pitch_skill_iq(row)
+                profiles.append(prof)
+                iq_rows.append(iq)
+
+            prof_df = pd.DataFrame(profiles)
+            iq_df = pd.DataFrame(iq_rows)
+            if not prof_df.empty:
+                d = pd.concat([d.reset_index(drop=True), prof_df.reset_index(drop=True)], axis=1)
+            if not iq_df.empty:
+                d = pd.concat([d.reset_index(drop=True), iq_df.reset_index(drop=True)], axis=1)
+            return d
+        except Exception:
+            return df
+
+def render_tier12_pitcher_iq_panel():
+    st.markdown("### 🧠 Tier 1 + Tier 2 Pitcher IQ")
+    st.caption("Adds pitch-quality IQ and days-rest context. Uses real values when available; missing pitch-level values stay neutral.")
+    try:
+        df = build_kproj_table(board) if "board" in globals() else pd.DataFrame()
+        cols = [c for c in [
+            "Pitcher", "Matchup", "K PROJ", "UD/Line", "Decision",
+            "T12 30D Starts", "T12 30D Avg K", "T12 30D Avg BF", "T12 30D Avg IP",
+            "T12 30D Avg Pitch Count", "T12 Days Rest", "T12 Days Rest Label",
+            "T12 CSW%", "T12 SwStr%", "T12 First Strike%", "T12 Pitch IQ Score", "T12 Pitch IQ Label"
+        ] if c in df.columns]
+        if cols:
+            st.dataframe(df[cols], use_container_width=True, hide_index=True)
+        else:
+            st.info("Tier 1/2 IQ will populate after K board and/or 30D logs are loaded.")
+    except Exception:
+        st.info("Tier 1/2 IQ will populate after K board and/or 30D logs are loaded.")
+
 tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_moneyline, tab_mlb30_puller, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
