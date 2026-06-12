@@ -17249,12 +17249,1021 @@ def _baseball_iq_for_k_row(p):
     base.update(v)
     return base
 
-tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_moneyline, tab_iq, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+
+# =========================
+# MONEYLINE UI ONLY FINAL POLISH
+# Version: ML_UI_ONLY_FINAL_2026_06_11
+#
+# UI ONLY:
+# - Improves Moneyline cards.
+# - Adds projected score, model win %, edge, confidence.
+# - Adds correct team logos based on matchup teams.
+# - Leaves K Upside, Pitcher FS, Batter FS, Moneyline logic, and all projections unchanged.
+# =========================
+ML_UI_ONLY_FINAL_VERSION = "ML_UI_ONLY_FINAL_2026_06_11"
+
+_ML_UI_LOGOS = {
+    "ARI": "https://www.mlbstatic.com/team-logos/109.svg", "AZ": "https://www.mlbstatic.com/team-logos/109.svg",
+    "ATL": "https://www.mlbstatic.com/team-logos/144.svg",
+    "BAL": "https://www.mlbstatic.com/team-logos/110.svg",
+    "BOS": "https://www.mlbstatic.com/team-logos/111.svg",
+    "CHC": "https://www.mlbstatic.com/team-logos/112.svg",
+    "CWS": "https://www.mlbstatic.com/team-logos/145.svg", "CHW": "https://www.mlbstatic.com/team-logos/145.svg",
+    "CIN": "https://www.mlbstatic.com/team-logos/113.svg",
+    "CLE": "https://www.mlbstatic.com/team-logos/114.svg",
+    "COL": "https://www.mlbstatic.com/team-logos/115.svg",
+    "DET": "https://www.mlbstatic.com/team-logos/116.svg",
+    "HOU": "https://www.mlbstatic.com/team-logos/117.svg",
+    "KC": "https://www.mlbstatic.com/team-logos/118.svg", "KCR": "https://www.mlbstatic.com/team-logos/118.svg",
+    "LAA": "https://www.mlbstatic.com/team-logos/108.svg",
+    "LAD": "https://www.mlbstatic.com/team-logos/119.svg",
+    "MIA": "https://www.mlbstatic.com/team-logos/146.svg",
+    "MIL": "https://www.mlbstatic.com/team-logos/158.svg",
+    "MIN": "https://www.mlbstatic.com/team-logos/142.svg",
+    "NYM": "https://www.mlbstatic.com/team-logos/121.svg",
+    "NYY": "https://www.mlbstatic.com/team-logos/147.svg",
+    "ATH": "https://www.mlbstatic.com/team-logos/133.svg", "OAK": "https://www.mlbstatic.com/team-logos/133.svg",
+    "PHI": "https://www.mlbstatic.com/team-logos/143.svg",
+    "PIT": "https://www.mlbstatic.com/team-logos/134.svg",
+    "SD": "https://www.mlbstatic.com/team-logos/135.svg", "SDP": "https://www.mlbstatic.com/team-logos/135.svg",
+    "SEA": "https://www.mlbstatic.com/team-logos/136.svg",
+    "SF": "https://www.mlbstatic.com/team-logos/137.svg", "SFG": "https://www.mlbstatic.com/team-logos/137.svg",
+    "STL": "https://www.mlbstatic.com/team-logos/138.svg",
+    "TB": "https://www.mlbstatic.com/team-logos/139.svg", "TBR": "https://www.mlbstatic.com/team-logos/139.svg",
+    "TEX": "https://www.mlbstatic.com/team-logos/140.svg",
+    "TOR": "https://www.mlbstatic.com/team-logos/141.svg",
+    "WSH": "https://www.mlbstatic.com/team-logos/120.svg", "WAS": "https://www.mlbstatic.com/team-logos/120.svg",
+}
+
+_ML_UI_TEAM_NAMES = {
+    "ARIZONA DIAMONDBACKS": "ARI", "ATLANTA BRAVES": "ATL", "BALTIMORE ORIOLES": "BAL",
+    "BOSTON RED SOX": "BOS", "CHICAGO CUBS": "CHC", "CHICAGO WHITE SOX": "CWS",
+    "CINCINNATI REDS": "CIN", "CLEVELAND GUARDIANS": "CLE", "COLORADO ROCKIES": "COL",
+    "DETROIT TIGERS": "DET", "HOUSTON ASTROS": "HOU", "KANSAS CITY ROYALS": "KC",
+    "LOS ANGELES ANGELS": "LAA", "LOS ANGELES DODGERS": "LAD", "MIAMI MARLINS": "MIA",
+    "MILWAUKEE BREWERS": "MIL", "MINNESOTA TWINS": "MIN", "NEW YORK METS": "NYM",
+    "NEW YORK YANKEES": "NYY", "ATHLETICS": "ATH", "OAKLAND ATHLETICS": "ATH",
+    "PHILADELPHIA PHILLIES": "PHI", "PITTSBURGH PIRATES": "PIT", "SAN DIEGO PADRES": "SD",
+    "SEATTLE MARINERS": "SEA", "SAN FRANCISCO GIANTS": "SF", "ST. LOUIS CARDINALS": "STL",
+    "ST LOUIS CARDINALS": "STL", "TAMPA BAY RAYS": "TB", "TEXAS RANGERS": "TEX",
+    "TORONTO BLUE JAYS": "TOR", "WASHINGTON NATIONALS": "WSH",
+}
+
+def _mlui_html(x):
+    try:
+        import html
+        return html.escape("" if x is None else str(x))
+    except Exception:
+        return "" if x is None else str(x)
+
+def _mlui_num(x, default=0.0):
+    try:
+        if x in (None, "", "—"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _mlui_abbr(x):
+    s = str(x or "").strip()
+    if not s:
+        return ""
+    up = s.upper().replace(".", "")
+    if up in _ML_UI_LOGOS:
+        return up
+    if up in _ML_UI_TEAM_NAMES:
+        return _ML_UI_TEAM_NAMES[up]
+    found = re.findall(r"\b[A-Z]{2,3}\b", up)
+    for f in found:
+        if f in _ML_UI_LOGOS:
+            return f
+    return up[:3]
+
+def _mlui_split_matchup(matchup):
+    try:
+        if "@" in str(matchup):
+            a, h = str(matchup).split("@", 1)
+            return _mlui_abbr(a.strip()), _mlui_abbr(h.strip())
+    except Exception:
+        pass
+    try:
+        return ml_split_matchup(matchup)
+    except Exception:
+        return "", ""
+
+def _mlui_logo(team, size=46):
+    ab = _mlui_abbr(team)
+    url = _ML_UI_LOGOS.get(ab, "")
+    if url:
+        return f'<img src="{url}" style="width:{size}px;height:{size}px;object-fit:contain;" />'
+    return f'<div class="mlui-logo-fallback" style="width:{size}px;height:{size}px;">{_mlui_html(ab)}</div>'
+
+def _mlui_pick_side(row, away, home):
+    pick = _mlui_abbr(row.get("Pick") or row.get("Model Pick") or row.get("Score Pick") or row.get("Lean") or "")
+    if pick not in [away, home] and pick:
+        # allow exact abbreviation still
+        return pick
+    return pick or _mlui_abbr(row.get("Score Pick") or away)
+
+def _mlui_pick_pct(row, pick, away, home):
+    if pick == away:
+        return row.get("Away Model %") or row.get("Away Win %") or row.get("Model Win %") or row.get("Win %")
+    if pick == home:
+        return row.get("Home Model %") or row.get("Home Win %") or row.get("Model Win %") or row.get("Win %")
+    return row.get("Model Win %") or row.get("Win %") or row.get("Away Model %") or row.get("Home Model %")
+
+def _mlui_opp_pct(row, pick, away, home):
+    if pick == away:
+        return row.get("Home Model %") or row.get("Home Win %")
+    if pick == home:
+        return row.get("Away Model %") or row.get("Away Win %")
+    return ""
+
+def _mlui_pct(x):
+    if x in (None, "", "—"):
+        return "—"
+    v = _mlui_num(x, 0)
+    if abs(v) <= 1 and v != 0:
+        v *= 100
+    return f"{v:.1f}%"
+
+def _mlui_edge(row):
+    val = row.get("ML Edge %")
+    if val in (None, "", "—"):
+        val = row.get("Model Edge %") or row.get("Edge %") or row.get("Score Edge")
+    if val in (None, "", "—"):
+        return "—"
+    try:
+        return f"{float(val):+.1f}%"
+    except Exception:
+        return str(val)
+
+def _mlui_score(row, away, home):
+    val = row.get("Projected Score") or row.get("Score Projection") or row.get("Predicted Score")
+    if val not in (None, "", "—"):
+        return str(val)
+    ar = row.get("Away Projected Runs") or row.get("Away Runs")
+    hr = row.get("Home Projected Runs") or row.get("Home Runs")
+    if ar not in (None, "", "—") and hr not in (None, "", "—"):
+        return f"{away} {_mlui_num(ar):.1f} - {home} {_mlui_num(hr):.1f}"
+    return "—"
+
+def _mlui_conf(row):
+    return row.get("Confidence") or row.get("Confidence Label") or row.get("ML Grade") or row.get("Grade") or row.get("Status") or "—"
+
+def _mlui_css():
+    st.markdown("""
+<style>
+.mlui-wrap{display:grid;grid-template-columns:1fr;gap:14px;margin:10px 0 18px 0;}
+.mlui-card{border:1px solid rgba(255,77,77,.34);background:linear-gradient(135deg,rgba(115,0,22,.38),rgba(7,13,21,.95));border-radius:20px;padding:15px;box-shadow:0 10px 30px rgba(0,0,0,.30);overflow:hidden;}
+.mlui-card.blue{border-color:rgba(47,156,255,.45);background:linear-gradient(135deg,rgba(0,86,155,.28),rgba(7,13,21,.96));}
+.mlui-head{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:center;border-bottom:1px solid rgba(255,255,255,.10);padding-bottom:11px;margin-bottom:11px;}
+.mlui-team{display:flex;align-items:center;gap:9px;min-width:0;}
+.mlui-team.right{justify-content:flex-end;text-align:right;}
+.mlui-abbr{font-size:28px;font-weight:950;color:#fff;line-height:1;}
+.mlui-sp{font-size:12px;color:rgba(255,255,255,.62);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:130px;}
+.mlui-at{font-size:19px;font-weight:900;color:#fff;background:rgba(255,255,255,.07);border-radius:50%;width:36px;height:36px;display:flex;align-items:center;justify-content:center;}
+.mlui-main{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:center;margin-bottom:12px;}
+.mlui-pct{font-size:29px;font-weight:950;color:#ff405f;line-height:1;}
+.mlui-pct.blue{color:#2f9cff;}
+.mlui-small{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:rgba(255,255,255,.55);margin-top:4px;}
+.mlui-center{text-align:center;}
+.mlui-pill{display:inline-block;border:1px solid rgba(255,255,255,.16);border-radius:999px;padding:4px 10px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#ff405f;background:rgba(255,255,255,.05);margin-bottom:7px;}
+.mlui-pick{font-size:26px;font-weight:950;font-style:italic;color:#fff;}
+.mlui-score{font-size:18px;font-weight:950;color:#fff;}
+.mlui-metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;border-top:1px solid rgba(255,255,255,.10);padding-top:11px;}
+.mlui-metric{text-align:center;border-right:1px solid rgba(255,255,255,.08);min-width:0;}
+.mlui-metric:last-child{border-right:0;}
+.mlui-mval{font-size:17px;font-weight:950;color:#fff;white-space:nowrap;}
+.mlui-mval.hot{color:#ff405f}.mlui-mval.good{color:#2ecc71}.mlui-mval.warn{color:#f7c948}.mlui-mval.blue{color:#2f9cff}
+.mlui-logo-fallback{border-radius:50%;background:rgba(255,255,255,.08);display:flex;align-items:center;justify-content:center;font-weight:900;color:#fff;font-size:12px;}
+@media(max-width:520px){
+  .mlui-card{padding:13px;border-radius:18px}
+  .mlui-abbr{font-size:25px}
+  .mlui-sp{max-width:90px}
+  .mlui-pct{font-size:24px}
+  .mlui-pick{font-size:22px}
+  .mlui-metrics{grid-template-columns:repeat(2,1fr)}
+  .mlui-metric{border-right:0;border-top:1px solid rgba(255,255,255,.06);padding-top:7px}
+}
+</style>
+""", unsafe_allow_html=True)
+
+def _mlui_render_cards(df, max_cards=20):
+    if df is None or df.empty:
+        st.info("No Moneyline rows yet.")
+        return
+    _mlui_css()
+    cards = []
+    for _, rr in df.head(max_cards).iterrows():
+        row = rr.to_dict()
+        matchup = str(row.get("Matchup") or "")
+        away, home = _mlui_split_matchup(matchup)
+        pick = _mlui_pick_side(row, away, home)
+        pick_pct = _mlui_pick_pct(row, pick, away, home)
+        opp_pct = _mlui_opp_pct(row, pick, away, home)
+        score = _mlui_score(row, away, home)
+        edge = _mlui_edge(row)
+        conf = _mlui_conf(row)
+        away_sp = row.get("Away SP") or row.get("Away Pitcher") or "—"
+        home_sp = row.get("Home SP") or row.get("Home Pitcher") or "—"
+        is_blue = pick == home
+        cards.append(f"""
+<div class="mlui-card {'blue' if is_blue else ''}">
+  <div class="mlui-head">
+    <div class="mlui-team">{_mlui_logo(away,48)}<div><div class="mlui-abbr">{_mlui_html(away)}</div><div class="mlui-sp">{_mlui_html(away_sp)}</div></div></div>
+    <div class="mlui-at">@</div>
+    <div class="mlui-team right"><div><div class="mlui-abbr">{_mlui_html(home)}</div><div class="mlui-sp">{_mlui_html(home_sp)}</div></div>{_mlui_logo(home,48)}</div>
+  </div>
+  <div class="mlui-main">
+    <div><div class="mlui-pct">{_mlui_pct(pick_pct)}</div><div class="mlui-small">Model Win %</div></div>
+    <div class="mlui-center"><div class="mlui-pill">ML Projection</div><div class="mlui-pick">{_mlui_html(pick)}</div></div>
+    <div style="text-align:right;"><div class="mlui-pct blue">{_mlui_pct(opp_pct) if opp_pct not in (None,'','—') else ''}</div><div class="mlui-small">Projected Score</div><div class="mlui-score">{_mlui_html(score)}</div></div>
+  </div>
+  <div class="mlui-metrics">
+    <div class="mlui-metric"><div class="mlui-small">Edge</div><div class="mlui-mval hot">{_mlui_html(edge)}</div></div>
+    <div class="mlui-metric"><div class="mlui-small">Win Prob</div><div class="mlui-mval">{_mlui_pct(pick_pct)}</div></div>
+    <div class="mlui-metric"><div class="mlui-small">Score</div><div class="mlui-mval">{_mlui_html(score)}</div></div>
+    <div class="mlui-metric"><div class="mlui-small">Confidence</div><div class="mlui-mval warn">{_mlui_html(conf)}</div></div>
+  </div>
+</div>
+""")
+    st.markdown('<div class="mlui-wrap">' + "\n".join(cards) + "</div>", unsafe_allow_html=True)
+
+_prev_mlui_render_moneyline_edge_tab = render_moneyline_edge_tab
+
+def render_moneyline_edge_tab(board, dates=None):
+    st.markdown("### 💰 Moneyline Edge")
+    st.caption("UI-only moneyline cards. Projections and model logic are unchanged.")
+    try:
+        render_official_recalc_banner(board)
+    except Exception:
+        pass
+    try:
+        df = ml_build_board(board)
+        if df is None or df.empty:
+            st.info("No ML board yet. Refresh the K board first.")
+            return
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Games", len(df))
+        c2.metric("Playable", int((df.get("Status") == "PLAYABLE").sum()) if "Status" in df else 0)
+        c3.metric("Leans", int((df.get("Status") == "LEAN").sum()) if "Status" in df else 0)
+        c4.metric("Avg Edge", round(_mlui_num(df["ML Edge %"].mean(), 0), 2) if "ML Edge %" in df else "—")
+        _mlui_render_cards(df, max_cards=20)
+        with st.expander("Full Moneyline Table", expanded=False):
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        return
+    except Exception:
+        pass
+    _prev_mlui_render_moneyline_edge_tab(board, dates)
+
+
+# =========================
+# 30-DAY GAME LOG LEARNING IQ — READ ONLY
+# Version: GAMELOG_LEARNING_IQ_READ_ONLY_2026_06_11
+#
+# Phase 1 only:
+# - Pitcher + Batter 30-day MLB game-log learning summaries.
+# - Lives in Baseball IQ / Learning area.
+# - Does NOT change projections, picks, K Upside, FS, or ML.
+# =========================
+GAMELOG_LEARNING_IQ_VERSION = "GAMELOG_LEARNING_IQ_READ_ONLY_2026_06_11"
+
+def _gli_num(x, default=0.0):
+    try:
+        if x in (None, "", "—"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _gli_cap(x, lo, hi, default=0.0):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return default
+
+def _gli_col(df, names):
+    for c in names:
+        try:
+            if c in df.columns:
+                return c
+        except Exception:
+            pass
+    return None
+
+def _gli_recent_30(df):
+    try:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        d = df.copy()
+        date_col = _gli_col(d, ["Date", "date", "Game Date", "game_date"])
+        if date_col:
+            d["_gli_date"] = pd.to_datetime(d[date_col], errors="coerce")
+            mx = d["_gli_date"].max()
+            if pd.notna(mx):
+                d = d[d["_gli_date"] >= mx - pd.Timedelta(days=30)]
+        return d
+    except Exception:
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+def _gli_history(kind="pitcher"):
+    keys = [
+        f"{kind}_30_day_logs", f"{kind}_game_logs", f"mlb_{kind}_logs",
+        f"{kind}_history_df", f"graded_{kind}_history",
+        "learning_history", "graded_history", "graded_df", "results_df"
+    ]
+    try:
+        for key in keys:
+            if key in st.session_state:
+                v = st.session_state.get(key)
+                if isinstance(v, pd.DataFrame) and not v.empty:
+                    return _gli_recent_30(v)
+    except Exception:
+        pass
+    try:
+        paths = [f"{kind}_30_day_logs.csv", f"data/{kind}_30_day_logs.csv", f"learning/{kind}_30_day_logs.csv"]
+        for p in paths:
+            fp = Path(p)
+            if fp.exists():
+                return _gli_recent_30(pd.read_csv(fp))
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+def _gli_pitcher_summary():
+    d = _gli_history("pitcher")
+    if d is None or d.empty:
+        return pd.DataFrame([{
+            "Module": "Pitcher 30-Day Game Log Learning",
+            "Status": "WAITING_FOR_GAME_LOGS",
+            "Needed": "Date, Pitcher, Opponent, IP, BF, Pitch Count, K, BB, ER, HR, WHIP",
+            "Optional": "K Projection, Expected BF, Expected IP",
+            "Read Only": "YES",
+            "Version": GAMELOG_LEARNING_IQ_VERSION,
+        }])
+    pitcher = _gli_col(d, ["Pitcher", "pitcher", "Player", "Name"])
+    if not pitcher:
+        return pd.DataFrame([{"Status": "MISSING_PITCHER_COLUMN", "Read Only": "YES", "Version": GAMELOG_LEARNING_IQ_VERSION}])
+
+    k = _gli_col(d, ["K", "SO", "Strikeouts", "Actual K", "Actual Ks"])
+    bf = _gli_col(d, ["BF", "Batters Faced", "Actual BF"])
+    ip = _gli_col(d, ["IP", "Innings", "Actual IP"])
+    pc = _gli_col(d, ["Pitch Count", "Pitches", "PC"])
+    er = _gli_col(d, ["ER", "Earned Runs", "Actual ER"])
+    hr = _gli_col(d, ["HR", "Home Runs"])
+    bb = _gli_col(d, ["BB", "Walks"])
+    whip = _gli_col(d, ["WHIP", "Whip"])
+    proj_k = _gli_col(d, ["K Projection", "K PROJ", "Projected K", "Projection"])
+    exp_bf = _gli_col(d, ["Expected BF", "Exp BF", "Projected BF"])
+    exp_ip = _gli_col(d, ["Expected IP", "IP Projection", "Projected IP"])
+
+    w = d.copy()
+    for c in [k,bf,ip,pc,er,hr,bb,whip,proj_k,exp_bf,exp_ip]:
+        if c:
+            w[c] = pd.to_numeric(w[c], errors="coerce")
+    w["_K Bias"] = (w[k] - w[proj_k]) if (k and proj_k) else None
+    w["_BF Bias"] = (w[bf] - w[exp_bf]) if (bf and exp_bf) else None
+    w["_IP Bias"] = (w[ip] - w[exp_ip]) if (ip and exp_ip) else None
+
+    out = w.groupby(pitcher).agg(
+        Games=(pitcher, "count"),
+        Avg_K=(k, "mean") if k else (pitcher, "count"),
+        Avg_BF=(bf, "mean") if bf else (pitcher, "count"),
+        Avg_IP=(ip, "mean") if ip else (pitcher, "count"),
+        Avg_Pitch_Count=(pc, "mean") if pc else (pitcher, "count"),
+        Avg_ER=(er, "mean") if er else (pitcher, "count"),
+        Avg_HR=(hr, "mean") if hr else (pitcher, "count"),
+        Avg_BB=(bb, "mean") if bb else (pitcher, "count"),
+        Avg_WHIP=(whip, "mean") if whip else (pitcher, "count"),
+        K_Bias=("_K Bias", "mean"),
+        BF_Bias=("_BF Bias", "mean"),
+        IP_Bias=("_IP Bias", "mean"),
+    ).reset_index()
+
+    for c in out.columns:
+        if c != pitcher:
+            out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
+
+    out["Learning Confidence"] = out["Games"].apply(lambda n: "HIGH" if n >= 8 else "MEDIUM" if n >= 5 else "LOW" if n >= 3 else "VERY_LOW")
+    out["Suggested K Adj"] = out["K_Bias"].apply(lambda x: round(_gli_cap(_gli_num(x)*0.18, -0.25, 0.25), 2))
+    out["Suggested BF Adj"] = out["BF_Bias"].apply(lambda x: round(_gli_cap(_gli_num(x)*0.20, -1.0, 1.0), 2))
+    out["Suggested IP Adj"] = out["IP_Bias"].apply(lambda x: round(_gli_cap(_gli_num(x)*0.20, -0.35, 0.35), 2))
+    out["Read Only"] = "YES"
+    out["Version"] = GAMELOG_LEARNING_IQ_VERSION
+    return out.sort_values(["Games", "Avg_K"], ascending=[False, False])
+
+def _gli_batter_summary():
+    d = _gli_history("batter")
+    if d is None or d.empty:
+        return pd.DataFrame([{
+            "Module": "Batter 30-Day Game Log Learning",
+            "Status": "WAITING_FOR_GAME_LOGS",
+            "Needed": "Date, Player, Opponent, Lineup Slot, PA, AB, H, HR, BB, R, RBI, SB, K, Fantasy Score",
+            "Optional": "FS Projection, Expected Slot, Actual Slot",
+            "Read Only": "YES",
+            "Version": GAMELOG_LEARNING_IQ_VERSION,
+        }])
+    player = _gli_col(d, ["Player", "Batter", "Name"])
+    if not player:
+        return pd.DataFrame([{"Status": "MISSING_PLAYER_COLUMN", "Read Only": "YES", "Version": GAMELOG_LEARNING_IQ_VERSION}])
+
+    pa = _gli_col(d, ["PA", "Plate Appearances"])
+    ab = _gli_col(d, ["AB", "At Bats"])
+    h = _gli_col(d, ["H", "Hits"])
+    hr = _gli_col(d, ["HR", "Home Runs"])
+    bb = _gli_col(d, ["BB", "Walks"])
+    r = _gli_col(d, ["R", "Runs"])
+    rbi = _gli_col(d, ["RBI"])
+    sb = _gli_col(d, ["SB", "Stolen Bases"])
+    k = _gli_col(d, ["K", "SO", "Strikeouts"])
+    fs = _gli_col(d, ["Fantasy Score", "Actual FS", "FS Actual"])
+    proj_fs = _gli_col(d, ["FS Projection", "Projected FS"])
+    slot = _gli_col(d, ["Lineup Slot", "Actual Slot", "Confirmed Slot"])
+    exp_slot = _gli_col(d, ["Expected Slot", "Projected Slot"])
+
+    w = d.copy()
+    for c in [pa,ab,h,hr,bb,r,rbi,sb,k,fs,proj_fs,slot,exp_slot]:
+        if c:
+            w[c] = pd.to_numeric(w[c], errors="coerce")
+    w["_FS Bias"] = (w[fs] - w[proj_fs]) if (fs and proj_fs) else None
+    w["_Slot Bias"] = (w[slot] - w[exp_slot]) if (slot and exp_slot) else None
+
+    out = w.groupby(player).agg(
+        Games=(player, "count"),
+        Avg_PA=(pa, "mean") if pa else (player, "count"),
+        Avg_AB=(ab, "mean") if ab else (player, "count"),
+        Avg_H=(h, "mean") if h else (player, "count"),
+        HR_Rate=(hr, "mean") if hr else (player, "count"),
+        BB_Rate=(bb, "mean") if bb else (player, "count"),
+        Run_Rate=(r, "mean") if r else (player, "count"),
+        RBI_Rate=(rbi, "mean") if rbi else (player, "count"),
+        SB_Rate=(sb, "mean") if sb else (player, "count"),
+        K_Rate=(k, "mean") if k else (player, "count"),
+        Avg_FS=(fs, "mean") if fs else (player, "count"),
+        Avg_Lineup_Slot=(slot, "mean") if slot else (player, "count"),
+        FS_Bias=("_FS Bias", "mean"),
+        Slot_Bias=("_Slot Bias", "mean"),
+    ).reset_index()
+
+    for c in out.columns:
+        if c != player:
+            out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
+
+    out["Learning Confidence"] = out["Games"].apply(lambda n: "HIGH" if n >= 20 else "MEDIUM" if n >= 12 else "LOW" if n >= 7 else "VERY_LOW")
+    out["Suggested FS Adj"] = out["FS_Bias"].apply(lambda x: round(_gli_cap(_gli_num(x)*0.12, -0.40, 0.40), 2))
+    out["Suggested PA Adj"] = out["Avg_PA"].apply(lambda x: round(_gli_cap((_gli_num(x,4.1)-4.1)*0.10, -0.20, 0.20), 2))
+    out["Read Only"] = "YES"
+    out["Version"] = GAMELOG_LEARNING_IQ_VERSION
+    return out.sort_values(["Games", "Avg_FS"], ascending=[False, False])
+
+def render_30_day_gamelog_learning_iq():
+    st.markdown("### 🧠 30-Day MLB Game Log Learning IQ")
+    st.caption("Read-only Phase 1. No projection or pick changes.")
+    ptab, btab, guide = st.tabs(["Pitcher 30-Day IQ", "Batter 30-Day IQ", "Data Needed"])
+    with ptab:
+        st.dataframe(_gli_pitcher_summary(), use_container_width=True, hide_index=True)
+    with btab:
+        st.dataframe(_gli_batter_summary(), use_container_width=True, hide_index=True)
+    with guide:
+        st.markdown("""
+**Pitcher fields**
+```text
+Date, Pitcher, Opponent, Home/Away, IP, BF, Pitch Count, H, R, ER, HR, BB, K, WHIP, Days Rest,
+K Projection, Expected BF, Expected IP
+```
+
+**Batter fields**
+```text
+Date, Player, Opponent, Home/Away, Lineup Slot, PA, AB, H, 1B, 2B, 3B, HR, BB, R, RBI, SB, K,
+Fantasy Score, FS Projection, Expected Slot, Actual Slot
+```
+
+**Phase 1:** read-only only.  
+**Future caps:** K ±0.25, BF ±1.0, IP ±0.35, Batter FS ±0.40.
+""")
+
+
+# =========================
+# K UPSIDE CALIBRATION FIX
+# Version: K_UPSIDE_CALIBRATION_FIX_2026_06_11
+#
+# Adds:
+# 1) Upside Inflation Clamp
+# 2) Volume Confidence Score
+#
+# Goal:
+# - Tighten overly aggressive OVER projections.
+# - Protect UNDER reads.
+# - Do not rewrite K skill, whiff, putaway, opponent K, or lineup logic.
+# - Do not affect Pitcher FS, Batter FS, or Moneyline.
+# =========================
+K_UPSIDE_CALIBRATION_FIX_VERSION = "K_UPSIDE_CALIBRATION_FIX_2026_06_11"
+
+def _kcal_num(x, default=0.0):
+    try:
+        if x in (None, "", "—"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _kcal_cap(x, lo, hi, default=0.0):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return default
+
+def _kcal_side(row):
+    s = str(row.get("Decision") or row.get("Model Lean") or row.get("Pick") or "").upper()
+    if "UNDER" in s:
+        return "UNDER"
+    if "OVER" in s:
+        return "OVER"
+    return ""
+
+def _kcal_line(row):
+    return _kcal_num(row.get("UD/Line") or row.get("Line") or row.get("line"), 0.0)
+
+def _kcal_parse_base(row):
+    s = str(row.get("Attrib") or row.get("K Attribution") or "")
+    m = re.search(r"Base\s+(-?\d+(?:\.\d+)?)\s*[→>:-]+\s*Final\s+(-?\d+(?:\.\d+)?)", s)
+    if m:
+        try:
+            return float(m.group(1)), float(m.group(2))
+        except Exception:
+            pass
+    return None, None
+
+def _kcal_volume_confidence(row):
+    exp_bf = _kcal_num(row.get("Exp BF") or row.get("Expected BF") or row.get("Projected BF"), 22)
+    ip_floor = _kcal_num(row.get("IP Floor") or row.get("IP Projection") or row.get("Projected IP"), 5.0)
+    role = _kcal_num(row.get("Role Score"), 70)
+    starter = _kcal_num(row.get("Starter Score"), 80)
+    leash = _kcal_num(row.get("Deep Leash Risk") or row.get("Leash Score"), 50)
+    early_exit = _kcal_num(row.get("Early Exit Risk"), 45)
+    vol_safety = str(row.get("Volume Safety Label") or "").upper()
+    vol_learning = str(row.get("Volume Learning Label") or "").upper()
+    vol_bf_score = _kcal_num(row.get("Volume Learning BF Score"), 50)
+    pitch_eff = _kcal_num(row.get("Pitch Efficiency Learning"), 50)
+    mgr = _kcal_num(row.get("Manager Tendency Learning"), 50)
+
+    score = 50.0
+    score += _kcal_cap((exp_bf - 22.0) * 1.4, -8, 10, 0)
+    score += _kcal_cap((ip_floor - 5.0) * 5.5, -9, 10, 0)
+    score += _kcal_cap((role - 70.0) * 0.10, -5, 5, 0)
+    score += _kcal_cap((starter - 80.0) * 0.08, -5, 5, 0)
+    score += _kcal_cap((leash - 50.0) * 0.10, -5, 7, 0)
+    score += _kcal_cap((vol_bf_score - 50.0) * 0.18, -8, 8, 0)
+    score += _kcal_cap((pitch_eff - 50.0) * 0.12, -6, 6, 0)
+    score += _kcal_cap((mgr - 50.0) * 0.12, -6, 6, 0)
+    score -= _kcal_cap((early_exit - 45.0) * 0.18, -5, 8, 0)
+    if "RISK" in vol_learning:
+        score -= 8
+    if "DANGER" in vol_safety:
+        score -= 10
+    elif "CAUTION" in vol_safety:
+        score -= 5
+    score = _kcal_cap(score, 0, 100, 50)
+    if score >= 68:
+        label = "VOLUME_STRONG"
+    elif score >= 55:
+        label = "VOLUME_OK"
+    elif score >= 42:
+        label = "VOLUME_THIN"
+    else:
+        label = "VOLUME_WEAK"
+    return round(score, 1), label
+
+def _kcal_upside_inflation_score(row):
+    proj = _kcal_num(row.get("K PROJ") or row.get("Projection") or row.get("Median"), 0)
+    line = _kcal_line(row)
+    l10 = _kcal_num(row.get("L10 Avg"), proj)
+    oppk = _kcal_num(row.get("Opp K%"), 22)
+    whiff = _kcal_num(row.get("Putaway/Whiff"), 22)
+    hit_rate = _kcal_num(row.get("Hit Rate %"), 50)
+    conf = _kcal_num(row.get("Confidence %"), 50)
+    base, final = _kcal_parse_base(row)
+    score = 0.0
+    if line > 0:
+        score += _kcal_cap((proj - line) * 14, 0, 28, 0)
+    score += _kcal_cap((proj - l10) * 9, 0, 24, 0)
+    if base and base > 0:
+        score += _kcal_cap(((proj / base) - 1.0) * 80, 0, 28, 0)
+    elif final and final > 0:
+        score += _kcal_cap(((proj / final) - 1.0) * 60, 0, 20, 0)
+    score += _kcal_cap((oppk - 22.5) * 1.0, 0, 10, 0)
+    score += _kcal_cap((whiff - 24.0) * 0.8, 0, 10, 0)
+    score += _kcal_cap((hit_rate - 65.0) * 0.35, 0, 9, 0)
+    score += _kcal_cap((conf - 75.0) * 0.35, 0, 9, 0)
+    score = _kcal_cap(score, 0, 100, 0)
+    if score >= 75:
+        label = "HIGH_UPSIDE_INFLATION"
+    elif score >= 55:
+        label = "MED_UPSIDE_INFLATION"
+    elif score >= 35:
+        label = "LOW_UPSIDE_INFLATION"
+    else:
+        label = "CLEAN_UPSIDE"
+    return round(score, 1), label
+
+def _kcal_calibrated_projection(row):
+    side = _kcal_side(row)
+    proj = _kcal_num(row.get("K PROJ") or row.get("Projection") or row.get("Median"), 0)
+    if proj <= 0:
+        return proj, 0.0, "NO_PROJECTION", 0.0, "NA", 0.0, "NA"
+    vol_score, vol_label = _kcal_volume_confidence(row)
+    inf_score, inf_label = _kcal_upside_inflation_score(row)
+    tax = 0.0
+    reason = "NO_TAX"
+    if side == "OVER":
+        if inf_score >= 75 and vol_score < 55:
+            tax, reason = 0.55, "HIGH_INFLATION_LOW_VOLUME"
+        elif inf_score >= 75 and vol_score < 68:
+            tax, reason = 0.40, "HIGH_INFLATION_MED_VOLUME"
+        elif inf_score >= 55 and vol_score < 42:
+            tax, reason = 0.35, "MED_INFLATION_WEAK_VOLUME"
+        elif inf_score >= 55 and vol_score < 55:
+            tax, reason = 0.25, "MED_INFLATION_THIN_VOLUME"
+        elif inf_score >= 35 and vol_score < 38:
+            tax, reason = 0.18, "LOW_INFLATION_WEAK_VOLUME"
+        line = _kcal_line(row)
+        if line and line <= 3.5:
+            tax = min(tax, 0.25)
+        if proj < 4.5:
+            tax = min(tax, 0.25)
+        tax = _kcal_cap(tax, 0, 0.65, 0)
+    else:
+        tax, reason = 0.0, "UNDER_PROTECTED"
+    return round(max(0, proj - tax), 2), round(tax, 2), reason, vol_score, vol_label, inf_score, inf_label
+
+def _kcal_redecision(row, new_proj):
+    old = str(row.get("Decision") or "")
+    side = _kcal_side(row)
+    line = _kcal_line(row)
+    if not line or side == "UNDER":
+        return old
+    gap = round(new_proj - line, 2)
+    if side == "OVER":
+        if gap < 0.20:
+            return "🚫 PASS — OVER THIN AFTER CAL"
+        if gap < 0.45 and "🔥" in old:
+            return "⚠️ OVER LEAN"
+    return old
+
+_prev_kcal_build_kproj_table = build_kproj_table
+
+def build_kproj_table(board):
+    df = _prev_kcal_build_kproj_table(board)
+    try:
+        if df is None or df.empty:
+            return df
+        d = df.copy()
+        new_vals=[]; taxes=[]; reasons=[]; vols=[]; vollabels=[]; infs=[]; inflabels=[]; newdec=[]
+        for _, r in d.iterrows():
+            row = r.to_dict()
+            new_proj, tax, reason, vol_score, vol_label, inf_score, inf_label = _kcal_calibrated_projection(row)
+            new_vals.append(new_proj); taxes.append(tax); reasons.append(reason)
+            vols.append(vol_score); vollabels.append(vol_label); infs.append(inf_score); inflabels.append(inf_label)
+            newdec.append(_kcal_redecision(row, new_proj))
+        d["Raw K PROJ"] = d.get("K PROJ", d.get("Projection", d.get("Median", "")))
+        d["K PROJ"] = new_vals
+        if "Median" in d.columns:
+            d["Median"] = new_vals
+        d["K Calibration Tax"] = taxes
+        d["K Calibration Reason"] = reasons
+        d["Volume Confidence Score"] = vols
+        d["Volume Confidence Label"] = vollabels
+        d["Upside Inflation Score"] = infs
+        d["Upside Inflation Label"] = inflabels
+        d["K Calibration Version"] = K_UPSIDE_CALIBRATION_FIX_VERSION
+        if "Decision" in d.columns:
+            d["Decision"] = newdec
+        if "Lean Gap" in d.columns and "UD/Line" in d.columns:
+            d["Lean Gap"] = [round(_kcal_num(p)-_kcal_num(l),2) for p,l in zip(d["K PROJ"], d["UD/Line"])]
+        if "Edge Gap" in d.columns and "UD/Line" in d.columns:
+            d["Edge Gap"] = [round(_kcal_num(p)-_kcal_num(l),2) for p,l in zip(d["K PROJ"], d["UD/Line"])]
+        return d
+    except Exception:
+        return df
+
+if "kproj_decision" in globals():
+    _prev_kcal_kproj_decision = kproj_decision
+    def kproj_decision(p):
+        d = dict(_prev_kcal_kproj_decision(p) or {})
+        try:
+            row = dict(p or {}); row.update(d)
+            new_proj, tax, reason, vol_score, vol_label, inf_score, inf_label = _kcal_calibrated_projection(row)
+            d["k_calibrated_projection"] = new_proj
+            d["k_calibration_tax"] = tax
+            d["k_calibration_reason"] = reason
+            d["volume_confidence_score"] = vol_score
+            d["volume_confidence_label"] = vol_label
+            d["upside_inflation_score"] = inf_score
+            d["upside_inflation_label"] = inf_label
+        except Exception:
+            pass
+        return d
+
+
+# =========================
+# UNDERDOG FS WATCHER ONLY
+# Version: UD_FS_WATCHER_ONLY_2026_06_11
+#
+# Scope:
+# - Pitcher Fantasy only
+# - Batter Fantasy only
+#
+# Protected:
+# - K Upside tab is untouched.
+# - K Upside line pulling is untouched.
+# - K Upside projection math is untouched.
+# - Moneyline is untouched.
+# =========================
+UD_FS_WATCHER_ONLY_VERSION = "UD_FS_WATCHER_ONLY_2026_06_11"
+
+def _fsud_norm(x):
+    s = str(x or "").strip().lower()
+    s = re.sub(r"[^a-z0-9\s\.\-']", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def _fsud_num(x, default=None):
+    try:
+        if x in (None, "", "—", "WAITING_FOR_UD_LINE"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _fsud_player(row):
+    for c in ["Player", "player", "Name", "name", "display_name", "player_name", "Pitcher", "Batter"]:
+        if c in row and row.get(c) not in (None, ""):
+            return str(row.get(c))
+    return ""
+
+def _fsud_prop_text(row):
+    for c in ["stat_type", "Stat Type", "prop_type", "Prop Type", "Market", "market", "Line Type", "line_type", "OverUnder", "over_under_title"]:
+        if c in row and row.get(c) not in (None, ""):
+            return str(row.get(c))
+    return ""
+
+def _fsud_line(row):
+    for c in ["Line", "line", "UD/Line", "stat_value", "Value", "value", "over_under_line", "target_value"]:
+        if c in row:
+            v = _fsud_num(row.get(c), None)
+            if v is not None:
+                return v
+    return None
+
+def _fsud_is_fantasy_points(prop_text):
+    s = str(prop_text or "").lower()
+    return ("fantasy" in s and ("point" in s or "score" in s)) or s in ["fantasy points", "fantasy score", "fs"]
+
+def _fsud_raw_df():
+    """
+    Best-effort lookup of Underdog lines already fetched by the app.
+    No new external API dependency is added here.
+    """
+    try:
+        keys = [
+            "underdog_lines_df", "ud_lines_df", "ud_board_df", "underdog_board_df",
+            "underdog_props_df", "props_df", "vendor_lines_df", "lines_df"
+        ]
+        for key in keys:
+            if key in st.session_state:
+                v = st.session_state.get(key)
+                if isinstance(v, pd.DataFrame) and not v.empty:
+                    return v.copy()
+    except Exception:
+        pass
+
+    try:
+        helpers = [
+            "load_underdog_lines", "fetch_underdog_lines", "get_underdog_lines",
+            "fetch_ud_lines", "load_ud_lines", "get_ud_board"
+        ]
+        for fn in helpers:
+            if fn in globals():
+                try:
+                    v = globals()[fn]()
+                    if isinstance(v, pd.DataFrame) and not v.empty:
+                        return v.copy()
+                    if isinstance(v, list) and len(v):
+                        return pd.DataFrame(v)
+                except TypeError:
+                    try:
+                        v = globals()[fn](sport="MLB")
+                        if isinstance(v, pd.DataFrame) and not v.empty:
+                            return v.copy()
+                        if isinstance(v, list) and len(v):
+                            return pd.DataFrame(v)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return pd.DataFrame()
+
+def _fsud_build_fs_index():
+    raw = _fsud_raw_df()
+    idx = {}
+    if raw is None or raw.empty:
+        return idx, raw
+
+    try:
+        for _, rr in raw.iterrows():
+            row = rr.to_dict()
+            player = _fsud_player(row)
+            if not player:
+                continue
+            prop_text = _fsud_prop_text(row)
+            if not _fsud_is_fantasy_points(prop_text):
+                continue
+
+            line = _fsud_line(row)
+            idx[_fsud_norm(player)] = {
+                "Player": player,
+                "Line": line,
+                "Status": "UD_LINE_AVAILABLE" if line is not None else "WAITING_FOR_UD_LINE",
+                "Raw Prop": prop_text,
+                "Version": UD_FS_WATCHER_ONLY_VERSION,
+            }
+    except Exception:
+        pass
+
+    return idx, raw
+
+def _fsud_match(player):
+    idx, raw = _fsud_build_fs_index()
+    p = _fsud_norm(player)
+
+    if p in idx:
+        return idx[p]
+
+    # If player is somewhere on UD but fantasy points not posted yet, mark waiting.
+    try:
+        if raw is not None and not raw.empty:
+            for _, rr in raw.iterrows():
+                row = rr.to_dict()
+                if _fsud_norm(_fsud_player(row)) == p:
+                    return {
+                        "Player": player,
+                        "Line": None,
+                        "Status": "WAITING_FOR_UD_LINE",
+                        "Raw Prop": "Player found on UD, waiting for Fantasy Points",
+                        "Version": UD_FS_WATCHER_ONLY_VERSION,
+                    }
+    except Exception:
+        pass
+
+    return {
+        "Player": player,
+        "Line": None,
+        "Status": "NOT_ON_UD_BOARD",
+        "Raw Prop": "",
+        "Version": UD_FS_WATCHER_ONLY_VERSION,
+    }
+
+def _fsud_apply_to_fs_df(df, player_cols, proj_col="FS Projection"):
+    if df is None or df.empty:
+        return df
+
+    d = df.copy()
+    names = []
+    for _, rr in d.iterrows():
+        row = rr.to_dict()
+        name = ""
+        for c in player_cols:
+            if c in row and row.get(c) not in (None, ""):
+                name = str(row.get(c))
+                break
+        names.append(name)
+
+    statuses, lines, rawprops = [], [], []
+    for name in names:
+        m = _fsud_match(name)
+        statuses.append(m.get("Status"))
+        lines.append(m.get("Line"))
+        rawprops.append(m.get("Raw Prop"))
+
+    d["UD Watch Status"] = statuses
+    d["UD Live Line"] = lines
+    d["UD Raw Prop"] = rawprops
+    d["UD FS Watch Version"] = UD_FS_WATCHER_ONLY_VERSION
+
+    # FS-only UD board mode. This does NOT affect K Upside.
+    try:
+        ud_only = bool(st.session_state.get("fs_ud_board_only_mode", True))
+    except Exception:
+        ud_only = True
+
+    if ud_only:
+        d = d[d["UD Watch Status"].isin(["UD_LINE_AVAILABLE", "WAITING_FOR_UD_LINE"])].copy()
+
+    if "UD Live Line" in d.columns:
+        d["UD/Line"] = d["UD Live Line"].apply(lambda x: x if pd.notna(x) else "WAITING_FOR_UD_LINE")
+        if proj_col in d.columns:
+            def _decide(r):
+                if r.get("UD Watch Status") == "WAITING_FOR_UD_LINE":
+                    return "⏳ WAITING_FOR_UD_LINE"
+                line = _fsud_num(r.get("UD Live Line"), None)
+                proj = _fsud_num(r.get(proj_col), None)
+                if line is None or proj is None:
+                    return "WAITING_FOR_UD_LINE"
+                gap = proj - line
+                if gap >= 0.75:
+                    return "🔥 OVER"
+                if gap >= 0.30:
+                    return "⚠️ OVER LEAN"
+                if gap <= -0.75:
+                    return "🔥 UNDER"
+                if gap <= -0.30:
+                    return "⚠️ UNDER LEAN"
+                return "🚫 PASS — THIN UD EDGE"
+            d["FS Decision"] = d.apply(_decide, axis=1)
+            d["FS Edge"] = d.apply(lambda r: round(_fsud_num(r.get(proj_col), 0) - _fsud_num(r.get("UD Live Line"), _fsud_num(r.get(proj_col), 0)), 2) if _fsud_num(r.get("UD Live Line"), None) is not None else "", axis=1)
+
+    return d
+
+def render_fs_ud_watcher_controls():
+    st.markdown("### 🟣 Underdog Fantasy Points Watcher")
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        st.session_state["fs_ud_board_only_mode"] = st.toggle(
+            "FS UD Board Only",
+            value=st.session_state.get("fs_ud_board_only_mode", True),
+            help="Only for Pitcher FS and Batter FS. K Upside is not affected."
+        )
+    with c2:
+        auto = st.toggle(
+            "FS Auto Refresh",
+            value=st.session_state.get("fs_ud_auto_refresh", False),
+            help="Refreshes so Fantasy Points can appear once Underdog posts them."
+        )
+        st.session_state["fs_ud_auto_refresh"] = auto
+
+    if auto:
+        try:
+            st.autorefresh(interval=90_000, key="fs_ud_line_refresh")
+        except Exception:
+            try:
+                from streamlit_autorefresh import st_autorefresh
+                st_autorefresh(interval=90_000, key="fs_ud_line_refresh")
+            except Exception:
+                st.caption("Auto refresh package unavailable; use manual refresh.")
+
+    idx, raw = _fsud_build_fs_index()
+    with c3:
+        if raw is None or raw.empty:
+            st.warning("No Underdog board loaded yet.")
+        else:
+            st.success(f"UD board loaded: {len(raw)} raw rows / {len(idx)} Fantasy Points rows")
+
+# Pitcher FS only.
+if "build_pitcher_fs_board" in globals():
+    _prev_fsud_build_pitcher_fs_board = build_pitcher_fs_board
+
+    def build_pitcher_fs_board(board=None):
+        df = _prev_fsud_build_pitcher_fs_board(board)
+        try:
+            return _fsud_apply_to_fs_df(df, ["Pitcher", "Player", "Name"], proj_col="FS Projection")
+        except Exception:
+            return df
+
+# Batter FS only.
+if "build_batter_fs_board" in globals():
+    _prev_fsud_build_batter_fs_board = build_batter_fs_board
+
+    def build_batter_fs_board():
+        df = _prev_fsud_build_batter_fs_board()
+        try:
+            return _fsud_apply_to_fs_df(df, ["Player", "Batter", "Name"], proj_col="FS Projection")
+        except Exception:
+            return df
+
+tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_moneyline, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
     "BATTER FS",
     "MONEYLINE EDGE",
+    "🟣 FS UD WATCHER",
     "🧠 BASEBALL IQ",
+    "🧠 30D LEARNING IQ",
     "🧪 LEARNING LAB",
     "CALIBRATION AUDIT",
     "ALL PLAYERS",
@@ -17268,16 +18277,29 @@ with tab_kproj:
     render_kproj_tab(board)
 
 with tab_pitcher_fs:
+    render_fs_ud_watcher_controls()
+
     render_pitcher_fs_tab(board)
 
 with tab_batter_fs:
+    render_fs_ud_watcher_controls()
+
     render_batter_fs_tab()
 
 with tab_moneyline:
     render_moneyline_edge_tab(board, dates)
 
+with tab_fs_ud_watcher:
+    render_fs_ud_watcher_controls()
+    raw_fs_ud = _fsud_raw_df()
+    if raw_fs_ud is not None and not raw_fs_ud.empty:
+        st.dataframe(raw_fs_ud, use_container_width=True, hide_index=True)
+
 with tab_iq:
     render_baseball_iq_tab(board)
+
+with tab_30d_learning:
+    render_30_day_gamelog_learning_iq()
 
 with tab_learning_lab:
     render_learning_lab_tab(board)
