@@ -19716,6 +19716,484 @@ try:
 except Exception:
     pass
 
+
+# =========================
+# SEASON LOG PROJECTION BRIDGE
+# Version: SEASON_LOG_PROJECTION_BRIDGE_2026_06_12
+#
+# Forces embedded pitcher season logs into K projection context:
+# K, IP, BF, Pitch Count, H, R, ER, HR, BB, WHIP, Home/Away, Opponent.
+# Conservative capped nudge. K Upside base projection remains intact.
+# =========================
+SEASON_LOG_PROJECTION_BRIDGE_VERSION = "SEASON_LOG_PROJECTION_BRIDGE_2026_06_12"
+
+def _slpb_norm_name(x):
+    s = str(x or "").strip().lower().replace(".", "")
+    s = re.sub(r"[^a-z0-9\s'\-]", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+def _slpb_num(x, default=0.0):
+    try:
+        if x in (None, "", "—"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _slpb_cap(x, lo, hi):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return 0.0
+
+def _slpb_split_matchup(matchup):
+    try:
+        if "@" in str(matchup):
+            a, h = str(matchup).split("@", 1)
+            return a.strip().upper(), h.strip().upper()
+    except Exception:
+        pass
+    return "", ""
+
+def _slpb_pitcher_logs():
+    try:
+        for key in ["pitcher_season_logs", "pitcher_30_day_logs"]:
+            df = st.session_state.get(key)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df.copy()
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+def _slpb_pitcher_profile(pitcher, matchup=""):
+    df = _slpb_pitcher_logs()
+    if df is None or df.empty or "Pitcher" not in df.columns:
+        return {}
+
+    d = df.copy()
+    d["_p_norm"] = d["Pitcher"].map(_slpb_norm_name)
+    d = d[d["_p_norm"] == _slpb_norm_name(pitcher)].copy()
+    if d.empty:
+        return {}
+
+    for c in ["IP", "BF", "Pitch Count", "H", "R", "ER", "HR", "BB", "K", "WHIP"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+
+    if "Date" in d.columns:
+        d["_date"] = pd.to_datetime(d["Date"], errors="coerce")
+        d = d.sort_values("_date")
+
+    away, home = _slpb_split_matchup(matchup)
+    team = str(d["Team"].dropna().iloc[-1]).upper() if "Team" in d.columns and not d["Team"].dropna().empty else ""
+    opp = home if team and team in away else away if team and team in home else ""
+
+    def avg(col):
+        return d[col].mean() if col in d.columns else None
+    def med(col):
+        return d[col].median() if col in d.columns else None
+
+    ha_k = ha_bf = None
+    ha_label = "NO_HA_SPLIT"
+    try:
+        if "Home/Away" in d.columns and team:
+            desired = "Away" if team in away else "Home" if team in home else None
+            if desired:
+                ha = d[d["Home/Away"].astype(str).str.lower() == desired.lower()]
+                if len(ha) >= 2:
+                    ha_k = ha["K"].mean() if "K" in ha else None
+                    ha_bf = ha["BF"].mean() if "BF" in ha else None
+                    ha_label = f"{desired.upper()}_SPLIT"
+    except Exception:
+        pass
+
+    opp_k = opp_bf = None
+    opp_label = "NO_OPP_HISTORY"
+    try:
+        if opp and "Opponent" in d.columns:
+            od = d[d["Opponent"].astype(str).str.upper().str.contains(opp[:3], na=False)]
+            if len(od) >= 1:
+                opp_k = od["K"].mean() if "K" in od else None
+                opp_bf = od["BF"].mean() if "BF" in od else None
+                opp_label = f"VS_{opp[:3]}_HISTORY"
+    except Exception:
+        pass
+
+    recent_k = recent_bf = None
+    try:
+        tail = d.tail(3)
+        if len(tail) >= 2:
+            recent_k = tail["K"].mean() if "K" in tail else None
+            recent_bf = tail["BF"].mean() if "BF" in tail else None
+    except Exception:
+        pass
+
+    def rnd(x, n=2):
+        return round(x, n) if x is not None and not pd.isna(x) else ""
+
+    return {
+        "Season Starts": int(len(d)),
+        "Season Avg K": rnd(avg("K")),
+        "Season Median K": rnd(med("K")),
+        "Season Avg BF": rnd(avg("BF")),
+        "Season Avg IP": rnd(avg("IP")),
+        "Season Avg Pitch Count": rnd(avg("Pitch Count"), 1),
+        "Season WHIP": rnd(avg("WHIP")),
+        "Season Avg ER": rnd(avg("ER")),
+        "Season Avg HR": rnd(avg("HR")),
+        "Season Avg BB": rnd(avg("BB")),
+        "Season Avg H": rnd(avg("H")),
+        "Season Avg R": rnd(avg("R")),
+        "Season Home/Away K": rnd(ha_k),
+        "Season Home/Away BF": rnd(ha_bf),
+        "Season Home/Away Label": ha_label,
+        "Season Opponent K": rnd(opp_k),
+        "Season Opponent BF": rnd(opp_bf),
+        "Season Opponent Label": opp_label,
+        "Season Recent3 K": rnd(recent_k),
+        "Season Recent3 BF": rnd(recent_bf),
+    }
+
+def _slpb_projection_nudge(row):
+    proj = _slpb_num(row.get("K PROJ") or row.get("Projection") or row.get("Proj"), None)
+    if proj is None:
+        return 0.0, "NO_PROJ"
+    starts = _slpb_num(row.get("Season Starts"), 0)
+    if starts < 3:
+        return 0.0, "LOW_SEASON_SAMPLE"
+
+    avg_k = _slpb_num(row.get("Season Avg K"), proj)
+    med_k = _slpb_num(row.get("Season Median K"), avg_k)
+    recent_k = _slpb_num(row.get("Season Recent3 K"), avg_k)
+    avg_bf = _slpb_num(row.get("Season Avg BF"), row.get("Exp BF") or 20)
+    exp_bf = _slpb_num(row.get("Exp BF"), avg_bf)
+    whip = _slpb_num(row.get("Season WHIP"), 1.25)
+    er = _slpb_num(row.get("Season Avg ER"), 2.5)
+    hr = _slpb_num(row.get("Season Avg HR"), 0.8)
+    bb = _slpb_num(row.get("Season Avg BB"), 2.0)
+
+    target_k = (avg_k * 0.55) + (med_k * 0.25) + (recent_k * 0.20)
+    k_gap = target_k - proj
+    bf_gap = avg_bf - exp_bf
+
+    nudge = 0.0
+    nudge += _slpb_cap(k_gap * 0.18, -0.35, 0.35)
+    nudge += _slpb_cap(bf_gap * 0.025, -0.20, 0.20)
+
+    if whip >= 1.45: nudge -= 0.08
+    if er >= 3.5: nudge -= 0.08
+    if hr >= 1.25: nudge -= 0.05
+    if bb >= 3.0: nudge -= 0.05
+
+    nudge = round(_slpb_cap(nudge, -0.55, 0.45), 2)
+    label = "SEASON_LOG_UP" if nudge >= 0.20 else "SEASON_LOG_DOWN" if nudge <= -0.20 else "SEASON_LOG_MICRO" if abs(nudge) > 0 else "SEASON_LOG_NEUTRAL"
+    return nudge, label
+
+def _slpb_apply_to_k_df(df):
+    if df is None or df.empty:
+        return df
+    d = df.copy()
+    pcol = next((c for c in ["Pitcher", "Player", "Name"] if c in d.columns), None)
+    if not pcol:
+        return d
+
+    profiles, nudges, labels, adjusted = [], [], [], []
+    for _, rr in d.iterrows():
+        row = rr.to_dict()
+        prof = _slpb_pitcher_profile(row.get(pcol, ""), row.get("Matchup", ""))
+        temp = dict(row); temp.update(prof)
+        nudge, label = _slpb_projection_nudge(temp)
+        profiles.append(prof)
+        nudges.append(nudge)
+        labels.append(label)
+        base_proj = _slpb_num(row.get("K PROJ"), None)
+        adjusted.append(round(base_proj + nudge, 2) if base_proj is not None else "")
+
+    prof_df = pd.DataFrame(profiles)
+    if not prof_df.empty:
+        for c in prof_df.columns:
+            if c in d.columns:
+                d.drop(columns=[c], inplace=True)
+        d = pd.concat([d.reset_index(drop=True), prof_df.reset_index(drop=True)], axis=1)
+
+    d["Season Log K Nudge"] = nudges
+    d["Season Log Label"] = labels
+    d["Season Log Adjusted K"] = adjusted
+    d["Season Log Bridge Version"] = SEASON_LOG_PROJECTION_BRIDGE_VERSION
+    try:
+        if "Attrib" in d.columns:
+            d["Attrib"] = d["Attrib"].astype(str) + " | SeasonLog " + d["Season Log K Nudge"].astype(str)
+    except Exception:
+        pass
+    return d
+
+if "build_kproj_table" in globals():
+    _prev_slpb_build_kproj_table = build_kproj_table
+    def build_kproj_table(board):
+        df = _prev_slpb_build_kproj_table(board)
+        try:
+            return _slpb_apply_to_k_df(df)
+        except Exception:
+            return df
+
+def render_season_log_bridge_panel():
+    st.markdown("### 🧠 Season Log Projection Bridge")
+    st.caption("Embedded pitcher logs are connected here: K, IP, BF, pitch count, H/R/ER/HR/BB/WHIP, home/away, opponent history, and capped K nudge.")
+    try:
+        df = build_kproj_table(board) if "board" in globals() else pd.DataFrame()
+        cols = [c for c in [
+            "Pitcher", "Matchup", "K PROJ", "Season Log Adjusted K", "Season Log K Nudge", "Season Log Label",
+            "Season Starts", "Season Avg K", "Season Median K", "Season Recent3 K",
+            "Season Avg BF", "Exp BF", "Season Avg IP", "Season Avg Pitch Count",
+            "Season WHIP", "Season Avg ER", "Season Avg HR", "Season Avg BB", "Season Avg H", "Season Avg R",
+            "Season Home/Away K", "Season Home/Away Label", "Season Opponent K", "Season Opponent Label"
+        ] if c in df.columns]
+        if cols:
+            st.dataframe(df[cols], use_container_width=True, hide_index=True)
+        else:
+            st.info("Bridge will populate after the K board is built and embedded pitcher logs are loaded.")
+    except Exception as e:
+        st.info(f"Season Log Bridge waiting: {e}")
+
+
+# =========================
+# OPPONENT HISTORY ENGINE
+# Version: OPPONENT_HISTORY_ENGINE_2026_06_12
+#
+# Uses embedded pitcher season logs to summarize:
+# - How many times pitcher faced today's opponent
+# - K outcomes vs opponent
+# - Avg K / BF / IP / ER / BB / HR / WHIP vs opponent
+# - Hit rate vs current line when line exists
+# - Small capped opponent-history projection nudge
+#
+# Runs alongside Season Log Projection Bridge.
+# =========================
+OPPONENT_HISTORY_ENGINE_VERSION = "OPPONENT_HISTORY_ENGINE_2026_06_12"
+
+def _ohe_current_opponent_from_row(row):
+    matchup = str(row.get("Matchup", "") or "")
+    pitcher_team = str(row.get("Team", "") or row.get("Pitcher Team", "") or "").upper()
+    away, home = _slpb_split_matchup(matchup) if "_slpb_split_matchup" in globals() else ("", "")
+    if pitcher_team and pitcher_team in away:
+        return home
+    if pitcher_team and pitcher_team in home:
+        return away
+
+    # Fallback: use pitcher season log latest team if available.
+    try:
+        p = row.get("Pitcher") or row.get("Player") or row.get("Name") or ""
+        prof_logs = _slpb_pitcher_logs()
+        if isinstance(prof_logs, pd.DataFrame) and not prof_logs.empty and "Pitcher" in prof_logs.columns and "Team" in prof_logs.columns:
+            d = prof_logs.copy()
+            d["_p_norm"] = d["Pitcher"].map(_slpb_norm_name)
+            d = d[d["_p_norm"] == _slpb_norm_name(p)]
+            if not d.empty:
+                team = str(d["Team"].dropna().iloc[-1]).upper()
+                if team in away:
+                    return home
+                if team in home:
+                    return away
+    except Exception:
+        pass
+
+    # Last resort if matchup exists: unknown pitcher side, no confident opponent.
+    return ""
+
+def _ohe_line_from_row(row):
+    for c in ["UD/Line", "Line", "line", "K Line"]:
+        if c in row:
+            v = _slpb_num(row.get(c), None)
+            if v is not None:
+                return v
+    return None
+
+def _ohe_pitcher_vs_opponent_profile(pitcher, opponent, line=None):
+    df = _slpb_pitcher_logs() if "_slpb_pitcher_logs" in globals() else pd.DataFrame()
+    if df is None or df.empty or "Pitcher" not in df.columns or "Opponent" not in df.columns:
+        return {}
+
+    d = df.copy()
+    d["_p_norm"] = d["Pitcher"].map(_slpb_norm_name)
+    d = d[d["_p_norm"] == _slpb_norm_name(pitcher)].copy()
+    if d.empty or not opponent:
+        return {}
+
+    opp = str(opponent or "").upper()[:3]
+    d = d[d["Opponent"].astype(str).str.upper().str.contains(opp, na=False)].copy()
+    if d.empty:
+        return {
+            "Opp Hist Opponent": opp,
+            "Opp Hist Starts": 0,
+            "Opp Hist Label": "NO_DIRECT_HISTORY",
+            "Opp Hist Version": OPPONENT_HISTORY_ENGINE_VERSION,
+        }
+
+    for c in ["IP", "BF", "Pitch Count", "H", "R", "ER", "HR", "BB", "K", "WHIP"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+
+    if "Date" in d.columns:
+        d["_date"] = pd.to_datetime(d["Date"], errors="coerce")
+        d = d.sort_values("_date")
+
+    starts = len(d)
+    k_list = d["K"].dropna().astype(float).tolist() if "K" in d.columns else []
+    k_results = ", ".join(str(int(x)) if float(x).is_integer() else str(round(x, 1)) for x in k_list[-6:])
+
+    hit_rate = ""
+    if line is not None and k_list:
+        hits = sum(1 for x in k_list if x > float(line))
+        hit_rate = round((hits / len(k_list)) * 100, 1)
+
+    def avg(col):
+        return d[col].mean() if col in d.columns else None
+    def rnd(x, n=2):
+        return round(x, n) if x is not None and not pd.isna(x) else ""
+
+    avg_k = avg("K")
+    avg_bf = avg("BF")
+    avg_ip = avg("IP")
+    avg_er = avg("ER")
+    avg_bb = avg("BB")
+    avg_hr = avg("HR")
+    avg_whip = avg("WHIP")
+
+    if starts >= 3:
+        label = "STRONG_DIRECT_HISTORY"
+    elif starts >= 1:
+        label = "SMALL_DIRECT_HISTORY"
+    else:
+        label = "NO_DIRECT_HISTORY"
+
+    return {
+        "Opp Hist Opponent": opp,
+        "Opp Hist Starts": int(starts),
+        "Opp Hist K Results": k_results,
+        "Opp Hist Avg K": rnd(avg_k),
+        "Opp Hist Avg BF": rnd(avg_bf),
+        "Opp Hist Avg IP": rnd(avg_ip),
+        "Opp Hist Avg ER": rnd(avg_er),
+        "Opp Hist Avg BB": rnd(avg_bb),
+        "Opp Hist Avg HR": rnd(avg_hr),
+        "Opp Hist WHIP": rnd(avg_whip),
+        "Opp Hist Hit Rate %": hit_rate,
+        "Opp Hist Label": label,
+        "Opp Hist Version": OPPONENT_HISTORY_ENGINE_VERSION,
+    }
+
+def _ohe_nudge(row):
+    starts = _slpb_num(row.get("Opp Hist Starts"), 0)
+    if starts < 1:
+        return 0.0, "NO_OPP_NUDGE"
+
+    proj = _slpb_num(row.get("Season Log Adjusted K") or row.get("K PROJ") or row.get("Projection"), None)
+    if proj is None:
+        return 0.0, "NO_PROJ"
+
+    opp_avg_k = _slpb_num(row.get("Opp Hist Avg K"), proj)
+    opp_avg_bf = _slpb_num(row.get("Opp Hist Avg BF"), row.get("Season Avg BF") or row.get("Exp BF") or 20)
+    exp_bf = _slpb_num(row.get("Exp BF"), row.get("Season Avg BF") or opp_avg_bf)
+    opp_er = _slpb_num(row.get("Opp Hist Avg ER"), row.get("Season Avg ER") or 2.5)
+    opp_whip = _slpb_num(row.get("Opp Hist WHIP"), row.get("Season WHIP") or 1.25)
+
+    # Opponent history is helpful but small sample; cap hard.
+    sample_weight = 0.45 if starts >= 3 else 0.25
+    nudge = (opp_avg_k - proj) * sample_weight * 0.25
+    nudge += _slpb_cap((opp_avg_bf - exp_bf) * 0.018, -0.10, 0.10)
+
+    # If he historically struggles run-suppression wise vs this opponent, slight K-volume risk tax.
+    if opp_er >= 3.5:
+        nudge -= 0.05
+    if opp_whip >= 1.45:
+        nudge -= 0.05
+
+    cap_hi = 0.30 if starts >= 3 else 0.18
+    cap_lo = -0.35 if starts >= 3 else -0.20
+    nudge = round(_slpb_cap(nudge, cap_lo, cap_hi), 2)
+
+    if nudge >= 0.15:
+        label = "OPP_HISTORY_UP"
+    elif nudge <= -0.15:
+        label = "OPP_HISTORY_DOWN"
+    elif abs(nudge) > 0:
+        label = "OPP_HISTORY_MICRO"
+    else:
+        label = "OPP_HISTORY_NEUTRAL"
+    return nudge, label
+
+def _ohe_apply_to_k_df(df):
+    if df is None or df.empty:
+        return df
+    d = df.copy()
+    pcol = next((c for c in ["Pitcher", "Player", "Name"] if c in d.columns), None)
+    if not pcol:
+        return d
+
+    profiles, nudges, labels, final_proj = [], [], [], []
+    for _, rr in d.iterrows():
+        row = rr.to_dict()
+        pitcher = row.get(pcol, "")
+        opponent = _ohe_current_opponent_from_row(row)
+        line = _ohe_line_from_row(row)
+        prof = _ohe_pitcher_vs_opponent_profile(pitcher, opponent, line=line)
+        temp = dict(row)
+        temp.update(prof)
+        nudge, label = _ohe_nudge(temp)
+        profiles.append(prof)
+        nudges.append(nudge)
+        labels.append(label)
+
+        base = _slpb_num(row.get("Season Log Adjusted K") or row.get("K PROJ"), None)
+        final_proj.append(round(base + nudge, 2) if base is not None else "")
+
+    prof_df = pd.DataFrame(profiles)
+    if not prof_df.empty:
+        for c in prof_df.columns:
+            if c in d.columns:
+                d.drop(columns=[c], inplace=True)
+        d = pd.concat([d.reset_index(drop=True), prof_df.reset_index(drop=True)], axis=1)
+
+    d["Opponent History Nudge"] = nudges
+    d["Opponent History Nudge Label"] = labels
+    d["Opponent History Adjusted K"] = final_proj
+    d["Opponent History Engine Version"] = OPPONENT_HISTORY_ENGINE_VERSION
+    return d
+
+# Patch bridge output so opponent history runs after season log bridge.
+if "build_kproj_table" in globals():
+    _prev_ohe_build_kproj_table = build_kproj_table
+
+    def build_kproj_table(board):
+        df = _prev_ohe_build_kproj_table(board)
+        try:
+            return _ohe_apply_to_k_df(df)
+        except Exception:
+            return df
+
+def render_opponent_history_engine_panel():
+    st.markdown("### 🎯 Opponent History Engine")
+    st.caption("Shows how many times pitcher faced today's opponent, K outcomes, averages, hit rate vs line, and a small capped opponent-history nudge.")
+    try:
+        df = build_kproj_table(board) if "board" in globals() else pd.DataFrame()
+        cols = [c for c in [
+            "Pitcher", "Matchup", "K PROJ", "Season Log Adjusted K", "Opponent History Adjusted K",
+            "UD/Line", "Opponent History Nudge", "Opponent History Nudge Label",
+            "Opp Hist Opponent", "Opp Hist Starts", "Opp Hist K Results",
+            "Opp Hist Avg K", "Opp Hist Avg BF", "Opp Hist Avg IP", "Opp Hist Avg ER",
+            "Opp Hist Avg BB", "Opp Hist Avg HR", "Opp Hist WHIP", "Opp Hist Hit Rate %",
+            "Opp Hist Label"
+        ] if c in df.columns]
+        if cols:
+            st.dataframe(df[cols], use_container_width=True, hide_index=True)
+        else:
+            st.info("Opponent History will populate after K board and embedded pitcher logs are loaded.")
+    except Exception as e:
+        st.info(f"Opponent History waiting: {e}")
+
 tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_moneyline, tab_mlb30_puller, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
