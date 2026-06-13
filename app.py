@@ -20369,10 +20369,9 @@ def render_final_k_projection_connector_panel():
     except Exception as e:
         st.info(f"Final K Connector waiting: {e}")
 
-tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_moneyline, tab_mlb30_puller, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab_kproj, tab_pitcher_fs, tab_moneyline, tab_mlb30_puller, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
-    "BATTER FS",
     "MONEYLINE EDGE",
     "📥 SEASON DATA",
     "🟣 FS UD WATCHER",
@@ -20394,9 +20393,6 @@ with tab_pitcher_fs:
     render_fs_ud_watcher_controls()
 
     render_pitcher_fs_tab(board)
-
-with tab_batter_fs:
-    render_batter_fs_tab()
 
 with tab_moneyline:
     render_moneyline_edge_tab(board, dates)
