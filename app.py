@@ -8361,6 +8361,35 @@ def grade_finished_games():
     save_json(RESULT_LOG, results[-10000:])
     return graded
 
+
+def grade_finished_games_with_diagnostics():
+    """
+    Same grading flow as grade_finished_games(), but returns useful counts
+    so the UI does not just show 0 with no explanation.
+    """
+    before_picks = load_json(PICK_LOG, [])
+    before_results = load_json(RESULT_LOG, [])
+
+    total_saved = len(before_picks)
+    already_graded = sum(1 for p in before_picks if p.get("graded"))
+    missing_ids = sum(1 for p in before_picks if not p.get("game_pk") or not p.get("pitcher_id"))
+    ungraded = [p for p in before_picks if not p.get("graded")]
+
+    graded = grade_finished_games()
+
+    after_results = load_json(RESULT_LOG, [])
+    return {
+        "graded": graded,
+        "saved_snapshots": total_saved,
+        "ungraded_before": len(ungraded),
+        "already_graded_before": already_graded,
+        "missing_game_or_pitcher_id": missing_ids,
+        "results_before": len(before_results),
+        "results_after": len(after_results),
+        "pick_log_path": PICK_LOG,
+        "result_log_path": RESULT_LOG,
+    }
+
 def build_signal_tracking():
     results = load_json(RESULT_LOG, [])
     finished = [r for r in results if r.get("graded_result") in ["WIN", "LOSS"]]
@@ -20616,8 +20645,24 @@ def build_better_miss_reason_analytics(results):
 with tab5:
     st.markdown('<div class="section-title-pro">After Games — Grade + Learn</div>', unsafe_allow_html=True)
     if st.button("✅ AFTER GAMES — Grade Results + Update Learning", use_container_width=True):
-        graded = grade_finished_games()
-        st.success(f"Graded {graded} finished official snapshots and updated learning.")
+        diag = grade_finished_games_with_diagnostics()
+        graded = diag.get("graded", 0)
+
+        if graded > 0:
+            st.success(f"✅ After-game grading complete: graded {graded} finished official snapshots and updated learning.")
+        else:
+            st.warning("⚠️ After-game grading ran, but graded 0 snapshots.")
+
+        st.write({
+            "Saved snapshots found": diag.get("saved_snapshots"),
+            "Ungraded before grading": diag.get("ungraded_before"),
+            "Already graded before": diag.get("already_graded_before"),
+            "Missing game_pk or pitcher_id": diag.get("missing_game_or_pitcher_id"),
+            "Results before": diag.get("results_before"),
+            "Results after": diag.get("results_after"),
+        })
+        st.caption(f"PICK_LOG: {diag.get('pick_log_path')}")
+        st.caption(f"RESULT_LOG: {diag.get('result_log_path')}")
     results = load_json(RESULT_LOG, [])
     if results:
         df = pd.DataFrame(results)
