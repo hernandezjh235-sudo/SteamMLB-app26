@@ -20398,6 +20398,443 @@ def render_final_k_projection_connector_panel():
     except Exception as e:
         st.info(f"Final K Connector waiting: {e}")
 
+
+# =========================
+# TRUE PROJECTION CALIBRATION TEST
+# Version: TRUE_PROJECTION_CALIBRATION_TEST_2026_06_14
+# Uses: season logs, current-line hit rate, opponent/matchup hit rate,
+# volume reality, soft ceiling clamp, and thin-edge PASS filter.
+# =========================
+TRUE_PROJECTION_CALIBRATION_TEST_VERSION = "TRUE_PROJECTION_CALIBRATION_TEST_2026_06_14"
+
+def _tpc_num(x, default=None):
+    try:
+        if x in (None, "", "—", "WAITING_FOR_UD_LINE", "NL"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _tpc_cap(x, lo, hi):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return 0.0
+
+def _tpc_norm_name(x):
+    try:
+        s = str(x or "").strip().lower().replace(".", "")
+        s = re.sub(r"[^a-z0-9\s'\-]", "", s)
+        return re.sub(r"\s+", " ", s).strip()
+    except Exception:
+        return str(x or "").strip().lower()
+
+def _tpc_line(row):
+    for c in ["UD/Line", "Line", "line", "K Line"]:
+        v = _tpc_num(row.get(c), None)
+        if v is not None:
+            return v
+    return None
+
+def _tpc_pitcher_col(df):
+    return next((c for c in ["Pitcher", "Player", "Name", "pitcher"] if c in df.columns), None)
+
+def _tpc_get_logs_for_pitcher(player):
+    try:
+        for key in ["pitcher_season_logs", "pitcher_30_day_logs"]:
+            df = st.session_state.get(key)
+            if isinstance(df, pd.DataFrame) and not df.empty and "Pitcher" in df.columns:
+                d = df.copy()
+                d["_p_norm"] = d["Pitcher"].map(_tpc_norm_name)
+                d = d[d["_p_norm"] == _tpc_norm_name(player)].copy()
+                if not d.empty:
+                    for c in ["K", "Ks", "SO", "IP", "BF", "Pitch Count", "Pitches", "ER", "HR", "BB", "WHIP"]:
+                        if c in d.columns:
+                            d[c] = pd.to_numeric(d[c], errors="coerce")
+                    if "Date" in d.columns:
+                        d["_date"] = pd.to_datetime(d["Date"], errors="coerce")
+                        d = d.sort_values("_date")
+                    return d
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+def _tpc_k_col(d):
+    for c in ["K", "Ks", "SO", "Strikeouts"]:
+        if c in d.columns:
+            return c
+    return None
+
+def _tpc_current_opp(row):
+    try:
+        opp = str(row.get("Opp Hist Opponent") or "").upper().strip()
+        if opp:
+            return opp[:3]
+    except Exception:
+        pass
+    try:
+        matchup = str(row.get("Matchup") or "")
+        team = str(row.get("Team") or row.get("Pitcher Team") or "").upper()
+        if "@" in matchup:
+            a, h = matchup.split("@", 1)
+            a, h = a.strip().upper(), h.strip().upper()
+            if team and team in a:
+                return h[:3]
+            if team and team in h:
+                return a[:3]
+    except Exception:
+        pass
+    return ""
+
+def _tpc_rate(vals, line):
+    vals = [float(x) for x in vals if x is not None and not pd.isna(x)]
+    if not vals or line is None:
+        return None, 0, 0
+    clears = sum(1 for x in vals if x > float(line))
+    return round(clears / len(vals) * 100, 1), clears, len(vals)
+
+def _tpc_profile(player, row):
+    line = _tpc_line(row)
+    d = _tpc_get_logs_for_pitcher(player)
+    if d.empty or line is None:
+        return {"TPC Log Sample": 0, "TPC Status": "NO_LOG_OR_LINE"}
+    kc = _tpc_k_col(d)
+    if not kc:
+        return {"TPC Log Sample": len(d), "TPC Status": "NO_K_COLUMN"}
+
+    k_vals = d[kc].dropna().astype(float).tolist()
+    season_rate, season_clears, season_games = _tpc_rate(k_vals, line)
+    recent5_vals = d.tail(5)[kc].dropna().astype(float).tolist()
+    recent_rate, recent_clears, recent_games = _tpc_rate(recent5_vals, line)
+    recent3_vals = d.tail(3)[kc].dropna().astype(float).tolist()
+    recent3_rate, recent3_clears, recent3_games = _tpc_rate(recent3_vals, line)
+    band_vals = [x for x in k_vals if (float(line) - 1.0) <= x <= (float(line) + 2.0)]
+    band_rate, band_clears, band_games = _tpc_rate(band_vals, line)
+
+    opp = _tpc_current_opp(row)
+    opp_rate = opp_clears = opp_games = None
+    if opp and "Opponent" in d.columns:
+        od = d[d["Opponent"].astype(str).str.upper().str.contains(opp, na=False)].copy()
+        if not od.empty:
+            opp_vals = od[kc].dropna().astype(float).tolist()
+            opp_rate, opp_clears, opp_games = _tpc_rate(opp_vals, line)
+
+    def avg(vals):
+        vals = [float(x) for x in vals if x is not None and not pd.isna(x)]
+        return round(sum(vals)/len(vals), 2) if vals else None
+
+    season_avg = avg(k_vals)
+    season_med = round(float(pd.Series(k_vals).median()), 2) if k_vals else None
+    recent5_avg = avg(recent5_vals)
+    recent3_avg = avg(recent3_vals)
+
+    bf_col = next((c for c in ["BF", "Batters Faced"] if c in d.columns), None)
+    ip_col = next((c for c in ["IP", "IP_float"] if c in d.columns), None)
+    pc_col = next((c for c in ["Pitch Count", "Pitches"] if c in d.columns), None)
+
+    season_bf = round(float(pd.to_numeric(d[bf_col], errors="coerce").mean()), 2) if bf_col else None
+    recent_bf = round(float(pd.to_numeric(d.tail(5)[bf_col], errors="coerce").mean()), 2) if bf_col else None
+    season_ip = round(float(pd.to_numeric(d[ip_col], errors="coerce").mean()), 2) if ip_col else None
+    season_pc = round(float(pd.to_numeric(d[pc_col], errors="coerce").mean()), 1) if pc_col else None
+    last_results = ", ".join(str(int(x)) if float(x).is_integer() else str(round(x, 1)) for x in k_vals[-8:])
+
+    return {
+        "TPC Status": "OK",
+        "TPC Log Sample": len(d),
+        "TPC Current Line": line,
+        "TPC Season Avg K": season_avg,
+        "TPC Season Median K": season_med,
+        "TPC Recent5 Avg K": recent5_avg,
+        "TPC Recent3 Avg K": recent3_avg,
+        "TPC Season Hit Rate %": season_rate,
+        "TPC Season Clears": season_clears,
+        "TPC Season Games": season_games,
+        "TPC Recent5 Hit Rate %": recent_rate,
+        "TPC Recent5 Clears": recent_clears,
+        "TPC Recent5 Games": recent_games,
+        "TPC Recent3 Hit Rate %": recent3_rate,
+        "TPC Band Hit Rate %": band_rate,
+        "TPC Band Games": band_games,
+        "TPC Opp Hit Rate %": opp_rate,
+        "TPC Opp Clears": opp_clears,
+        "TPC Opp Games": opp_games,
+        "TPC Opponent": opp,
+        "TPC Season Avg BF": season_bf,
+        "TPC Recent5 Avg BF": recent_bf,
+        "TPC Season Avg IP": season_ip,
+        "TPC Season Avg Pitch Count": season_pc,
+        "TPC Last K Results": last_results,
+    }
+
+def _tpc_weighted_anchor(row):
+    vals, weights = [], []
+    for c, w in [
+        ("TPC Season Avg K", 0.30),
+        ("TPC Season Median K", 0.18),
+        ("TPC Recent5 Avg K", 0.20),
+        ("TPC Recent3 Avg K", 0.14),
+        ("Opp Hist Avg K", 0.08),
+        ("Season Avg K", 0.06),
+        ("Season Median K", 0.04),
+    ]:
+        v = _tpc_num(row.get(c), None)
+        if v is not None:
+            vals.append(v*w); weights.append(w)
+    if not weights:
+        return None
+    return sum(vals) / sum(weights)
+
+def _tpc_hit_score(row):
+    parts, weights = [], []
+    for c, w, min_games_c in [
+        ("TPC Season Hit Rate %", 0.48, "TPC Season Games"),
+        ("TPC Recent5 Hit Rate %", 0.24, "TPC Recent5 Games"),
+        ("TPC Recent3 Hit Rate %", 0.10, None),
+        ("TPC Band Hit Rate %", 0.10, "TPC Band Games"),
+        ("TPC Opp Hit Rate %", 0.08, "TPC Opp Games"),
+    ]:
+        v = _tpc_num(row.get(c), None)
+        if v is None:
+            continue
+        if min_games_c and c != "TPC Season Hit Rate %" and (_tpc_num(row.get(min_games_c), 0) or 0) < 2:
+            continue
+        parts.append(v*w); weights.append(w)
+    if not weights:
+        return None
+    return sum(parts) / sum(weights)
+
+def _tpc_support(row):
+    support, notes = 0, []
+    for c, threshold, note in [
+        ("Pitcher K%", 25, "PITCHER_K"),
+        ("Opp K%", 23, "OPP_K"),
+        ("Putaway/Whiff", 24, "WHIFF"),
+        ("TPC Recent5 Avg K", 5.8, "RECENT_AVG"),
+        ("TPC Season Avg K", 5.8, "SEASON_AVG"),
+    ]:
+        v = _tpc_num(row.get(c), None)
+        if v is not None and v >= threshold:
+            support += 1; notes.append(note)
+    hit_score = _tpc_hit_score(row)
+    if hit_score is not None and hit_score >= 62:
+        support += 1; notes.append("HIT_RATE")
+    exp_bf = _tpc_num(row.get("Exp BF"), None)
+    season_bf = _tpc_num(row.get("TPC Season Avg BF"), _tpc_num(row.get("Season Avg BF"), None))
+    if exp_bf is not None and season_bf is not None and exp_bf <= season_bf + 2.5:
+        support += 1; notes.append("BF_OK")
+    return support, "|".join(notes)
+
+def _tpc_base_projection(row):
+    for c in ["Reality K Projection", "Line Aware Final K Projection", "Suppressed Final K Projection", "Final K Projection", "K PROJ", "Projection", "Proj"]:
+        v = _tpc_num(row.get(c), None)
+        if v is not None:
+            return v
+    return None
+
+def _tpc_adjust(row):
+    base = _tpc_base_projection(row)
+    if base is None:
+        return None, 0.0, "NO_BASE_PROJ", ""
+    line = _tpc_line(row)
+    sample = _tpc_num(row.get("TPC Log Sample"), 0) or 0
+    if sample < 3:
+        return base, 0.0, "LOW_LOG_SAMPLE", ""
+
+    anchor = _tpc_weighted_anchor(row)
+    hit_score = _tpc_hit_score(row)
+    if anchor is None:
+        return base, 0.0, "NO_ANCHOR", ""
+
+    support, support_notes = _tpc_support(row)
+    adj, labels = 0.0, []
+    reasons = [f"base {base:.2f}", f"anchor {anchor:.2f}", f"support {support}:{support_notes}"]
+    if hit_score is not None:
+        reasons.append(f"hit_score {hit_score:.1f}")
+
+    gap = base - anchor
+    if gap >= 0.75:
+        if support >= 5:
+            rate, cap, label = 0.10, 0.25, "LIGHT_HIGH_TRIM_SUPPORTED"
+        elif support >= 3:
+            rate, cap, label = 0.17, 0.45, "MODERATE_HIGH_TRIM"
+        else:
+            rate, cap, label = 0.24, 0.75, "STRONG_HIGH_TRIM"
+        adj -= _tpc_cap((gap - 0.45) * rate, 0.0, cap)
+        labels.append(label); reasons.append(f"HIGH_GAP_{gap:.2f}")
+    elif gap <= -0.95:
+        if support >= 3:
+            rate, cap, label = 0.20, 0.55, "UNDER_FLOOR_LIFT"
+        else:
+            rate, cap, label = 0.13, 0.35, "SMALL_UNDER_FLOOR_LIFT"
+        adj += _tpc_cap((abs(gap) - 0.55) * rate, 0.0, cap)
+        labels.append(label); reasons.append(f"LOW_GAP_{gap:.2f}")
+
+    if line is not None and hit_score is not None:
+        edge = base - line
+        if edge >= 0.65 and hit_score < 43:
+            adj -= 0.30; labels.append("HIT_RATE_DISAGREES_OVER")
+        elif edge >= 1.25 and hit_score < 55:
+            adj -= 0.18; labels.append("HIT_RATE_WEAKENS_OVER")
+        elif edge <= 0.35 and hit_score >= 66:
+            adj += 0.25; labels.append("HIT_RATE_SUPPORTS_OVER")
+        elif edge >= 0.35 and hit_score >= 70:
+            adj += 0.12; labels.append("HIT_RATE_CONFIRMS_OVER")
+        elif -0.35 < edge < 0.70 and hit_score <= 35:
+            adj -= 0.18; labels.append("HIT_RATE_UNDER_SUPPORT")
+
+    exp_bf = _tpc_num(row.get("Exp BF"), None)
+    season_bf = _tpc_num(row.get("TPC Season Avg BF"), _tpc_num(row.get("Season Avg BF"), None))
+    recent_bf = _tpc_num(row.get("TPC Recent5 Avg BF"), None)
+    bf_vals = [v for v in [season_bf, recent_bf] if v is not None]
+    if exp_bf is not None and bf_vals:
+        bf_anchor = sum(bf_vals) / len(bf_vals)
+        bf_gap = exp_bf - bf_anchor
+        if bf_gap >= 3.0:
+            adj -= _tpc_cap((bf_gap - 2.0) * 0.035, 0.05, 0.22)
+            labels.append("VOLUME_REALITY_TRIM"); reasons.append(f"BF_GAP_{bf_gap:.1f}")
+        elif bf_gap <= -3.0 and support >= 3:
+            adj += _tpc_cap((abs(bf_gap)-2.0) * 0.025, 0.03, 0.15)
+            labels.append("VOLUME_UNDER_FLOOR_LIFT")
+
+    projected_after = base + adj
+    if line is not None and anchor is not None:
+        max_allowed = anchor + (1.15 if support >= 5 else 0.85 if support >= 3 else 0.55)
+        if hit_score is not None and hit_score >= 68:
+            max_allowed += 0.25
+        if projected_after > max_allowed and projected_after - line >= 1.5:
+            cut = min(projected_after - max_allowed, 0.55)
+            adj -= cut
+            labels.append("SOFT_CEILING_CLAMP"); reasons.append(f"CEILING_{max_allowed:.2f}")
+
+    adj = round(_tpc_cap(adj, -0.95, 0.75), 2)
+    final = round(base + adj, 2)
+
+    if line is not None:
+        old_edge = base - line
+        new_edge = final - line
+        if old_edge > 0.25 and new_edge < -0.25:
+            final = round(line - 0.20, 2); adj = round(final - base, 2); labels.append("SOFTEN_OVER_TO_UNDER_FLIP")
+        elif old_edge < -0.25 and new_edge > 0.25:
+            final = round(line + 0.20, 2); adj = round(final - base, 2); labels.append("SOFTEN_UNDER_TO_OVER_FLIP")
+
+    return final, adj, "|".join(labels) if labels else "TPC_NO_CHANGE", "; ".join(reasons)
+
+def _tpc_decision(row, proj):
+    line = _tpc_line(row)
+    if proj is None:
+        return "NO_PROJECTION", ""
+    if line is None:
+        return "NO_UD_LINE", ""
+    edge = round(proj - line, 2)
+    hit_score = _tpc_hit_score(row)
+    if -0.65 < edge < 0.65:
+        return "🚫 PASS — TRUE EDGE THIN", edge
+    if edge > 0 and hit_score is not None and hit_score < 42 and edge < 1.35:
+        return "🚫 PASS — HIT RATE CONFLICT", edge
+    if edge < 0 and hit_score is not None and hit_score > 62 and abs(edge) < 1.15:
+        return "🚫 PASS — UNDER HIT RATE CONFLICT", edge
+    if edge >= 1.35:
+        return "🔥 OVER", edge
+    if edge >= 0.70:
+        return "⚠️ OVER LEAN", edge
+    if edge <= -1.35:
+        return "🔥 UNDER", edge
+    if edge <= -0.70:
+        return "⚠️ UNDER LEAN", edge
+    return "🚫 PASS — TRUE EDGE THIN", edge
+
+def _tpc_apply(df):
+    if df is None or df.empty:
+        return df
+    d = df.copy()
+    pcol = _tpc_pitcher_col(d)
+    if not pcol:
+        return d
+    profiles = []
+    for _, rr in d.iterrows():
+        profiles.append(_tpc_profile(rr.to_dict().get(pcol, ""), rr.to_dict()))
+    prof = pd.DataFrame(profiles)
+    if not prof.empty:
+        for c in prof.columns:
+            if c in d.columns:
+                d.drop(columns=[c], inplace=True)
+        d = pd.concat([d.reset_index(drop=True), prof.reset_index(drop=True)], axis=1)
+
+    finals, adjs, labels, reasons, decisions, edges = [], [], [], [], [], []
+    for _, rr in d.iterrows():
+        row = rr.to_dict()
+        final, adj, label, reason = _tpc_adjust(row)
+        dec, edge = _tpc_decision(row, final)
+        finals.append(final if final is not None else "")
+        adjs.append(adj); labels.append(label); reasons.append(reason)
+        decisions.append(dec); edges.append(edge)
+
+    d["TPC True K Projection"] = finals
+    d["TPC Adjustment"] = adjs
+    d["TPC Label"] = labels
+    d["TPC Reason"] = reasons
+    d["TPC Edge"] = edges
+    d["TPC Decision"] = decisions
+    d["TPC Version"] = TRUE_PROJECTION_CALIBRATION_TEST_VERSION
+
+    try:
+        if bool(st.session_state.get("use_true_projection_calibration_test", True)):
+            if "K PROJ" in d.columns:
+                d["Pre-TPC K PROJ"] = d["K PROJ"]
+                d["K PROJ"] = d["TPC True K Projection"]
+            if "Decision" in d.columns:
+                d["Pre-TPC Decision"] = d["Decision"]
+                d["Decision"] = d["TPC Decision"]
+            if "Edge Gap" in d.columns:
+                d["Pre-TPC Edge Gap"] = d["Edge Gap"]
+                d["Edge Gap"] = d["TPC Edge"]
+            if "Main Engine Action" in d.columns:
+                d["Pre-TPC Main Engine Action"] = d["Main Engine Action"]
+                d["Main Engine Action"] = d["TPC Decision"]
+    except Exception:
+        pass
+    return d
+
+if "build_kproj_table" in globals():
+    _prev_tpc_build_kproj_table = build_kproj_table
+    def build_kproj_table(board):
+        df = _prev_tpc_build_kproj_table(board)
+        try:
+            return _tpc_apply(df)
+        except Exception:
+            return df
+
+def render_true_projection_calibration_panel():
+    st.markdown("### 🎯 True Projection Calibration Test")
+    st.caption("Uses season logs, current-line hit rate, matchup/opponent hit rate, volume reality, soft ceiling clamp, and thin-edge PASS filter.")
+    try:
+        st.session_state["use_true_projection_calibration_test"] = st.toggle(
+            "Use True Projection Calibration Test",
+            value=st.session_state.get("use_true_projection_calibration_test", True),
+            key="use_true_projection_calibration_test_unique"
+        )
+    except Exception:
+        pass
+    try:
+        df = build_kproj_table(board) if "board" in globals() else pd.DataFrame()
+        cols = [c for c in [
+            "Pitcher", "Matchup", "Pre-TPC K PROJ", "K PROJ", "TPC True K Projection",
+            "UD/Line", "TPC Edge", "TPC Decision", "TPC Adjustment", "TPC Label",
+            "TPC Season Avg K", "TPC Recent5 Avg K", "TPC Recent3 Avg K",
+            "TPC Season Hit Rate %", "TPC Recent5 Hit Rate %", "TPC Opp Hit Rate %",
+            "TPC Season Avg BF", "Exp BF", "Pitcher K%", "Opp K%", "Putaway/Whiff",
+            "TPC Last K Results", "TPC Reason"
+        ] if c in df.columns]
+        if cols:
+            st.dataframe(df[cols], use_container_width=True, hide_index=True)
+        else:
+            st.info("True Projection Calibration will populate after the K board builds.")
+    except Exception as e:
+        st.info(f"True Projection Calibration waiting: {e}")
+
 tab_kproj, tab_pitcher_fs, tab_moneyline, tab_mlb30_puller, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
