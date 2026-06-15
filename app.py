@@ -21536,6 +21536,203 @@ def apply_moneyline_confidence_gate_1_2_df(df):
     d["ML Gate Version 1.2"] = MONEYLINE_CONFIDENCE_GATE_1_2_VERSION
     return d
 
+
+# =========================
+# LINE-AWARE HIT RATE SMART DISPLAY + CONFIRMATION
+# Version: LINE_AWARE_SMART_CONFIRM_2026_06_14
+#
+# Purpose:
+# - Brings the useful V3 Line-Aware Hit Rate visibility into Stack 1.2.
+# - DOES NOT double-count the main hit-rate logic already used by WRS 1.2.
+# - Adds a small final confirmation/penalty only when current-line hit rate
+#   strongly agrees or strongly conflicts with the final WRS projection.
+# =========================
+LINE_AWARE_SMART_CONFIRM_VERSION = "LINE_AWARE_SMART_CONFIRM_2026_06_14"
+
+def _lash_num(x, default=None):
+    try:
+        if x in (None, "", "—", "WAITING_FOR_UD_LINE", "NL"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _lash_line(row):
+    for c in ["UD/Line", "Line", "line", "K Line", "TPC Current Line"]:
+        v = _lash_num(row.get(c), None)
+        if v is not None:
+            return v
+    return None
+
+def _lash_final_base(row):
+    for c in ["WRS Final K Projection", "TPS Final K Projection", "TPC True K Projection", "K PROJ", "Final K Projection"]:
+        v = _lash_num(row.get(c), None)
+        if v is not None:
+            return v
+    return None
+
+def _lash_hit_score(row):
+    vals, weights = [], []
+    for c, w, min_c in [
+        ("TPC Season Hit Rate %", 0.40, "TPC Season Games"),
+        ("TPC Recent5 Hit Rate %", 0.24, "TPC Recent5 Games"),
+        ("TPC Recent3 Hit Rate %", 0.10, None),
+        ("TPC Band Hit Rate %", 0.10, "TPC Band Games"),
+        ("TPC Opp Hit Rate %", 0.16, "TPC Opp Games"),
+    ]:
+        v = _lash_num(row.get(c), None)
+        if v is None:
+            continue
+        if min_c and c != "TPC Season Hit Rate %" and (_lash_num(row.get(min_c), 0) or 0) < 2:
+            continue
+        vals.append(v*w); weights.append(w)
+    if not weights:
+        return None
+    return sum(vals) / sum(weights)
+
+def _lash_adjust(row):
+    """
+    Small, final hit-rate confirmation only.
+    WRS already uses hit rate; this prevents double-counting.
+    """
+    base = _lash_final_base(row)
+    line = _lash_line(row)
+    hit = _lash_hit_score(row)
+    if base is None or line is None or hit is None:
+        return base, 0.0, "LASH_NO_DATA", ""
+
+    edge = base - line
+    adj = 0.0
+    label = "LASH_NEUTRAL"
+
+    # Only act on strong disagreement/agreement.
+    if edge >= 0.90 and hit < 38:
+        adj = -0.16
+        label = "LASH_STRONG_OVER_CONFLICT"
+    elif edge >= 0.70 and hit < 45:
+        adj = -0.10
+        label = "LASH_OVER_WARNING"
+    elif edge <= 0.30 and hit >= 72:
+        adj = 0.14
+        label = "LASH_STRONG_OVER_SUPPORT"
+    elif edge >= 0.45 and hit >= 76:
+        adj = 0.08
+        label = "LASH_OVER_CONFIRM"
+
+    final = round(base + adj, 2)
+    reason = f"base {base:.2f}; line {line:.1f}; edge {edge:.2f}; line-aware hit score {hit:.1f}"
+    return final, round(adj, 2), label, reason
+
+def _lash_decision(row, proj):
+    line = _lash_line(row)
+    if proj is None:
+        return "NO_PROJECTION", ""
+    if line is None:
+        return "NO_UD_LINE", ""
+    edge = round(proj - line, 2)
+    hit = _lash_hit_score(row)
+
+    if -0.70 < edge < 0.70:
+        return "🚫 PASS — TRUE EDGE THIN", edge
+    if edge > 0 and hit is not None and hit < 42 and edge < 1.45:
+        return "🚫 PASS — LINE HIT CONFLICT", edge
+    if edge < 0 and hit is not None and hit > 65 and abs(edge) < 1.25:
+        return "🚫 PASS — UNDER LINE HIT CONFLICT", edge
+
+    if edge >= 1.35:
+        return "🔥 OVER", edge
+    if edge >= 0.70:
+        return "⚠️ OVER LEAN", edge
+    if edge <= -1.35:
+        return "🔥 UNDER", edge
+    if edge <= -0.70:
+        return "⚠️ UNDER LEAN", edge
+    return "🚫 PASS — TRUE EDGE THIN", edge
+
+def _lash_apply(df):
+    if df is None or df.empty:
+        return df
+    d = df.copy()
+    finals, adjs, labels, reasons, decisions, edges = [], [], [], [], [], []
+    for _, rr in d.iterrows():
+        row = rr.to_dict()
+        final, adj, label, reason = _lash_adjust(row)
+        dec, edge = _lash_decision(row, final)
+        finals.append(final if final is not None else "")
+        adjs.append(adj)
+        labels.append(label)
+        reasons.append(reason)
+        decisions.append(dec)
+        edges.append(edge)
+
+    d["Line-Aware Smart Final K Projection"] = finals
+    d["Line-Aware Smart Adjustment"] = adjs
+    d["Line-Aware Smart Label"] = labels
+    d["Line-Aware Smart Reason"] = reasons
+    d["Line-Aware Smart Edge"] = edges
+    d["Line-Aware Smart Decision"] = decisions
+    d["Line-Aware Smart Version"] = LINE_AWARE_SMART_CONFIRM_VERSION
+
+    try:
+        if bool(st.session_state.get("use_line_aware_smart_confirm", True)):
+            if "K PROJ" in d.columns:
+                d["Pre-LineAwareSmart K PROJ"] = d["K PROJ"]
+                d["K PROJ"] = d["Line-Aware Smart Final K Projection"]
+            if "Decision" in d.columns:
+                d["Pre-LineAwareSmart Decision"] = d["Decision"]
+                d["Decision"] = d["Line-Aware Smart Decision"]
+            if "Edge Gap" in d.columns:
+                d["Pre-LineAwareSmart Edge Gap"] = d["Edge Gap"]
+                d["Edge Gap"] = d["Line-Aware Smart Edge"]
+            if "Main Engine Action" in d.columns:
+                d["Pre-LineAwareSmart Main Engine Action"] = d["Main Engine Action"]
+                d["Main Engine Action"] = d["Line-Aware Smart Decision"]
+    except Exception:
+        pass
+
+    return d
+
+if "build_kproj_table" in globals():
+    _prev_lash_build_kproj_table = build_kproj_table
+    def build_kproj_table(board):
+        df = _prev_lash_build_kproj_table(board)
+        try:
+            return _lash_apply(df)
+        except Exception:
+            return df
+
+def render_line_aware_smart_confirm_panel():
+    st.markdown("### 📈 Line-Aware Hit Rate Smart Confirm")
+    st.caption("V3-style line hit-rate visibility added to Stack 1.2, with only a tiny final confirmation/tax to avoid double-counting.")
+    try:
+        st.session_state["use_line_aware_smart_confirm"] = st.toggle(
+            "Use Line-Aware Smart Confirm",
+            value=st.session_state.get("use_line_aware_smart_confirm", True),
+            key="use_line_aware_smart_confirm_unique"
+        )
+    except Exception:
+        pass
+    try:
+        df = build_kproj_table(board) if "board" in globals() else pd.DataFrame()
+        cols = [c for c in [
+            "Pitcher","Matchup","Pre-LineAwareSmart K PROJ","K PROJ",
+            "UD/Line","Line-Aware Smart Edge","Line-Aware Smart Decision",
+            "TPC Season Hit Rate %","TPC Season Clears","TPC Season Games",
+            "TPC Recent5 Hit Rate %","TPC Recent5 Clears","TPC Recent5 Games",
+            "TPC Band Hit Rate %","TPC Opp Hit Rate %","TPC Opp Games",
+            "Line-Aware Smart Adjustment","Line-Aware Smart Label",
+            "TPC Last K Results","Line-Aware Smart Reason"
+        ] if c in df.columns]
+        if cols:
+            st.dataframe(df[cols], use_container_width=True, hide_index=True)
+        else:
+            st.info("Line-Aware Smart Confirm will populate after K board builds.")
+    except Exception as e:
+        st.info(f"Line-Aware Smart Confirm waiting: {e}")
+
 tab_kproj, tab_pitcher_fs, tab_moneyline, tab_mlb30_puller, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
