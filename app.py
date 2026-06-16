@@ -22283,6 +22283,177 @@ def _rh_bar_html(vals, line=None):
     return "".join(parts)
 
 
+
+
+def _rh_fmt_num(x, nd=2):
+    try:
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return "—"
+        v = float(x)
+        if abs(v - round(v)) < 1e-9:
+            return str(int(round(v)))
+        return f"{v:.{nd}f}".rstrip('0').rstrip('.')
+    except Exception:
+        return str(x) if x is not None else "—"
+
+
+def _rh_side_word(side):
+    side = str(side or "").upper()
+    return "Over" if side == "OVER" else "Under" if side == "UNDER" else "Hit"
+
+
+def _rh_count_hit(vals, line, side):
+    vals = [_rh_num(v, None) for v in (vals or [])]
+    vals = [float(v) for v in vals if v is not None]
+    line = _rh_num(line, None)
+    side = str(side or "OVER").upper()
+    if line is None or not vals:
+        return 0, 0, None, None, None
+    if side == "UNDER":
+        hits = sum(1 for v in vals if v < line)
+    else:
+        hits = sum(1 for v in vals if v > line)
+    avg = sum(vals) / len(vals)
+    med = float(pd.Series(vals).median()) if vals else None
+    pct = round(hits / len(vals) * 100, 1) if vals else None
+    return hits, len(vals), pct, avg, med
+
+
+def _rh_narrative_sections(rr):
+    """Build Outlier-style readable card text. Display only; does not alter V1 projections."""
+    side = str(rr.get("K Pick") or "OVER").upper()
+    side_word = _rh_side_word(side)
+    line = _rh_num(rr.get("K Line"), None)
+    proj = _rh_num(rr.get("K Projection"), None)
+    edge = _rh_num(rr.get("K Edge"), None)
+    recent = rr.get("Recent Ks") or []
+    # Prefer real recent starts shown. If only 4 available, show Last 4 like the example.
+    shown_vals = recent[-5:] if len(recent) >= 5 else recent
+    hits, total, pct, avg, med = _rh_count_hit(shown_vals, line, side)
+    l10_hits, l10_total, l10_pct, l10_avg, l10_med = _rh_count_hit(recent[-10:], line, side)
+    fair_low = fair_high = None
+    if avg is not None and med is not None:
+        fair_mid = (avg + med + (proj if proj is not None else avg)) / (3 if proj is not None else 2)
+        fair_low = max(0, fair_mid - 0.35)
+        fair_high = fair_mid + 0.35
+    goods, bads = [], []
+    if line is not None:
+        if line <= 3.5:
+            goods.append(f"Line is only {line:g}")
+        elif line >= 6.5:
+            bads.append(f"Line is high at {line:g}, needs a ceiling outing")
+    if shown_vals:
+        last = shown_vals[-1]
+        if line is not None:
+            if (side == "OVER" and last > line) or (side == "UNDER" and last < line):
+                goods.append(f"Most recent outing supported the {side_word.lower()} ({_rh_fmt_num(last)} Ks)")
+            else:
+                bads.append(f"Most recent outing missed this side ({_rh_fmt_num(last)} Ks)")
+        if pct is not None:
+            if pct >= 70:
+                goods.append(f"Recent hit rate is strong: {hits}/{total} ({pct:g}%)")
+            elif pct <= 35:
+                bads.append(f"Only {hits}/{total} recent starts hit this side ({pct:g}%)")
+    if avg is not None and line is not None:
+        if side == "OVER" and avg >= line:
+            goods.append(f"Recent average ({_rh_fmt_num(avg)} Ks) is at/above the line")
+        elif side == "UNDER" and avg <= line:
+            goods.append(f"Recent average ({_rh_fmt_num(avg)} Ks) is below the line")
+        else:
+            bads.append(f"Recent average ({_rh_fmt_num(avg)} Ks) is on the wrong side of the line")
+    ha = rr.get("Home/Away")
+    if ha and str(ha) != "—":
+        ha_pct = _rh_num(rr.get("Home/Away %"), None)
+        if ha_pct is not None and ha_pct >= 65:
+            goods.append(f"Home/Away split supports this side: {ha}")
+        elif ha_pct is not None and ha_pct <= 40:
+            bads.append(f"Home/Away split does not support this side: {ha}")
+    h2h = rr.get("H2H")
+    if h2h and str(h2h) != "—":
+        h2h_pct = _rh_num(rr.get("H2H %"), None)
+        if h2h_pct is not None and h2h_pct >= 65:
+            goods.append(f"H2H supports this side: {h2h}")
+        elif h2h_pct is not None and h2h_pct <= 40:
+            bads.append(f"H2H is weak for this side: {h2h}")
+    role = _rh_num(rr.get("Role Stability"), None)
+    role_label = rr.get("Role Label") or ""
+    if role is not None:
+        if role >= 78:
+            goods.append(f"Role looks stable ({int(role)}/100, {role_label})")
+        elif role < 63:
+            bads.append(f"Role/leash risk flag ({int(role)}/100, {role_label})")
+    ip_label = str(rr.get("IP Trend Label") or "")
+    if "LEASH UP" in ip_label:
+        goods.append("Recent IP trend shows leash up")
+    elif "LEASH DOWN" in ip_label or "VOLATILE" in ip_label:
+        bads.append(f"IP trend warning: {ip_label}")
+    # Matchup note from text only; keep generic, not pretending advanced opponent data.
+    matchup = str(rr.get("Matchup") or "")
+    if matchup:
+        bads.append(f"Matchup context still needs review: {matchup}")
+    sync = _rh_num(rr.get("Sync Score"), None)
+    if sync is not None:
+        if sync >= 75:
+            confidence = "8/10"
+        elif sync >= 62:
+            confidence = "7/10"
+        elif sync >= 48:
+            confidence = "5.5/10"
+        else:
+            confidence = "4/10"
+    else:
+        # fallback from hit rate + edge
+        base = 6
+        if pct is not None:
+            base += 1 if pct >= 65 else -1 if pct <= 35 else 0
+        if edge is not None:
+            base += 1 if abs(edge) >= 0.75 else 0
+        confidence = f"{max(1, min(9, base))}/10"
+    lean = side
+    if pct is not None and pct <= 35 and avg is not None and line is not None:
+        if side == "OVER" and avg < line:
+            lean = "UNDER / PASS" if proj is not None and proj > line else "UNDER"
+        elif side == "UNDER" and avg > line:
+            lean = "OVER / PASS" if proj is not None and proj < line else "OVER"
+    return {
+        "shown_label": f"Last {total} Starts Shown" if total else "Last Starts Shown",
+        "hit_rate": f"{hits}/{total} {side_word} ({pct:g}%)" if pct is not None else "—",
+        "average": avg,
+        "median": med,
+        "fair_low": fair_low,
+        "fair_high": fair_high,
+        "goods": goods[:6] or ["Projection and board data loaded"],
+        "bads": bads[:6] or ["No major trend warning from loaded logs"],
+        "lean": lean,
+        "confidence": confidence,
+        "l10": f"{l10_hits}/{l10_total}" if l10_total else "—",
+    }
+
+
+def _rh_render_verdict_card(rr):
+    ns = _rh_narrative_sections(rr)
+    side = str(rr.get("K Pick") or "OVER").upper()
+    side_word = _rh_side_word(side)
+    line = _rh_num(rr.get("K Line"), None)
+    proj = _rh_num(rr.get("K Projection"), None)
+    fair = "—"
+    if ns["fair_low"] is not None and ns["fair_high"] is not None:
+        fair = f"{_rh_fmt_num(ns['fair_low'])}–{_rh_fmt_num(ns['fair_high'])} Ks"
+    st.markdown("### Hit Rate")
+    st.markdown(f"• **{ns['shown_label']}:** {ns['hit_rate']}  \n• **Average:** {_rh_fmt_num(ns['average'])} Ks  \n• **Median:** {_rh_fmt_num(ns['median'])} Ks")
+    st.markdown("### The Good")
+    for g in ns["goods"]:
+        st.markdown(f"✅ {g}")
+    st.markdown("### The Bad")
+    for b in ns["bads"]:
+        st.markdown(f"❌ {b}")
+    st.markdown("### Outlier-Style Verdict")
+    st.markdown(f"**Line:** {_rh_fmt_num(line)} Ks  \n\n**Hit Rate:** {ns['hit_rate']}  \n\n**Average:** {_rh_fmt_num(ns['average'])} Ks  \n\n**Projection:** {_rh_fmt_num(proj)} Ks  \n\n**Fair Line:** {fair}")
+    lean = ns["lean"]
+    color_icon = "🔴" if "UNDER" in str(lean).upper() else "🟢" if "OVER" in str(lean).upper() else "🟡"
+    st.markdown(f"### Lean\n{color_icon} **{lean} {_rh_fmt_num(line)} Ks**  \n\n**Confidence:** {ns['confidence']}")
+
+
 def render_research_hub_tab(board):
     st.markdown('<div class="section-title-pro">🔎 PROP RESEARCH HUB — K + FS</div>', unsafe_allow_html=True)
     st.caption("Outlier-style trend layer for V1. Research only — Recent IP Trend and Role Stability are display warnings only and do NOT change K projection, FS projection, IP projection, confidence, save/grade, or official decisions.")
@@ -22326,29 +22497,31 @@ def render_research_hub_tab(board):
         st.markdown(_rh_bar_html(rr.get("Recent Ks") or [], kline), unsafe_allow_html=True)
         st.markdown("**Recent Estimated FS Results**", unsafe_allow_html=True)
         st.markdown(_rh_bar_html(rr.get("Recent FS") or [], rr.get("FS Projection")), unsafe_allow_html=True)
-        st.write({
-            "Last 5": rr.get("Last 5"),
-            "Last 10": rr.get("Last 10"),
-            "Last 15": rr.get("Last 15"),
-            "Home/Away": rr.get("Home/Away"),
-            "Home/Away Label": rr.get("Home/Away Label"),
-            "H2H": rr.get("H2H"),
-            "H2H Ks": rr.get("H2H Ks"),
-            "Same-Line Hit Rate": rr.get("Same-Line"),
-            "Recent IP Trend": rr.get("Recent IP Trend"),
-            "Last 5 IP": rr.get("Last 5 IP"),
-            "Last 10 IP": rr.get("Last 10 IP"),
-            "IP Trend Label": rr.get("IP Trend Label"),
-            "Role Stability": rr.get("Role Stability"),
-            "Role Label": rr.get("Role Label"),
-            "Role Note": rr.get("Role Note"),
-            "Open Line": rr.get("Open Line"),
-            "Current Line": rr.get("Current Line"),
-            "Line Move": rr.get("Line Move"),
-            "Line Move Source": rr.get("Line Move Source"),
-            "Odds Comparison": rr.get("Odds Comparison"),
-            "Data Source": rr.get("Data Source"),
-        })
+        _rh_render_verdict_card(rr)
+        with st.expander("Raw research details / audit", expanded=False):
+            st.write({
+                "Last 5": rr.get("Last 5"),
+                "Last 10": rr.get("Last 10"),
+                "Last 15": rr.get("Last 15"),
+                "Home/Away": rr.get("Home/Away"),
+                "Home/Away Label": rr.get("Home/Away Label"),
+                "H2H": rr.get("H2H"),
+                "H2H Ks": rr.get("H2H Ks"),
+                "Same-Line Hit Rate": rr.get("Same-Line"),
+                "Recent IP Trend": rr.get("Recent IP Trend"),
+                "Last 5 IP": rr.get("Last 5 IP"),
+                "Last 10 IP": rr.get("Last 10 IP"),
+                "IP Trend Label": rr.get("IP Trend Label"),
+                "Role Stability": rr.get("Role Stability"),
+                "Role Label": rr.get("Role Label"),
+                "Role Note": rr.get("Role Note"),
+                "Open Line": rr.get("Open Line"),
+                "Current Line": rr.get("Current Line"),
+                "Line Move": rr.get("Line Move"),
+                "Line Move Source": rr.get("Line Move Source"),
+                "Odds Comparison": rr.get("Odds Comparison"),
+                "Data Source": rr.get("Data Source"),
+            })
         st.info("Use this as a confirmation/downgrade tool only. V1 official projection and official decision remain untouched.")
 
 tab_kproj, tab_pitcher_fs, tab_research_hub, tab_moneyline, tab_mlb30_puller, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
