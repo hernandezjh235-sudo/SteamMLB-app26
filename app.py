@@ -21800,9 +21800,561 @@ def render_line_aware_smart_confirm_panel():
     except Exception as e:
         st.info(f"Line-Aware Smart Confirm waiting: {e}")
 
-tab_kproj, tab_pitcher_fs, tab_moneyline, tab_mlb30_puller, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+
+
+# =========================
+# OUTLIER-STYLE RESEARCH HUB — V1 ADD-ON
+# Version: RESEARCH_HUB_V1_2026_06_15
+# UI / decision-support only. DOES NOT change K projections, FS projections, IP projections, or official decisions.
+# Uses session Pitch.csv / MLB game logs when available, plus board prop rows/line history when present.
+# =========================
+RESEARCH_HUB_VERSION = "RESEARCH_HUB_V1_2026_06_15"
+
+
+def _rh_norm(x):
+    try:
+        return unicodedata.normalize("NFKD", str(x or "")).encode("ascii", "ignore").decode("ascii").lower().strip()
+    except Exception:
+        return str(x or "").lower().strip()
+
+
+def _rh_num(x, default=None):
+    try:
+        if x is None or x == "":
+            return default
+        if isinstance(x, str):
+            x = x.replace("%", "").replace("+", "").strip()
+        v = float(x)
+        if math.isnan(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+def _rh_col(df, names):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+    low = {str(c).lower().strip(): c for c in df.columns}
+    for n in names:
+        if n in df.columns:
+            return n
+        k = str(n).lower().strip()
+        if k in low:
+            return low[k]
+    return None
+
+
+def _rh_logs_df():
+    """Return pitcher season/30d logs loaded in the app. Never calls projections; never changes projections."""
+    try:
+        for key in ["pitcher_season_logs", "pitcher_30_day_logs"]:
+            df = st.session_state.get(key)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df.copy()
+    except Exception:
+        pass
+    try:
+        if '_embedded_pitchcsv_df' in globals():
+            df = _embedded_pitchcsv_df()
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df.copy()
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def _rh_board_base_df(board):
+    rows = []
+    fs_lookup = {}
+    try:
+        fsdf = build_pitcher_fs_board(board)
+        if isinstance(fsdf, pd.DataFrame) and not fsdf.empty:
+            for _, r in fsdf.iterrows():
+                fs_lookup[_rh_norm(r.get("Pitcher"))] = r.to_dict()
+    except Exception:
+        fs_lookup = {}
+
+    for p in board or []:
+        name = p.get("pitcher") or p.get("Pitcher") or p.get("Player") or ""
+        side = str(p.get("pick_side") or p.get("Pick") or "").upper()
+        line = _rh_num(p.get("line") or p.get("UD/Line") or p.get("Line"), None)
+        proj = _rh_num(p.get("projection") or p.get("K PROJ") or p.get("Projection"), None)
+        if not side and line is not None and proj is not None:
+            side = "OVER" if proj > line else "UNDER"
+        fsrow = fs_lookup.get(_rh_norm(name), {})
+        rows.append({
+            "Pitcher": name,
+            "Matchup": p.get("matchup") or p.get("Matchup") or "",
+            "Team": p.get("team") or p.get("Team") or p.get("Pitcher Team") or "",
+            "K Line": line,
+            "K Projection": proj,
+            "K Pick": side,
+            "K Edge": None if line is None or proj is None else round(proj - line, 2),
+            "FS Projection": _rh_num(fsrow.get("FS Projection"), None),
+            "IP Projection": _rh_num(p.get("ip_projection") or p.get("IP Projection") or p.get("IP Proj") or p.get("ip_floor"), _rh_num(fsrow.get("IP Projection"), None)),
+            "Raw": p,
+        })
+    return pd.DataFrame(rows)
+
+
+def _rh_current_opponent(matchup, team=""):
+    try:
+        away, home = _slpb_split_matchup(matchup) if '_slpb_split_matchup' in globals() else ("", "")
+    except Exception:
+        away, home = "", ""
+    team = str(team or "").upper()
+    if team and team in away:
+        return home
+    if team and team in home:
+        return away
+    return ""
+
+
+def _rh_pitcher_logs(name):
+    df = _rh_logs_df()
+    if df.empty:
+        return df
+    pcol = _rh_col(df, ["Pitcher", "Player", "Name"])
+    if not pcol:
+        return pd.DataFrame()
+    d = df.copy()
+    d["_rh_name"] = d[pcol].map(_rh_norm)
+    d = d[d["_rh_name"] == _rh_norm(name)].copy()
+    if d.empty:
+        return d
+    date_col = _rh_col(d, ["Date", "Game Date", "game_date"])
+    if date_col:
+        d["_rh_date"] = pd.to_datetime(d[date_col], errors="coerce")
+        d = d.sort_values("_rh_date")
+    for c in d.columns:
+        if str(c).lower().strip() in ["k", "so", "strikeouts", "ip", "bf", "pitch count", "pitches", "er", "r", "h", "bb", "hr", "whip"]:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    return d
+
+
+def _rh_k_col(d):
+    return _rh_col(d, ["K", "SO", "Strikeouts", "strikeOuts", "Ks"])
+
+def _rh_ip_col(d):
+    return _rh_col(d, ["IP", "Innings", "Innings Pitched", "inningsPitched", "ip"])
+
+
+def _rh_recent_ip_trend(d, ip_projection=None):
+    """Recent IP trend for the Research Hub only. Does not feed V1 projections."""
+    if d is None or getattr(d, "empty", True):
+        return {
+            "Recent IP Trend": "NO DATA",
+            "Last 5 IP": "—",
+            "Last 10 IP": "—",
+            "L5 IP Avg": None,
+            "L10 IP Avg": None,
+            "IP Trend Label": "NO_IP_LOGS",
+        }
+    ipcol = _rh_ip_col(d)
+    if not ipcol:
+        return {
+            "Recent IP Trend": "NO IP COL",
+            "Last 5 IP": "—",
+            "Last 10 IP": "—",
+            "L5 IP Avg": None,
+            "L10 IP Avg": None,
+            "IP Trend Label": "NO_IP_COLUMN",
+        }
+    vals = []
+    for v in d[ipcol].dropna().tolist():
+        n = _rh_num(v, None)
+        if n is not None:
+            vals.append(float(n))
+    if not vals:
+        return {
+            "Recent IP Trend": "NO IP VALUES",
+            "Last 5 IP": "—",
+            "Last 10 IP": "—",
+            "L5 IP Avg": None,
+            "L10 IP Avg": None,
+            "IP Trend Label": "NO_IP_VALUES",
+        }
+    l5 = vals[-5:]
+    l10 = vals[-10:]
+    l5_avg = round(sum(l5) / len(l5), 2) if l5 else None
+    l10_avg = round(sum(l10) / len(l10), 2) if l10 else None
+    ip_projection = _rh_num(ip_projection, None)
+    label = "STABLE"
+    if l5_avg is not None and ip_projection is not None:
+        diff = l5_avg - ip_projection
+        if diff >= 0.85:
+            label = "RECENT LEASH UP"
+        elif diff <= -0.85:
+            label = "RECENT LEASH DOWN"
+        elif len(l5) >= 3 and (max(l5) - min(l5)) >= 2.0:
+            label = "VOLATILE IP"
+    elif len(l5) >= 3 and (max(l5) - min(l5)) >= 2.0:
+        label = "VOLATILE IP"
+    return {
+        "Recent IP Trend": f"L5 {l5_avg} / L10 {l10_avg}",
+        "Last 5 IP": ", ".join([f"{x:g}" for x in l5]),
+        "Last 10 IP": ", ".join([f"{x:g}" for x in l10]),
+        "L5 IP Avg": l5_avg,
+        "L10 IP Avg": l10_avg,
+        "IP Trend Label": label,
+    }
+
+
+def _rh_role_stability_score(d, row, ip_trend=None):
+    """Display-only role stability. It does not alter V1 K/FS/IP projections or decisions."""
+    ip_projection = _rh_num((row or {}).get("IP Projection"), None)
+    score = 50
+    notes = []
+    if d is None or getattr(d, "empty", True):
+        score -= 15
+        notes.append("limited log data")
+    else:
+        score += min(len(d), 12)
+        ipcol = _rh_ip_col(d)
+        vals = []
+        if ipcol:
+            for v in d[ipcol].dropna().tolist()[-10:]:
+                n = _rh_num(v, None)
+                if n is not None:
+                    vals.append(float(n))
+        if vals:
+            l5 = vals[-5:]
+            avg = sum(l5) / len(l5)
+            starter_like = sum(1 for x in l5 if x >= 4.0)
+            deep = sum(1 for x in l5 if x >= 5.0)
+            if starter_like >= 4:
+                score += 18; notes.append("starter workload")
+            elif starter_like <= 2:
+                score -= 18; notes.append("short/swing workload")
+            if deep >= 3:
+                score += 8; notes.append("recent 5+ IP")
+            if len(l5) >= 3 and (max(l5) - min(l5)) >= 2.5:
+                score -= 14; notes.append("volatile leash")
+            if ip_projection is not None:
+                if avg + 0.9 < ip_projection:
+                    score -= 8; notes.append("projection above recent IP")
+                elif avg - 0.9 > ip_projection:
+                    score += 5; notes.append("projection below recent IP")
+        else:
+            score -= 10; notes.append("no recent IP values")
+    raw = row.get("Raw") if isinstance(row, dict) else {}
+    role_text = " ".join([str(raw.get(k, "")) for k in ["Role", "role", "Starter", "starter", "Lineup", "Pitcher Role", "Leash Label"]]) if isinstance(raw, dict) else ""
+    lt = role_text.lower()
+    if any(w in lt for w in ["opener", "bulk", "swing", "spot", "relief", "bullpen"]):
+        score -= 20; notes.append("role warning")
+    if any(w in lt for w in ["confirmed", "starter", "probable"]):
+        score += 8; notes.append("confirmed/probable")
+    score = int(max(0, min(100, round(score))))
+    label = "STABLE STARTER" if score >= 78 else "MOSTLY STABLE" if score >= 63 else "ROLE WATCH" if score >= 48 else "HIGH ROLE RISK"
+    return score, label, "; ".join(notes[:5]) if notes else "normal workload profile"
+
+
+
+def _rh_fs_from_log_row(r):
+    """Estimated UD-style pitcher FS from real log columns when available. Research only."""
+    k = _rh_num(r.get("K") if "K" in r else r.get("SO") if "SO" in r else r.get("Strikeouts"), 0) or 0
+    ip = _rh_num(r.get("IP"), 0) or 0
+    er = _rh_num(r.get("ER") if "ER" in r else r.get("Earned Runs"), 0) or 0
+    # Win/QS actual flags often are not in Pitch.csv. Keep them optional if present.
+    win = 1 if str(r.get("W") or r.get("Win") or "").upper() in ["1", "TRUE", "W", "WIN"] else 0
+    qs = 1 if ip >= 6.0 and er <= 3.0 else 0
+    return round((k * 3.0) + (ip * 3.0) - (er * 3.0) + (win * 5.0) + (qs * 5.0), 2)
+
+
+def _rh_rate(vals, line, side):
+    vals = [_rh_num(v, None) for v in vals]
+    vals = [v for v in vals if v is not None]
+    if line is None or not vals:
+        return "—", None, 0, 0
+    side = str(side or "OVER").upper()
+    if side == "UNDER":
+        hits = sum(1 for v in vals if v < line)
+    else:
+        hits = sum(1 for v in vals if v > line)
+    return f"{hits}/{len(vals)}", round(hits / len(vals) * 100, 1), hits, len(vals)
+
+
+def _rh_same_line_rate(vals, line, side):
+    # With historical prop lines unavailable, use actual outcomes vs today's exact line.
+    return _rh_rate(vals, line, side)
+
+
+def _rh_market_from_board(raw):
+    books = []
+    try:
+        for r in raw.get("prop_rows", []) or []:
+            src = r.get("Source") or r.get("source") or r.get("book") or r.get("Sportsbook") or "Market"
+            ln = _rh_num(r.get("Line") or r.get("line") or r.get("points"), None)
+            if ln is not None:
+                books.append({"Book": str(src), "Line": ln, "Market": r.get("Market") or r.get("market") or "K"})
+    except Exception:
+        pass
+    # Deduplicate same book/line
+    out = []
+    seen = set()
+    for b in books:
+        key = (b["Book"], b["Line"], b["Market"])
+        if key not in seen:
+            seen.add(key); out.append(b)
+    return out
+
+
+def _rh_line_movement(name, current_line):
+    try:
+        hist = load_json(LINE_HISTORY_FILE, {}) if 'LINE_HISTORY_FILE' in globals() else {}
+        key_norm = _rh_norm(name)
+        candidates = []
+        if isinstance(hist, dict):
+            for k, v in hist.items():
+                if key_norm in _rh_norm(k):
+                    candidates.append(v)
+        lines = []
+        for v in candidates:
+            if isinstance(v, list):
+                for item in v:
+                    ln = _rh_num((item or {}).get("line") if isinstance(item, dict) else item, None)
+                    if ln is not None: lines.append(ln)
+            elif isinstance(v, dict):
+                for kk in ["open", "opening_line", "first_line", "line", "current"]:
+                    ln = _rh_num(v.get(kk), None)
+                    if ln is not None: lines.append(ln)
+        if lines:
+            open_line = lines[0]
+            cur = current_line if current_line is not None else lines[-1]
+            return open_line, cur, round(cur - open_line, 2), "REAL_LINE_HISTORY"
+    except Exception:
+        pass
+    return None, current_line, None, "NO_LINE_MOVEMENT_SOURCE"
+
+
+def _rh_profile_for_row(row):
+    name = row.get("Pitcher")
+    line = _rh_num(row.get("K Line"), None)
+    side = row.get("K Pick") or "OVER"
+    matchup = row.get("Matchup") or ""
+    team = row.get("Team") or ""
+    opp = _rh_current_opponent(matchup, team)
+    d = _rh_pitcher_logs(name)
+    kcol = _rh_k_col(d)
+    vals = d[kcol].dropna().astype(float).tolist() if not d.empty and kcol else []
+    ip_trend = _rh_recent_ip_trend(d, row.get("IP Projection"))
+    role_score, role_label, role_note = _rh_role_stability_score(d, row, ip_trend)
+    l5 = vals[-5:]
+    l10 = vals[-10:]
+    l15 = vals[-15:]
+    l5_txt, l5_pct, _, _ = _rh_rate(l5, line, side)
+    l10_txt, l10_pct, _, _ = _rh_rate(l10, line, side)
+    l15_txt, l15_pct, _, _ = _rh_rate(l15, line, side)
+    same_txt, same_pct, _, _ = _rh_same_line_rate(vals, line, side)
+
+    ha_txt = "—"; ha_pct = None; ha_vals = []
+    ha_label = "NO_HOME_AWAY_SPLIT"
+    try:
+        hacol = _rh_col(d, ["Home/Away", "H/A", "home_away"])
+        if hacol and matchup:
+            desired = None
+            away, home = _slpb_split_matchup(matchup) if '_slpb_split_matchup' in globals() else ("", "")
+            t = str(team or "").upper()
+            if t and t in away: desired = "Away"
+            elif t and t in home: desired = "Home"
+            if desired:
+                hd = d[d[hacol].astype(str).str.lower().str.contains(desired.lower(), na=False)]
+                if kcol and not hd.empty:
+                    ha_vals = hd[kcol].dropna().astype(float).tolist()
+                    ha_txt, ha_pct, _, _ = _rh_rate(ha_vals, line, side)
+                    ha_label = desired.upper()
+    except Exception:
+        pass
+
+    h2h_txt = "—"; h2h_pct = None; h2h_vals = []
+    try:
+        ocol = _rh_col(d, ["Opponent", "Opp", "opponent"])
+        if ocol and opp:
+            od = d[d[ocol].astype(str).str.upper().str.contains(str(opp).upper()[:3], na=False)]
+            if kcol and not od.empty:
+                h2h_vals = od[kcol].dropna().astype(float).tolist()
+                h2h_txt, h2h_pct, _, _ = _rh_rate(h2h_vals, line, side)
+    except Exception:
+        pass
+
+    fs_vals = []
+    try:
+        for _, rr in d.tail(10).iterrows():
+            fs_vals.append(_rh_fs_from_log_row(rr.to_dict()))
+    except Exception:
+        pass
+
+    open_line, cur_line, move, move_src = _rh_line_movement(name, line)
+    market_books = _rh_market_from_board(row.get("Raw") or {})
+    market_txt = "—"
+    if market_books:
+        market_txt = ", ".join([f"{b['Book']} {b['Line']}" for b in market_books[:6]])
+
+    # Sync score: support/confirm V1 side. This is display-only; official picks are unchanged.
+    parts = []
+    for pct, weight in [(l5_pct, 18), (l10_pct, 24), (l15_pct, 12), (ha_pct, 14), (h2h_pct, 12), (same_pct, 10)]:
+        if pct is not None:
+            parts.append((pct / 100.0, weight))
+    edge = _rh_num(row.get("K Edge"), None)
+    if edge is not None:
+        agree = 1.0 if (side == "OVER" and edge > 0) or (side == "UNDER" and edge < 0) else 0.35
+        parts.append((agree, 10))
+    if move is not None:
+        # Line move up can support OVER market interest; move down supports UNDER.
+        agree = 1.0 if (side == "OVER" and move > 0) or (side == "UNDER" and move < 0) else 0.45
+        parts.append((agree, 8))
+    if parts:
+        sync = round(sum(v*w for v,w in parts) / max(sum(w for _,w in parts), 1) * 100, 1)
+    else:
+        sync = None
+    label = "NO DATA"
+    if sync is not None:
+        label = "STRONG AGREEMENT" if sync >= 75 else "GOOD AGREEMENT" if sync >= 62 else "MIXED" if sync >= 48 else "AGAINST TREND"
+
+    return {
+        "Pitcher": name,
+        "Matchup": matchup,
+        "K Pick": side,
+        "K Line": line,
+        "K Projection": row.get("K Projection"),
+        "K Edge": row.get("K Edge"),
+        "FS Projection": row.get("FS Projection"),
+        "IP Projection": row.get("IP Projection"),
+        "Recent IP Trend": ip_trend.get("Recent IP Trend"),
+        "Last 5 IP": ip_trend.get("Last 5 IP"),
+        "Last 10 IP": ip_trend.get("Last 10 IP"),
+        "L5 IP Avg": ip_trend.get("L5 IP Avg"),
+        "L10 IP Avg": ip_trend.get("L10 IP Avg"),
+        "IP Trend Label": ip_trend.get("IP Trend Label"),
+        "Role Stability": role_score,
+        "Role Label": role_label,
+        "Role Note": role_note,
+        "Last 5": l5_txt,
+        "Last 5 %": l5_pct,
+        "Last 10": l10_txt,
+        "Last 10 %": l10_pct,
+        "Last 15": l15_txt,
+        "Last 15 %": l15_pct,
+        "Home/Away": ha_txt,
+        "Home/Away %": ha_pct,
+        "Home/Away Label": ha_label,
+        "H2H": h2h_txt,
+        "H2H %": h2h_pct,
+        "Same-Line": same_txt,
+        "Same-Line %": same_pct,
+        "Open Line": open_line,
+        "Current Line": cur_line,
+        "Line Move": move,
+        "Line Move Source": move_src,
+        "Odds Comparison": market_txt,
+        "Sync Score": sync,
+        "Sync Label": label,
+        "Recent Ks": l10,
+        "Recent FS": fs_vals,
+        "H2H Ks": h2h_vals[-10:],
+        "Data Source": "Pitch.csv/session logs + board prop rows",
+        "Version": RESEARCH_HUB_VERSION,
+    }
+
+
+def build_research_hub_table(board):
+    base = _rh_board_base_df(board)
+    if base.empty:
+        return pd.DataFrame()
+    rows = []
+    for _, r in base.iterrows():
+        rows.append(_rh_profile_for_row(r.to_dict()))
+    return pd.DataFrame(rows)
+
+
+def _rh_bar_html(vals, line=None):
+    if not vals:
+        return "<span class='small-muted'>No recent log data loaded</span>"
+    parts = []
+    for v in vals[-10:]:
+        try:
+            good = line is not None and float(v) > float(line)
+            bg = "#163d2a" if good else "#3a2020"
+            border = "#2ecc71" if good else "#ff5555"
+            parts.append(f"<span style='display:inline-block;min-width:34px;text-align:center;margin:3px;padding:7px 6px;border:1px solid {border};border-radius:9px;background:{bg};font-weight:800'>{v:g}</span>")
+        except Exception:
+            pass
+    return "".join(parts)
+
+
+def render_research_hub_tab(board):
+    st.markdown('<div class="section-title-pro">🔎 PROP RESEARCH HUB — K + FS</div>', unsafe_allow_html=True)
+    st.caption("Outlier-style trend layer for V1. Research only — Recent IP Trend and Role Stability are display warnings only and do NOT change K projection, FS projection, IP projection, confidence, save/grade, or official decisions.")
+    if not board:
+        st.info("Refresh or load the board first.")
+        return
+    df = build_research_hub_table(board)
+    if df.empty:
+        st.warning("No research rows found. Load Season Data / Pitch.csv first, then refresh the board.")
+        return
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Rows", len(df))
+    c2.metric("Strong Sync", int((pd.to_numeric(df.get("Sync Score"), errors="coerce") >= 75).sum()))
+    c3.metric("With L10 Data", int(df.get("Last 10", pd.Series(dtype=str)).astype(str).ne("—").sum()))
+    c4.metric("Role Watch", int((pd.to_numeric(df.get("Role Stability"), errors="coerce") < 63).sum()))
+    c5.metric("Version", RESEARCH_HUB_VERSION.replace("RESEARCH_HUB_", ""))
+
+    cols = [c for c in [
+        "Pitcher", "Matchup", "K Pick", "K Line", "K Projection", "K Edge", "FS Projection", "IP Projection",
+        "Recent IP Trend", "IP Trend Label", "Role Stability", "Role Label",
+        "Last 5", "Last 10", "Last 15", "Home/Away", "H2H", "Same-Line", "Line Move", "Odds Comparison", "Sync Score", "Sync Label"
+    ] if c in df.columns]
+    st.dataframe(df[cols].sort_values(["Sync Score", "K Edge"], ascending=[False, False], na_position="last"), use_container_width=True, hide_index=True)
+
+    st.subheader("Clickable Player Cards")
+    names = df["Pitcher"].dropna().astype(str).tolist()
+    selected = st.selectbox("Open player research card", names, key="research_hub_player_select")
+    rr = df[df["Pitcher"].astype(str) == selected].iloc[0].to_dict()
+    kline = _rh_num(rr.get("K Line"), None)
+    with st.expander(f"{selected} — Full K/FS Research Card", expanded=True):
+        a,b,c,d,e,f,g = st.columns(7)
+        a.metric("K Projection", rr.get("K Projection", "—"))
+        b.metric("K Line", rr.get("K Line", "—"))
+        c.metric("K Edge", rr.get("K Edge", "—"))
+        d.metric("FS Projection", rr.get("FS Projection", "—"))
+        e.metric("Sync", "—" if rr.get("Sync Score") is None else f"{rr.get('Sync Score')}%")
+        f.metric("L5 IP Avg", rr.get("L5 IP Avg", "—"))
+        g.metric("Role", rr.get("Role Stability", "—"))
+        st.markdown(f"**Decision Support:** {rr.get('Sync Label')}  ")
+        st.markdown("**Last 10 K Results**", unsafe_allow_html=True)
+        st.markdown(_rh_bar_html(rr.get("Recent Ks") or [], kline), unsafe_allow_html=True)
+        st.markdown("**Recent Estimated FS Results**", unsafe_allow_html=True)
+        st.markdown(_rh_bar_html(rr.get("Recent FS") or [], rr.get("FS Projection")), unsafe_allow_html=True)
+        st.write({
+            "Last 5": rr.get("Last 5"),
+            "Last 10": rr.get("Last 10"),
+            "Last 15": rr.get("Last 15"),
+            "Home/Away": rr.get("Home/Away"),
+            "Home/Away Label": rr.get("Home/Away Label"),
+            "H2H": rr.get("H2H"),
+            "H2H Ks": rr.get("H2H Ks"),
+            "Same-Line Hit Rate": rr.get("Same-Line"),
+            "Recent IP Trend": rr.get("Recent IP Trend"),
+            "Last 5 IP": rr.get("Last 5 IP"),
+            "Last 10 IP": rr.get("Last 10 IP"),
+            "IP Trend Label": rr.get("IP Trend Label"),
+            "Role Stability": rr.get("Role Stability"),
+            "Role Label": rr.get("Role Label"),
+            "Role Note": rr.get("Role Note"),
+            "Open Line": rr.get("Open Line"),
+            "Current Line": rr.get("Current Line"),
+            "Line Move": rr.get("Line Move"),
+            "Line Move Source": rr.get("Line Move Source"),
+            "Odds Comparison": rr.get("Odds Comparison"),
+            "Data Source": rr.get("Data Source"),
+        })
+        st.info("Use this as a confirmation/downgrade tool only. V1 official projection and official decision remain untouched.")
+
+tab_kproj, tab_pitcher_fs, tab_research_hub, tab_moneyline, tab_mlb30_puller, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
+    "🔎 RESEARCH HUB",
     "MONEYLINE EDGE",
     "📥 SEASON DATA",
     "🟣 FS UD WATCHER",
@@ -21824,6 +22376,9 @@ with tab_pitcher_fs:
     render_fs_ud_watcher_controls()
 
     render_pitcher_fs_tab(board)
+
+with tab_research_hub:
+    render_research_hub_tab(board)
 
 with tab_moneyline:
     render_moneyline_edge_tab(board, dates)
