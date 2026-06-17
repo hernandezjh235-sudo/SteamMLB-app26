@@ -226,6 +226,9 @@ SHARPAPI_KEY = "sk_live_UUk8eejunMDA96uM4vRAQT"
 # Optional manual market odds fallback text is assigned from the Streamlit sidebar at runtime.
 # It is used ONLY for Market/Sharp cards and never changes K projection, BF, IP, pitch count, lineups, or active UD line.
 MANUAL_MARKET_ODDS_TEXT = ""
+# V1 line-source selector: projection stays untouched; only the compared line changes.
+PITCHER_K_LINE_SOURCE = "Underdog"
+SLEEPER_MANUAL_LINES_TEXT = ""
 SPORTSGAMEODDS_API_KEY = get_secret("SPORTSGAMEODDS_API_KEY", "")
 OPTICODDS_API_KEY = get_secret("OPTICODDS_API_KEY", "")
 
@@ -6058,6 +6061,74 @@ def extract_prop_rows_from_any_json(data, player_name, source_name):
         dedup[key] = r
     return list(dedup.values())
 
+
+def parse_manual_sleeper_k_lines(player_name, text=None):
+    """Manual Sleeper fallback for pitcher strikeout lines.
+
+    Accepts lines like:
+      Pitcher, Line
+      Shohei Ohtani, 5.5
+      Dylan Cease 6.5
+
+    This does not alter projections; it only supplies a Sleeper line for edge comparison.
+    """
+    text = SLEEPER_MANUAL_LINES_TEXT if text is None else text
+    rows = []
+    target = str(player_name or "")
+    for raw in str(text or "").splitlines():
+        line_txt = raw.strip()
+        if not line_txt or line_txt.lower().startswith("pitcher"):
+            continue
+        parts = [p.strip() for p in line_txt.split(",")]
+        if len(parts) >= 2:
+            cand_name = parts[0]
+            cand_line = safe_float(parts[1])
+        else:
+            tokens = line_txt.split()
+            if len(tokens) < 2:
+                continue
+            cand_line = safe_float(tokens[-1])
+            cand_name = " ".join(tokens[:-1])
+        k_line = is_valid_k_line(cand_line, allow_integer=True)
+        if k_line is None:
+            continue
+        score = name_score(target, cand_name)
+        if score >= 0.80:
+            rows.append({
+                "Source": "Sleeper",
+                "Provider": "Sleeper Manual",
+                "Player": target,
+                "Matched Name": cand_name,
+                "Market": "Pitcher Strikeouts",
+                "Side": "OVER/UNDER",
+                "Line": float(k_line),
+                "Price": None,
+                "Match Score": round(score, 3),
+            })
+    rows = sorted(rows, key=lambda r: -safe_float(r.get("Match Score"), 0))
+    if not rows:
+        return source_result("Sleeper", "NO MATCH", line=None, rows=[], message="No Sleeper pitcher-K manual line matched")
+    return source_result("Sleeper", "FOUND", line=rows[0].get("Line"), rows=rows, message=f"Sleeper manual line matched: {rows[0].get('Line')}")
+
+
+def get_sleeper_k_data(player_name):
+    """Sleeper pitcher-K line source.
+
+    Public Sleeper fantasy APIs do not reliably expose pick'em prop boards, so this function:
+    1) uses the manual Sleeper fallback text when provided;
+    2) can be extended to a paid odds provider/Sleeper feed later without changing projection logic.
+    """
+    manual = parse_manual_sleeper_k_lines(player_name)
+    if manual.get("status") == "FOUND":
+        return manual
+    return source_result(
+        "Sleeper",
+        "NO MATCH",
+        line=None,
+        rows=[],
+        message="No Sleeper K line found. Paste Sleeper lines in sidebar or connect a Sleeper odds feed."
+    )
+
 def get_underdog_k_data(player_name):
     """Live Underdog parser for MLB pitcher strikeout props.
 
@@ -6436,13 +6507,70 @@ def get_opticodds_k_data(player_name):
     lines = [safe_float(r.get("Line")) for r in all_rows if safe_float(r.get("Line")) is not None]
     return source_result("OpticOdds", "FOUND", line=float(np.median(lines)), rows=all_rows, message=f"Found {len(all_rows)} OpticOdds rows")
 
-def choose_active_line(sportsbook_data, pp_data, ud_data, sgo_data, optic_data):
-    """Choose a safe active line.
+def choose_active_line(sportsbook_data, pp_data, ud_data, sleeper_data=None, sgo_data=None, optic_data=None, projection=None):
+    """Choose a safe active line based on the selected V1 source.
 
-    For this app, Underdog is treated as the live source of truth when it has an exact
-    half-point pitcher-K match. That prevents the app from showing 5 when Underdog is
-    actually showing 4.5. Other sources remain available as backup/consensus.
+    Projection math is untouched. This function only chooses which posted line
+    (Underdog, Sleeper, or Compare Both best edge) the model compares against.
     """
+    sleeper_data = sleeper_data or source_result("Sleeper", "OFF", line=None, rows=[], message="Sleeper off")
+    sgo_data = sgo_data or source_result("SportsGameOdds", "OFF", line=None, rows=[], message="SportsGameOdds off")
+    optic_data = optic_data or source_result("OpticOdds", "OFF", line=None, rows=[], message="OpticOdds off")
+    selected = str(globals().get("PITCHER_K_LINE_SOURCE", "Underdog") or "Underdog")
+
+    ud_line = is_valid_k_line(ud_data.get("line"), allow_integer=False)
+    sleeper_line = is_valid_k_line(sleeper_data.get("line"), allow_integer=True)
+
+    def source_payload(source, line, quality, rows=None, extra_rows=None):
+        all_rows = []
+        for r in (rows or []):
+            all_rows.append({"Source": source, "Line": line, "Weight": 3.5, **{k: v for k, v in r.items() if k in ["Provider", "Matched Name", "Match Score"]}})
+        for r in (extra_rows or []):
+            all_rows.append(r)
+        return float(line), source, {
+            "count": len(all_rows) or 1,
+            "quality": quality,
+            "spread": None,
+            "rows": all_rows or [{"Source": source, "Line": float(line), "Weight": 3.5}],
+            "selected_line_source": selected,
+            "underdog_line": ud_line,
+            "sleeper_line": sleeper_line,
+        }
+
+    # Sleeper-only mode: use Sleeper if present; otherwise no line rather than silently falling back.
+    if selected == "Sleeper":
+        if sleeper_data.get("status") == "FOUND" and sleeper_line is not None:
+            return source_payload("Sleeper", sleeper_line, "SLEEPER_EXACT", rows=sleeper_data.get("rows", []))
+        return None, "Sleeper No Line", {"count": 0, "quality": "SLEEPER_NO_LINE", "spread": None, "rows": [], "selected_line_source": selected, "underdog_line": ud_line, "sleeper_line": sleeper_line}
+
+    # Compare mode: show both and choose the best edge versus the same projection.
+    if selected == "Compare Both":
+        compare_candidates = []
+        if ud_data.get("status") == "FOUND" and ud_line is not None:
+            compare_candidates.append({"Source": "Underdog", "Line": float(ud_line), "Rows": ud_data.get("rows", [])})
+        if sleeper_data.get("status") == "FOUND" and sleeper_line is not None:
+            compare_candidates.append({"Source": "Sleeper", "Line": float(sleeper_line), "Rows": sleeper_data.get("rows", [])})
+        if compare_candidates:
+            proj = safe_float(projection)
+            if proj is not None:
+                best = sorted(compare_candidates, key=lambda c: abs(proj - safe_float(c.get("Line"), proj)), reverse=True)[0]
+            else:
+                best = compare_candidates[0]
+            spread = float(max(c["Line"] for c in compare_candidates) - min(c["Line"] for c in compare_candidates)) if len(compare_candidates) > 1 else 0.0
+            rows = [{"Source": c["Source"], "Line": c["Line"], "Weight": 3.5} for c in compare_candidates]
+            return float(best["Line"]), f"{best['Source']} Best Line", {
+                "count": len(compare_candidates),
+                "quality": "COMPARE_BOTH",
+                "spread": round(spread, 2),
+                "rows": rows,
+                "selected_line_source": selected,
+                "underdog_line": ud_line,
+                "sleeper_line": sleeper_line,
+                "best_source": best["Source"],
+            }
+        return None, "No UD/Sleeper Line", {"count": 0, "quality": "COMPARE_NO_LINE", "spread": None, "rows": [], "selected_line_source": selected, "underdog_line": ud_line, "sleeper_line": sleeper_line}
+
+    # Default Underdog mode: preserve original behavior.
     candidates = []
 
     def add(source, line, weight, allow_integer=False):
@@ -6450,10 +6578,7 @@ def choose_active_line(sportsbook_data, pp_data, ud_data, sgo_data, optic_data):
         if val is not None:
             candidates.append({"Source": source, "Line": val, "Weight": float(weight)})
 
-    # Underdog first: user is comparing the app to live Underdog props.
-    ud_line = is_valid_k_line(ud_data.get("line"), allow_integer=False)
     if ud_data.get("status") == "FOUND" and ud_line is not None:
-        # Still collect other rows for diagnostics, but do not let consensus round/shift Underdog.
         add("Sportsbook", sportsbook_data.get("line"), 3.0, allow_integer=True)
         add("SportsGameOdds", sgo_data.get("line"), 2.5, allow_integer=True)
         add("OpticOdds", optic_data.get("line"), 2.5, allow_integer=True)
@@ -6466,6 +6591,9 @@ def choose_active_line(sportsbook_data, pp_data, ud_data, sgo_data, optic_data):
             "quality": "UNDERDOG_EXACT",
             "spread": round(spread, 2),
             "rows": candidates,
+            "selected_line_source": selected,
+            "underdog_line": ud_line,
+            "sleeper_line": sleeper_line,
         }
 
     # Backup mode when Underdog has no exact match.
@@ -6475,7 +6603,7 @@ def choose_active_line(sportsbook_data, pp_data, ud_data, sgo_data, optic_data):
     add("PrizePicks", pp_data.get("line"), 1.5, allow_integer=False)
 
     if not candidates:
-        return None, "No Valid Real Pitcher-K Line", {"count": 0, "quality": "NO LINE", "spread": None, "rows": []}
+        return None, "No Valid Real Pitcher-K Line", {"count": 0, "quality": "NO LINE", "spread": None, "rows": [], "selected_line_source": selected, "underdog_line": ud_line, "sleeper_line": sleeper_line}
 
     raw_lines = [c["Line"] for c in candidates]
     spread = float(max(raw_lines) - min(raw_lines)) if len(candidates) > 1 else 0.0
@@ -6484,7 +6612,8 @@ def choose_active_line(sportsbook_data, pp_data, ud_data, sgo_data, optic_data):
         priority = {"Sportsbook": 1, "SportsGameOdds": 2, "OpticOdds": 3, "PrizePicks": 4}
         best = sorted(candidates, key=lambda c: priority.get(c["Source"], 99))[0]
         return best["Line"], f"{best['Source']} Only (source disagreement blocked)", {
-            "count": len(candidates), "quality": "DISAGREE", "spread": round(spread, 2), "rows": candidates
+            "count": len(candidates), "quality": "DISAGREE", "spread": round(spread, 2), "rows": candidates,
+            "selected_line_source": selected, "underdog_line": ud_line, "sleeper_line": sleeper_line
         }
 
     expanded = []
@@ -6492,7 +6621,6 @@ def choose_active_line(sportsbook_data, pp_data, ud_data, sgo_data, optic_data):
         expanded.extend([c["Line"]] * max(1, int(round(c["Weight"] * 2))))
     consensus = float(np.median(expanded))
 
-    # Do not create fake .0 lines from consensus if half-line sources dominate.
     half_candidates = [c["Line"] for c in candidates if is_half_point_line(c["Line"])]
     if half_candidates and not is_half_point_line(consensus):
         counts = {}
@@ -6502,7 +6630,7 @@ def choose_active_line(sportsbook_data, pp_data, ud_data, sgo_data, optic_data):
 
     quality = "STRONG" if len(candidates) >= 3 and spread <= 0.5 else "OK" if len(candidates) >= 2 and spread <= 1.0 else "THIN"
     source = "Cross-Source Consensus" if len(candidates) >= 2 else candidates[0]["Source"]
-    return consensus, f"{source} ({quality})", {"count": len(candidates), "quality": quality, "spread": round(spread, 2), "rows": candidates}
+    return consensus, f"{source} ({quality})", {"count": len(candidates), "quality": quality, "spread": round(spread, 2), "rows": candidates, "selected_line_source": selected, "underdog_line": ud_line, "sleeper_line": sleeper_line}
 
 # =========================
 # CONFIDENCE / SIGNAL
@@ -7679,13 +7807,14 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     sportsbook_data = get_sportsbook_k_data(row["home_team"], row["away_team"], pitcher_name)
     pp_data = get_prizepicks_k_data(pitcher_name)
     ud_data = get_underdog_k_data(pitcher_name)
+    sleeper_data = get_sleeper_k_data(pitcher_name) if PITCHER_K_LINE_SOURCE in ["Sleeper", "Compare Both"] else source_result("Sleeper", "OFF", message="Sleeper source turned off")
     sgo_data = get_sportsgameodds_k_data(pitcher_name) if use_sgo else source_result("SportsGameOdds", "OFF", message="Optional source turned off")
     optic_data = get_opticodds_k_data(pitcher_name) if use_optic else source_result("OpticOdds", "OFF", message="Optional source turned off")
 
     # Keep The Odds API isolated to Market/Sharp only. It should NOT set or shift the active K line.
-    # Active line still comes from Underdog/PrizePicks/optional sources.
+    # Active line comes from the selected pitcher-K line source.
     market_only_blank = source_result("Sportsbook", "MARKET_ONLY", line=None, rows=[], message="Odds API kept out of active-line selection")
-    active_line, active_source, consensus = choose_active_line(market_only_blank, pp_data, ud_data, sgo_data, optic_data)
+    active_line, active_source, consensus = choose_active_line(market_only_blank, pp_data, ud_data, sleeper_data, sgo_data, optic_data, projection=mean)
 
     manual_market_data = get_manual_market_k_data(pitcher_name, active_line)
 
@@ -8125,6 +8254,11 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "underdog_status": ud_data.get("status"),
         "underdog_line": ud_data.get("line"),
         "underdog_message": ud_data.get("message"),
+        "sleeper_status": sleeper_data.get("status"),
+        "sleeper_line": sleeper_data.get("line"),
+        "sleeper_message": sleeper_data.get("message"),
+        "line_source_mode": PITCHER_K_LINE_SOURCE,
+        "best_line_source": consensus.get("best_source") or active_source,
         "line_delta": line_delta,
         "true_line_delta": true_line_delta,
         "consensus_count": consensus.get("count"),
@@ -8837,6 +8971,9 @@ def render_pick_card(p):
         bars = "<div class='mini-k-bars'>" + "".join(bar_parts) + "</div>"
     statcast_txt = "YES" if p.get("statcast_available") else "NO"
     pitch_type_txt = "YES" if p.get("pitch_type_matchup_available") else "NO"
+    ud_line_display = f"{safe_float(p.get('underdog_line')):.1f}" if p.get('underdog_line') is not None else "—"
+    sleeper_line_display = f"{safe_float(p.get('sleeper_line')):.1f}" if p.get('sleeper_line') is not None else "—"
+    line_mode_display = p.get('line_source_mode') or "Underdog"
     st.markdown(f"""
     <div class="pick-card">
       <div style="display:grid;grid-template-columns:1.3fr .8fr .9fr 1fr 1fr;gap:18px;align-items:center;">
@@ -8846,11 +8983,14 @@ def render_pick_card(p):
           <div class="small-muted">{p.get('team')} vs {p.get('opponent')}</div>
           <span class="badge {badge}">{p.get('risk_label')}</span>
           <span class="badge">{p.get('line_source')}</span>
+          <span class="badge yellow-badge">Mode: {line_mode_display}</span>
+          <span class="badge">UD {ud_line_display}</span>
+          <span class="badge">Sleeper {sleeper_line_display}</span>
           <span class="badge good-badge">{p.get('projection_source')}</span>
           <span class="badge">Lineup: {p.get('lineup_status')}</span>
         </div>
         <div><div class="small-muted">Projection</div><div class="big-number {color_class}">{p.get('projection')}</div><div class="small-muted">BF {p.get('expected_bf')} | PPB {p.get('ppb')}</div></div>
-        <div><div class="small-muted">Line</div><div class="big-number">{line_display}</div><div class="small-muted">Edge: {edge_display} K</div></div>
+        <div><div class="small-muted">Line</div><div class="big-number">{line_display}</div><div class="small-muted">Edge: {edge_display} K</div><div class="small-muted">UD {ud_line_display} | Sleeper {sleeper_line_display}</div></div>
         <div>
           <div class="small-muted">Model Side</div><div class="big-number {color_class}">{p.get('pick_side')}</div>
           <div class="small-muted">Final Action</div><div class="{color_class}" style="font-size:22px;font-weight:950;">{p.get('bet_action', '🚫 PASS')}</div>
@@ -9205,6 +9345,24 @@ with st.sidebar:
     default_odds = st.number_input("Default Odds if sportsbook price missing", value=-110.0, step=5.0)
     hide_no_line = st.checkbox("Hide No Real Line picks", value=False)
     only_strong = st.checkbox("Show only strong signals", value=True)
+    st.divider()
+    st.header("Pitcher K Line Source")
+    PITCHER_K_LINE_SOURCE = st.radio(
+        "Compare projection against",
+        ["Underdog", "Sleeper", "Compare Both"],
+        index=0,
+        help="Projection math does not change. This only switches which posted pitcher-K line is used for edge/pick."
+    )
+    if PITCHER_K_LINE_SOURCE in ["Sleeper", "Compare Both"]:
+        SLEEPER_MANUAL_LINES_TEXT = st.text_area(
+            "Sleeper pitcher-K lines fallback",
+            value="",
+            height=90,
+            placeholder="Pitcher, Line\nShohei Ohtani, 5.5\nDylan Cease, 6.5",
+            help="Use this if the live Sleeper feed is unavailable. The app will match names and use these as Sleeper lines."
+        )
+    else:
+        SLEEPER_MANUAL_LINES_TEXT = ""
     st.divider()
     st.header("Model Upgrades")
     use_statcast = st.checkbox("Use Statcast pitcher CSW/whiff", value=True)
