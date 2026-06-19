@@ -22,7 +22,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "ONE WAY PICKZ v11.17 VERIFIED LEARNING BUILD + ACTIVE MANAGER/RUN SUPPRESSION + STABLE PROJECTIONS + CARD FINAL FIX"
+APP_VERSION = "ONE WAY PICKZ v11.17 VERIFIED LEARNING BUILD + ACTIVE MANAGER/RUN SUPPRESSION + STABLE PROJECTIONS + OFFICIAL KPROJ FIX"
 # =========================
 # STABLE PROJECTION SEEDING
 # =========================
@@ -9238,43 +9238,40 @@ def render_kpis(picks, bankroll):
 
 
 def official_card_k_projection(p):
-    """Display-only official K projection for player cards.
+    """Official display projection for player cards.
 
-    Priority:
-    1) Existing final/line-aware projection fields if already attached to row
-    2) K Upside final decision projection from kproj_decision/kproj_upside_projection
-    3) Raw projection fallback
+    IMPORTANT:
+    The production board's trusted number is the stabilized board projection:
+    - p["projection"] on live cards
+    - "K PROJ" / "Line-Aware Smart Final K Projection" in exported tables
 
-    This fixes card/board mismatch without changing the model, picks, saves, or grading.
+    The older connector field named "Final K Projection" can be an intermediate
+    high-side value before TPS/WRS/Line-Aware trims. Do not use it as the player
+    card source when the stabilized projection exists.
     """
     try:
-        for c in [
-            "Line-Aware Smart Final K Projection",
-            "WRS Final K Projection",
-            "TPS Final K Projection",
-            "TPC True K Projection",
-            "Final K Projection",
-            "K PROJ",
-        ]:
+        # Live board dict source used by cards.
+        for c in ["projection", "K PROJ", "Line-Aware Smart Final K Projection", "WRS Final K Projection", "TPS Final K Projection"]:
             if isinstance(p, dict) and p.get(c) not in (None, "", "—"):
                 v = safe_float(p.get(c), None)
                 if v is not None:
-                    return round(float(v), 2), c
-        try:
-            d = kproj_decision(p)
-            v = safe_float(d.get("projection"), None)
-            if v is not None:
-                return round(float(v), 2), "K Upside Final"
-        except Exception:
-            pass
+                    return round(float(v), 2), "Official K PROJ"
+
+        # Only fallback to older connector field if no stabilized projection exists.
+        for c in ["Final K Projection", "Original K PROJ"]:
+            if isinstance(p, dict) and p.get(c) not in (None, "", "—"):
+                v = safe_float(p.get(c), None)
+                if v is not None:
+                    return round(float(v), 2), f"Fallback {c}"
+
         try:
             v = safe_float(kproj_upside_projection(p), None)
             if v is not None:
-                return round(float(v), 2), "K Upside Final"
+                return round(float(v), 2), "Fallback K Upside"
         except Exception:
             pass
-        v = safe_float(p.get("projection"), None) if isinstance(p, dict) else None
-        return (round(float(v), 2), "Raw Projection") if v is not None else ("—", "Unavailable")
+
+        return ("—", "Unavailable")
     except Exception:
         return (p.get("projection", "—") if isinstance(p, dict) else "—", "Fallback")
 
@@ -11030,10 +11027,14 @@ def render_kproj_pitcher_card(p):
         pass
     dist_display = f"F {dist.get('floor')} | M {dist.get('median')} | C {dist.get('ceiling')}"
     card_k_projection, card_k_projection_source = official_card_k_projection(p)
-    # K PROJ card should display the same final projection source as the board/card.
+    # K PROJ card should display the same official projection source as the board/card.
     if card_k_projection != "—":
         try:
             d["projection"] = card_k_projection
+            if d.get("line") is not None:
+                official_edge = round(float(card_k_projection) - float(d.get("line")), 2)
+                d["line_edge"] = official_edge
+                d["edge_display"] = official_edge
         except Exception:
             pass
     edge_display = d.get("edge_display", "—")
@@ -11168,6 +11169,46 @@ def _short_lineup_source(row):
         return src.replace("_", " ").title()
     return "—"
 
+
+def normalize_official_kproj_columns(df):
+    """Display/export normalization only.
+
+    Keeps the official table projection aligned to the latest stabilized value.
+    Does not rebuild the model; it only prevents confusing intermediate columns.
+    """
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+        d = df.copy()
+        official_cols = [
+            "Line-Aware Smart Final K Projection",
+            "WRS Final K Projection",
+            "TPS Final K Projection",
+            "TPC True K Projection",
+            "K PROJ",
+        ]
+        def pick_official(row):
+            for c in official_cols:
+                if c in row.index:
+                    v = safe_float(row.get(c), None)
+                    if v is not None:
+                        return round(float(v), 2)
+            v = safe_float(row.get("Final K Projection"), None)
+            return round(float(v), 2) if v is not None else row.get("K PROJ")
+        if "K PROJ" in d.columns:
+            d["Official K PROJ"] = d.apply(pick_official, axis=1)
+            d["K PROJ"] = d["Official K PROJ"]
+            if "UD/Line" in d.columns:
+                d["Official K Edge"] = d.apply(
+                    lambda r: None if safe_float(r.get("UD/Line"), None) is None or safe_float(r.get("K PROJ"), None) is None
+                    else round(float(safe_float(r.get("K PROJ"), 0)) - float(safe_float(r.get("UD/Line"), 0)), 2),
+                    axis=1
+                )
+        return d
+    except Exception:
+        return df
+
+
 def build_kproj_table(board):
     rows = []
     for p in board or []:
@@ -11221,6 +11262,7 @@ def build_kproj_table(board):
         })
     df = pd.DataFrame(rows)
     if not df.empty:
+        df = normalize_official_kproj_columns(df)
         df = df.sort_values(["Decision", "Confidence %", "K PROJ"], ascending=[True, False, False])
     return df
 
