@@ -22,7 +22,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "ONE WAY PICKZ v11.17 VERIFIED LEARNING BUILD + ACTIVE MANAGER/RUN SUPPRESSION + STABLE PROJECTIONS + OFFICIAL KPROJ FIX"
+APP_VERSION = "ONE WAY PICKZ v11.17 VERIFIED LEARNING BUILD + ACTIVE MANAGER/RUN SUPPRESSION + STABLE PROJECTIONS + CARD DECISION FULL SYNC"
 # =========================
 # STABLE PROJECTION SEEDING
 # =========================
@@ -9237,39 +9237,54 @@ def render_kpis(picks, bankroll):
         """, unsafe_allow_html=True)
 
 
+_OFFICIAL_CARD_ROW_GUARD = False
+
+def official_card_k_row(p):
+    """Build a one-player K board row so the card matches the table exactly.
+
+    This is display-only. It prevents card projection/edge/decision from using
+    an earlier layer while the table is using the final post-stack K PROJ.
+    """
+    global _OFFICIAL_CARD_ROW_GUARD
+    try:
+        if _OFFICIAL_CARD_ROW_GUARD:
+            return {}
+        _OFFICIAL_CARD_ROW_GUARD = True
+        df = build_kproj_table([p])
+        _OFFICIAL_CARD_ROW_GUARD = False
+        if df is not None and not df.empty:
+            return df.iloc[0].to_dict()
+    except Exception:
+        try:
+            _OFFICIAL_CARD_ROW_GUARD = False
+        except Exception:
+            pass
+    return {}
+
 def official_card_k_projection(p):
-    """Official display projection for player cards.
+    """Official card projection synced to the board K PROJ.
 
-    IMPORTANT:
-    The production board's trusted number is the stabilized board projection:
-    - p["projection"] on live cards
-    - "K PROJ" / "Line-Aware Smart Final K Projection" in exported tables
+    The card must show the same stabilized number as the table's K PROJ:
+    - Soriano should show 6.41
+    - Misiorowski should show 9.55
+    - Gausman should show 6.16, not 4.93
 
-    The older connector field named "Final K Projection" can be an intermediate
-    high-side value before TPS/WRS/Line-Aware trims. Do not use it as the player
-    card source when the stabilized projection exists.
+    This is display-only and does not change the projection engine.
     """
     try:
-        # Live board dict source used by cards.
-        for c in ["projection", "K PROJ", "Line-Aware Smart Final K Projection", "WRS Final K Projection", "TPS Final K Projection"]:
+        row = official_card_k_row(p)
+        for c in ["K PROJ", "Line-Aware Smart Final K Projection", "WRS Final K Projection", "TPS Final K Projection"]:
+            if row and row.get(c) not in (None, "", "—"):
+                v = safe_float(row.get(c), None)
+                if v is not None:
+                    return round(float(v), 2), "Official K PROJ"
+
+        # Fallback if one-row table cannot be built.
+        for c in ["Line-Aware Smart Final K Projection", "WRS Final K Projection", "TPS Final K Projection", "K PROJ", "projection"]:
             if isinstance(p, dict) and p.get(c) not in (None, "", "—"):
                 v = safe_float(p.get(c), None)
                 if v is not None:
                     return round(float(v), 2), "Official K PROJ"
-
-        # Only fallback to older connector field if no stabilized projection exists.
-        for c in ["Final K Projection", "Original K PROJ"]:
-            if isinstance(p, dict) and p.get(c) not in (None, "", "—"):
-                v = safe_float(p.get(c), None)
-                if v is not None:
-                    return round(float(v), 2), f"Fallback {c}"
-
-        try:
-            v = safe_float(kproj_upside_projection(p), None)
-            if v is not None:
-                return round(float(v), 2), "Fallback K Upside"
-        except Exception:
-            pass
 
         return ("—", "Unavailable")
     except Exception:
@@ -11026,17 +11041,41 @@ def render_kproj_pitcher_card(p):
     except Exception:
         pass
     dist_display = f"F {dist.get('floor')} | M {dist.get('median')} | C {dist.get('ceiling')}"
+    card_row = official_card_k_row(p)
     card_k_projection, card_k_projection_source = official_card_k_projection(p)
-    # K PROJ card should display the same official projection source as the board/card.
+
+    # Full card sync: projection, edge, line, and decision must match K board row.
+    if card_row:
+        try:
+            if card_row.get("UD/Line") not in (None, "", "—"):
+                d["line"] = safe_float(card_row.get("UD/Line"), d.get("line"))
+            if card_row.get("Decision") not in (None, "", "—"):
+                d["decision"] = card_row.get("Decision")
+            if card_row.get("Model Lean") not in (None, "", "—"):
+                d["lean_side"] = card_row.get("Model Lean")
+            if card_row.get("Confidence %") not in (None, "", "—"):
+                d["confidence"] = (safe_float(card_row.get("Confidence %"), 0) or 0) / 100.0
+            if card_row.get("K PROJ") not in (None, "", "—"):
+                card_k_projection = round(float(safe_float(card_row.get("K PROJ"), card_k_projection)), 2)
+            official_edge_value = None
+            for ec in ["Edge Gap", "Official K Edge", "Line-Aware Smart Edge", "WRS Edge", "TPS Edge"]:
+                if card_row.get(ec) not in (None, "", "—"):
+                    official_edge_value = safe_float(card_row.get(ec), None)
+                    break
+            if official_edge_value is None and d.get("line") is not None and card_k_projection != "—":
+                official_edge_value = round(float(card_k_projection) - float(d.get("line")), 2)
+            if official_edge_value is not None:
+                d["line_edge"] = round(float(official_edge_value), 2)
+                d["edge_display"] = round(float(official_edge_value), 2)
+        except Exception:
+            pass
+
     if card_k_projection != "—":
         try:
             d["projection"] = card_k_projection
-            if d.get("line") is not None:
-                official_edge = round(float(card_k_projection) - float(d.get("line")), 2)
-                d["line_edge"] = official_edge
-                d["edge_display"] = official_edge
         except Exception:
             pass
+
     edge_display = d.get("edge_display", "—")
     edge_class = d.get("edge_class", "yellow-badge")
     needs_display = "—" if d.get("over_needed") is None else f"{d.get('over_needed')}+"
@@ -11184,8 +11223,8 @@ def normalize_official_kproj_columns(df):
             "Line-Aware Smart Final K Projection",
             "WRS Final K Projection",
             "TPS Final K Projection",
-            "TPC True K Projection",
             "K PROJ",
+            "TPC True K Projection",
         ]
         def pick_official(row):
             for c in official_cols:
