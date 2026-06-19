@@ -22,7 +22,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "ONE WAY PICKZ v11.17 VERIFIED LEARNING BUILD + ACTIVE MANAGER/RUN SUPPRESSION + STABLE PROJECTIONS + CARD DECISION FULL SYNC"
+APP_VERSION = "ONE WAY PICKZ v11.17 VERIFIED LEARNING BUILD + ACTIVE MANAGER/RUN SUPPRESSION + STABLE PROJECTIONS + CARD + BASEBALL IQ + OFFICIAL SIDE SYNC"
 # =========================
 # STABLE PROJECTION SEEDING
 # =========================
@@ -16780,22 +16780,52 @@ def _iq_label(score):
     return "FADE_IQ"
 
 def _baseball_iq_for_k_row(p):
+    """Baseball IQ K row synced to the same official K board/card row.
+
+    Prevents Baseball IQ from showing an old 10+ projection or an opposite
+    under/over decision when the K board has already trimmed it.
+    """
     try:
-        proj = _iq_num(_ks97_projection(p) if "_ks97_projection" in globals() else p.get("projection"), 0)
+        row = official_card_k_row(p) if "official_card_k_row" in globals() else {}
     except Exception:
-        proj = _iq_num(p.get("projection") or p.get("K PROJ"), 0)
-    line = _iq_num(p.get("line") or p.get("Line") or p.get("UD/Line"), 0)
-    edge = proj - line if line else 0
+        row = {}
+
+    try:
+        if row:
+            proj = _iq_num(row.get("K PROJ"), 0)
+            line = _iq_num(row.get("UD/Line"), 0)
+            model_pick = row.get("Decision") or row.get("Model Lean") or p.get("Decision") or p.get("bet_action")
+            edge = _iq_num(row.get("Edge Gap") if row.get("Edge Gap") not in (None, "", "—") else row.get("Official K Edge"), 0)
+            opp_k = _iq_num(row.get("Opp K%"), 22)
+            bf = _iq_num(row.get("Exp BF"), 22)
+            role = _iq_num(row.get("Role Score"), 50)
+            starter = _iq_num(row.get("Starter Score"), 50)
+        else:
+            d = kproj_decision(p) if "kproj_decision" in globals() else {}
+            proj = _iq_num(d.get("projection") or p.get("K PROJ") or p.get("projection"), 0)
+            line = _iq_num(d.get("line") or p.get("line") or p.get("Line") or p.get("UD/Line"), 0)
+            model_pick = d.get("decision") or p.get("pick_side") or p.get("Decision") or p.get("bet_action")
+            edge = _iq_num(d.get("line_edge"), proj - line if line else 0)
+            opp_k = _iq_num(p.get("opp_k") or p.get("Opp K%") or p.get("Opponent K%"), 22)
+            if opp_k <= 1:
+                opp_k *= 100
+            bf = _iq_num(p.get("expected_bf") or p.get("Exp BF"), 22)
+            role = _iq_num(p.get("role_score") or p.get("Role Score"), 50)
+            starter = _iq_num(p.get("starter_score") or p.get("Starter Score"), 50)
+    except Exception:
+        proj = _iq_num(p.get("K PROJ") or p.get("projection"), 0)
+        line = _iq_num(p.get("line") or p.get("Line") or p.get("UD/Line"), 0)
+        edge = proj - line if line else 0
+        model_pick = p.get("Decision") or p.get("bet_action")
+        opp_k = _iq_num(p.get("opp_k") or p.get("Opp K%") or p.get("Opponent K%"), 22)
+        if opp_k <= 1:
+            opp_k *= 100
+        bf = _iq_num(p.get("expected_bf") or p.get("Exp BF"), 22)
+        role = _iq_num(p.get("role_score") or p.get("Role Score"), 50)
+        starter = _iq_num(p.get("starter_score") or p.get("Starter Score"), 50)
 
     risk, rlabel, _ = _ks97_early_exit_risk(p) if "_ks97_early_exit_risk" in globals() else (50, "UNK", 0)
     conv, clabel, _ = _ks97_two_strike_conversion(p) if "_ks97_two_strike_conversion" in globals() else (50, "UNK", 0)
-
-    opp_k = _iq_num(p.get("opp_k") or p.get("Opp K%") or p.get("Opponent K%"), 22)
-    if opp_k <= 1:
-        opp_k *= 100
-    bf = _iq_num(p.get("expected_bf") or p.get("Exp BF"), 22)
-    role = _iq_num(p.get("role_score") or p.get("Role Score"), 50)
-    starter = _iq_num(p.get("starter_score") or p.get("Starter Score"), 50)
     leash = _iq_num(p.get("leash_score") or p.get("Leash Score"), 50)
 
     score = 50
@@ -16811,6 +16841,7 @@ def _baseball_iq_for_k_row(p):
 
     reasons = []
     if edge >= 1.0: reasons.append("Strong line edge")
+    if edge <= -1.0: reasons.append("Strong under edge")
     if opp_k >= 24: reasons.append("Opponent K-friendly")
     if bf >= 24: reasons.append("Strong BF/volume")
     if risk >= 65: reasons.append("Early-exit risk")
@@ -16824,7 +16855,7 @@ def _baseball_iq_for_k_row(p):
         "Matchup": p.get("matchup") or p.get("Matchup"),
         "Projection": round(proj, 2),
         "Line": line,
-        "Model Pick": p.get("pick_side") or p.get("Decision") or p.get("bet_action"),
+        "Model Pick": model_pick,
         "Baseball IQ Score": round(score, 1),
         "IQ Label": _iq_label(score),
         "Main Reasons": " | ".join(reasons),
@@ -24736,3 +24767,114 @@ def ml_build_board(board):
     if not df.empty:
         df = df.sort_values('ML Edge %', ascending=False)
     return df
+
+
+# =========================
+# FINAL OFFICIAL SIDE / DECISION SYNC FIX
+# Version: OFFICIAL_SIDE_SYNC_2026_06_19
+# Display / table sync only:
+# - Does NOT change K projection formulas
+# - Does NOT change learning inputs
+# - Does NOT change manager/run/volume calculations
+# - Forces K PROJ, Official K PROJ, edge, lean, and decision direction to agree
+# =========================
+OFFICIAL_SIDE_SYNC_VERSION = "OFFICIAL_SIDE_SYNC_2026_06_19"
+
+def _ows_num(x, default=None):
+    try:
+        if x is None or x == "":
+            return default
+        if isinstance(x, str):
+            x = x.replace("%", "").replace("+", "").strip()
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _ows_side_from_edge(edge):
+    if edge is None:
+        return "NO_LINE"
+    if edge > 0:
+        return "OVER"
+    if edge < 0:
+        return "UNDER"
+    return "PUSH"
+
+def _ows_decision_from_edge(edge):
+    if edge is None:
+        return "NO_UD_LINE"
+    side = _ows_side_from_edge(edge)
+    ae = abs(float(edge))
+    if side == "PUSH":
+        return "🚫 PASS — NO EDGE"
+    if ae >= 1.00:
+        return f"🔥 {side}"
+    if ae >= 0.70:
+        return f"⚠️ {side} LEAN"
+    return f"🚫 PASS — {side} THIN EDGE"
+
+def _sync_official_k_side_columns(df):
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+        d = df.copy()
+
+        for c in ["K PROJ", "UD/Line"]:
+            if c not in d.columns:
+                return d
+
+        official_proj, official_edge, official_side, official_decision = [], [], [], []
+
+        for _, row in d.iterrows():
+            k = _ows_num(row.get("K PROJ"), None)
+            line = _ows_num(row.get("UD/Line"), None)
+            line_source = str(row.get("Line Source") or "").upper()
+            if k is None or line is None or "NO LINE" in str(row.get("UD/Line")).upper() or "NO_UD" in line_source:
+                official_proj.append(k if k is not None else row.get("K PROJ"))
+                official_edge.append("")
+                official_side.append("NO_LINE")
+                official_decision.append("NO_UD_LINE")
+                continue
+
+            edge = round(float(k) - float(line), 2)
+            side = _ows_side_from_edge(edge)
+            dec = _ows_decision_from_edge(edge)
+
+            official_proj.append(round(float(k), 2))
+            official_edge.append(edge)
+            official_side.append(side)
+            official_decision.append(dec)
+
+        d["Official K PROJ"] = official_proj
+        d["Official K Edge"] = official_edge
+        d["Official K Side"] = official_side
+        d["Official K Decision Synced"] = official_decision
+
+        # These are the columns most UI/list/card sections read.
+        # Keep projection itself unchanged; only align direction/edge labels.
+        if "Edge Gap" in d.columns:
+            d["Edge Gap"] = d["Official K Edge"]
+        if "Model Lean" in d.columns:
+            d["Model Lean"] = d["Official K Side"].replace({"NO_LINE": "NO_LINE", "PUSH": "PASS"})
+        if "Decision" in d.columns:
+            d["Decision"] = d["Official K Decision Synced"]
+        if "Main Engine Action" in d.columns:
+            d["Main Engine Action"] = d["Official K Decision Synced"]
+        if "Final Main Engine Action" in d.columns:
+            d["Final Main Engine Action"] = d["Official K Decision Synced"]
+
+        return d
+    except Exception:
+        return df
+
+if "build_kproj_table" in globals():
+    _prev_official_side_sync_build_kproj_table = build_kproj_table
+    def build_kproj_table(board):
+        df = _prev_official_side_sync_build_kproj_table(board)
+        try:
+            return _sync_official_k_side_columns(df)
+        except Exception:
+            return df
+
