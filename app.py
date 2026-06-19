@@ -11214,6 +11214,12 @@ def normalize_official_kproj_columns(df):
 
     Keeps the official table projection aligned to the latest stabilized value.
     Does not rebuild the model; it only prevents confusing intermediate columns.
+
+    Direction-label safety fix:
+    after the late stability stacks set the final K PROJ, make the visible
+    Decision / Model Lean agree with that final K PROJ vs the Underdog line.
+    This is a label/export sync only; it does not change projections, line pulls,
+    refresh buttons, board pulls, or any model math.
     """
     try:
         if not isinstance(df, pd.DataFrame) or df.empty:
@@ -11234,6 +11240,24 @@ def normalize_official_kproj_columns(df):
                         return round(float(v), 2)
             v = safe_float(row.get("Final K Projection"), None)
             return round(float(v), 2) if v is not None else row.get("K PROJ")
+
+        def synced_decision_from_edge(edge):
+            edge = safe_float(edge, None)
+            if edge is None:
+                return None, None
+            lean = "OVER" if edge >= 0 else "UNDER"
+            ae = abs(float(edge))
+            if ae < 0.30:
+                return lean, "🚫 PASS — TRUE EDGE THIN"
+            if lean == "OVER":
+                if ae >= 1.00:
+                    return lean, "🔥 OVER"
+                return lean, "⚠️ OVER LEAN"
+            else:
+                if ae >= 1.25:
+                    return lean, "🔥 UNDER"
+                return lean, "⚠️ UNDER LEAN"
+
         if "K PROJ" in d.columns:
             d["Official K PROJ"] = d.apply(pick_official, axis=1)
             d["K PROJ"] = d["Official K PROJ"]
@@ -11243,6 +11267,31 @@ def normalize_official_kproj_columns(df):
                     else round(float(safe_float(r.get("K PROJ"), 0)) - float(safe_float(r.get("UD/Line"), 0)), 2),
                     axis=1
                 )
+                # Sync only visible labels/actions that were created before the final K PROJ was chosen.
+                # Example fixed: K PROJ 5.07 vs line 4.5 can no longer display UNDER.
+                for idx, row in d.iterrows():
+                    edge = safe_float(row.get("Official K Edge"), None)
+                    line = safe_float(row.get("UD/Line"), None)
+                    proj = safe_float(row.get("K PROJ"), None)
+                    if edge is None or line is None or proj is None:
+                        continue
+                    lean, decision = synced_decision_from_edge(edge)
+                    if lean is None or decision is None:
+                        continue
+                    if "Model Lean" in d.columns:
+                        d.at[idx, "Model Lean"] = lean
+                    if "Decision" in d.columns:
+                        d.at[idx, "Decision"] = decision
+                    if "Main Engine Action" in d.columns:
+                        d.at[idx, "Main Engine Action"] = decision
+                    if "Final K Decision" in d.columns:
+                        d.at[idx, "Final K Decision"] = decision if "PASS" not in decision else f"🚫 PASS — FINAL K THIN EDGE"
+                    if "Final Main Engine Action" in d.columns:
+                        d.at[idx, "Final Main Engine Action"] = decision
+                    if "Edge Gap" in d.columns:
+                        d.at[idx, "Edge Gap"] = round(edge, 2)
+                    if "Lean Gap" in d.columns:
+                        d.at[idx, "Lean Gap"] = round(abs(edge), 2)
         return d
     except Exception:
         return df
