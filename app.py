@@ -1,4 +1,3 @@
-Best V1 file 
 # -*- coding: utf-8 -*-
 # ============================================================
 # MLB STRIKEOUT PROP ENGINE — ONE FILE — v11.9
@@ -24878,4 +24877,3 @@ if "build_kproj_table" in globals():
             return _sync_official_k_side_columns(df)
         except Exception:
             return df
-
