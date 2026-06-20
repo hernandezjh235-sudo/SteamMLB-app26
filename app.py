@@ -11399,14 +11399,23 @@ def render_kproj_tab(board):
     st.subheader("Projection Board")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    st.subheader("Copy/Paste Slate — Final Line-Aware Smart Picks")
-    st.caption("Underdog only. Uses Line-Aware Smart Final K Projection + Line-Aware Smart Decision + Line-Aware Smart Edge. 🔥 = edge 1.00+ | ⚠️ = edge under 0.65.")
+    st.subheader("Copy/Paste Slate — Best Final Line-Aware Smart Picks")
+    st.caption("Underdog only. Uses Line-Aware Smart Final K Projection + Line-Aware Smart Decision + Line-Aware Smart Edge. 🔥 = edge 1.00+ | ⚠️ = edge under 0.65. PASS/NO LINE rows are hidden here.")
     slate_text = build_copy_paste_k_slate(df, show_pass_notes=False)
     if slate_text:
-        st.text_area("Slate list", slate_text, height=360)
-        st.download_button("Download slate .txt", slate_text, file_name="one_way_pickz_final_k_slate.txt", mime="text/plain")
+        st.text_area("Best picks slate", slate_text, height=360)
+        st.download_button("Download best slate .txt", slate_text, file_name="one_way_pickz_best_final_k_slate.txt", mime="text/plain")
     else:
-        st.info("No Underdog final O/U picks available for the copy/paste slate yet.")
+        st.info("No Underdog final O/U picks available for the best-picks slate yet.")
+
+    st.subheader("Copy/Paste Slate — All Underdog Projections")
+    st.caption("Tracking list. Shows every Underdog player with a real line, including PASS rows, using the same final Line-Aware Smart projection columns.")
+    all_slate_text = build_copy_paste_k_slate(df, show_pass_notes=True)
+    if all_slate_text:
+        st.text_area("All projections slate", all_slate_text, height=520)
+        st.download_button("Download all projections .txt", all_slate_text, file_name="one_way_pickz_all_underdog_projection_slate.txt", mime="text/plain")
+    else:
+        st.info("No Underdog projection rows available for the all-projections slate yet.")
 
     st.subheader("Pitcher Cards")
     priority = sorted(board, key=lambda p: ("🔥" in str(kproj_decision(p).get("decision")), safe_float(kproj_decision(p).get("confidence"), 0) or 0, kproj_upside_projection(p)), reverse=True)
