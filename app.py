@@ -1,4 +1,3 @@
-Best V1 file 
 # -*- coding: utf-8 -*-
 # ============================================================
 # MLB STRIKEOUT PROP ENGINE — ONE FILE — v11.9
@@ -23,7 +22,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "ONE WAY PICKZ v11.17 VERIFIED LEARNING BUILD + ACTIVE MANAGER/RUN SUPPRESSION + STABLE PROJECTIONS + CARD + BASEBALL IQ + OFFICIAL SIDE SYNC"
+APP_VERSION = "ONE WAY PICKZ v11.17 VERIFIED LEARNING BUILD + ACTIVE MANAGER/RUN SUPPRESSION + STABLE PROJECTIONS + CARD + BASEBALL IQ FULL SYNC"
 # =========================
 # STABLE PROJECTION SEEDING
 # =========================
@@ -24768,114 +24767,3 @@ def ml_build_board(board):
     if not df.empty:
         df = df.sort_values('ML Edge %', ascending=False)
     return df
-
-
-# =========================
-# FINAL OFFICIAL SIDE / DECISION SYNC FIX
-# Version: OFFICIAL_SIDE_SYNC_2026_06_19
-# Display / table sync only:
-# - Does NOT change K projection formulas
-# - Does NOT change learning inputs
-# - Does NOT change manager/run/volume calculations
-# - Forces K PROJ, Official K PROJ, edge, lean, and decision direction to agree
-# =========================
-OFFICIAL_SIDE_SYNC_VERSION = "OFFICIAL_SIDE_SYNC_2026_06_19"
-
-def _ows_num(x, default=None):
-    try:
-        if x is None or x == "":
-            return default
-        if isinstance(x, str):
-            x = x.replace("%", "").replace("+", "").strip()
-        v = float(x)
-        if pd.isna(v):
-            return default
-        return v
-    except Exception:
-        return default
-
-def _ows_side_from_edge(edge):
-    if edge is None:
-        return "NO_LINE"
-    if edge > 0:
-        return "OVER"
-    if edge < 0:
-        return "UNDER"
-    return "PUSH"
-
-def _ows_decision_from_edge(edge):
-    if edge is None:
-        return "NO_UD_LINE"
-    side = _ows_side_from_edge(edge)
-    ae = abs(float(edge))
-    if side == "PUSH":
-        return "🚫 PASS — NO EDGE"
-    if ae >= 1.00:
-        return f"🔥 {side}"
-    if ae >= 0.70:
-        return f"⚠️ {side} LEAN"
-    return f"🚫 PASS — {side} THIN EDGE"
-
-def _sync_official_k_side_columns(df):
-    try:
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            return df
-        d = df.copy()
-
-        for c in ["K PROJ", "UD/Line"]:
-            if c not in d.columns:
-                return d
-
-        official_proj, official_edge, official_side, official_decision = [], [], [], []
-
-        for _, row in d.iterrows():
-            k = _ows_num(row.get("K PROJ"), None)
-            line = _ows_num(row.get("UD/Line"), None)
-            line_source = str(row.get("Line Source") or "").upper()
-            if k is None or line is None or "NO LINE" in str(row.get("UD/Line")).upper() or "NO_UD" in line_source:
-                official_proj.append(k if k is not None else row.get("K PROJ"))
-                official_edge.append("")
-                official_side.append("NO_LINE")
-                official_decision.append("NO_UD_LINE")
-                continue
-
-            edge = round(float(k) - float(line), 2)
-            side = _ows_side_from_edge(edge)
-            dec = _ows_decision_from_edge(edge)
-
-            official_proj.append(round(float(k), 2))
-            official_edge.append(edge)
-            official_side.append(side)
-            official_decision.append(dec)
-
-        d["Official K PROJ"] = official_proj
-        d["Official K Edge"] = official_edge
-        d["Official K Side"] = official_side
-        d["Official K Decision Synced"] = official_decision
-
-        # These are the columns most UI/list/card sections read.
-        # Keep projection itself unchanged; only align direction/edge labels.
-        if "Edge Gap" in d.columns:
-            d["Edge Gap"] = d["Official K Edge"]
-        if "Model Lean" in d.columns:
-            d["Model Lean"] = d["Official K Side"].replace({"NO_LINE": "NO_LINE", "PUSH": "PASS"})
-        if "Decision" in d.columns:
-            d["Decision"] = d["Official K Decision Synced"]
-        if "Main Engine Action" in d.columns:
-            d["Main Engine Action"] = d["Official K Decision Synced"]
-        if "Final Main Engine Action" in d.columns:
-            d["Final Main Engine Action"] = d["Official K Decision Synced"]
-
-        return d
-    except Exception:
-        return df
-
-if "build_kproj_table" in globals():
-    _prev_official_side_sync_build_kproj_table = build_kproj_table
-    def build_kproj_table(board):
-        df = _prev_official_side_sync_build_kproj_table(board)
-        try:
-            return _sync_official_k_side_columns(df)
-        except Exception:
-            return df
-
