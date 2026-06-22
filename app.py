@@ -9330,6 +9330,18 @@ def render_pick_card(p):
         bars = "<div class='mini-k-bars'>" + "".join(bar_parts) + "</div>"
     statcast_txt = "YES" if p.get("statcast_available") else "NO"
     pitch_type_txt = "YES" if p.get("pitch_type_matchup_available") else "NO"
+    def _card_pct(v):
+        x = safe_float(v, None)
+        if x is None:
+            return "—"
+        if abs(x) <= 1:
+            x *= 100.0
+        return f"{x:.1f}%"
+    market_o_display = p.get('market_over_odds', '—')
+    market_u_display = p.get('market_under_odds', '—')
+    fair_o_display = _card_pct(p.get('market_over_implied'))
+    fair_u_display = _card_pct(p.get('market_under_implied'))
+
     st.markdown(f"""
     <div class="pick-card">
       <div style="display:grid;grid-template-columns:1.3fr .8fr .9fr 1fr 1fr;gap:18px;align-items:center;">
@@ -9362,7 +9374,7 @@ def render_pick_card(p):
         <div class="mobile-info-card"><div class="small-muted">Official Filter</div><div class="kpi-value" style="font-size:17px;">{p.get('official_play_filter', '—')}</div><div class="kpi-sub">{p.get('official_filter_note', '')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Reliability</div><div class="kpi-value">{p.get('reliability_score', '—')}</div><div class="kpi-sub">{p.get('reliability_label', '')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Integrity</div><div class="kpi-value">{p.get('decision_integrity_score', '—')}</div><div class="kpi-sub">{p.get('decision_integrity_label', '')}</div></div>
-        <div class="mobile-info-card"><div class="small-muted">Market</div><div class="kpi-value" style="font-size:16px;">{p.get('market_lean', 'NO_MARKET')}</div><div class="kpi-sub">O {p.get('market_over_odds', '—')} | U {p.get('market_under_odds', '—')}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Market</div><div class="kpi-value" style="font-size:16px;">{p.get('market_lean', 'NO_MARKET')}</div><div class="kpi-sub">O {market_o_display} | U {market_u_display}<br>Fair O {fair_o_display} | U {fair_u_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Sharp / Line</div><div class="kpi-value" style="font-size:16px;">{p.get('sharp_warning', 'NONE')}</div><div class="kpi-sub">{p.get('line_history_grade', '—')} | L10 {p.get('line_l10_avg', '—')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Umpire Zone</div><div class="kpi-value" style="font-size:16px;">{p.get('umpire_strike_zone_score', '—')}</div><div class="kpi-sub">K nudge {p.get('umpire_k_nudge', 0)} | {p.get('umpire', 'Unknown')}</div></div>
       </div>
@@ -9695,7 +9707,9 @@ with st.sidebar:
     st.header("Controls")
     day_mode = st.radio("Game Feed", ["Today + Tomorrow", "Today", "Tomorrow"], index=0)
     bankroll = st.number_input("Bankroll", min_value=1.0, value=1000.0, step=50.0)
-    default_odds = st.number_input("Default Odds if sportsbook price missing", value=-110.0, step=5.0)
+    # Default odds stays internal only. It is an estimated EV fallback when no real sportsbook price exists.
+    # It does NOT fill Market boxes and does NOT change K projection/BF/IP/Underdog line.
+    default_odds = -110.0
     hide_no_line = st.checkbox("Hide No Real Line picks", value=False)
     only_strong = st.checkbox("Show only strong signals", value=True)
     st.divider()
@@ -9707,24 +9721,20 @@ with st.sidebar:
     use_weather = st.checkbox("Use live weather adjustment", value=True)
     use_umpire = st.checkbox("Use capped umpire tendency", value=True)
     use_xgboost_assist = st.checkbox("Experimental: capped XGBoost assist", value=False)
-    use_sgo = st.checkbox("Optional: SportsGameOdds API", value=False)
-    use_optic = st.checkbox("Optional: OpticOdds API", value=False)
+    # Clean manual-market build: paid/live odds APIs are disabled so they cannot fight the board/cards.
+    use_sgo = False
+    use_optic = False
+    MANUAL_MARKET_ODDS_TEXT = ""
     st.divider()
-    st.header("Market Odds Fallback")
-    st.caption("Optional. Only fills Market/Sharp cards. Does not change K projection, BF/IP, pitch count, lineups, or Underdog line.")
-    MANUAL_MARKET_ODDS_TEXT = st.text_area(
-        "Manual sportsbook odds",
-        value="",
-        height=90,
-        placeholder="Pitcher Name, Line, OverOdds, UnderOdds\nCristopher Sanchez, 6.5, -145, +115",
-        help="Use when Odds API does not return pitcher props. One pitcher per line.",
-    )
+    st.header("Manual Market Odds")
+    st.caption("Refresh first. Then this build creates a pitcher/line table where you only enter Over/Under odds. Market odds never change K projection, BF/IP, pitch count, lineups, or Underdog line.")
     if st.button("🧹 Clear Streamlit Cache + Reload Live Lines", use_container_width=True):
         st.cache_data.clear()
         st.session_state.loaded_picks = []
         st.session_state.last_refresh_time = None
+        st.session_state.pop("manual_market_table", None)
         st.success("Cache cleared. Now click REFRESH LIVE BOARD again.")
-    st.caption("Refresh does not save official picks. Save only when the board looks right. Optional paid APIs stay OFF unless you have keys.")
+    st.caption("SportsGameOdds and OpticOdds are removed from this build. Manual table controls the Market card only.")
 
 dates = target_dates(day_mode)
 
@@ -9784,6 +9794,120 @@ if save_btn:
         added = save_many_once(st.session_state.loaded_picks)
         st.session_state.last_saved_count = added
         st.success(f"Saved official before-game snapshot. Added {added} new rows.")
+
+
+# =========================
+# CLEAN MANUAL MARKET ODDS TABLE
+# Auto-fills pitcher + active UD line after refresh; user only enters Over/Under odds.
+# This updates Market/Sharp card fields only. It never changes K projection, line, BF/IP, or saved projection logic.
+# =========================
+def _manual_odds_key_from_values(name, line):
+    return (str(name or "").strip().lower(), None if safe_float(line) is None else round(float(safe_float(line)), 2))
+
+def _fmt_manual_price(v):
+    if v is None or str(v).strip() == "":
+        return ""
+    x = safe_float(str(v).replace("+", ""), None)
+    if x is None:
+        return ""
+    return f"{int(x):+d}"
+
+def _manual_market_default_rows(picks):
+    old_rows = st.session_state.get("manual_market_table", []) or []
+    old = {}
+    for r in old_rows:
+        old[_manual_odds_key_from_values(r.get("Pitcher"), r.get("Line"))] = r
+    rows = []
+    seen = set()
+    for pp in picks or []:
+        name = str(pp.get("pitcher") or pp.get("Pitcher") or "").strip()
+        line = safe_float(pp.get("line") if pp.get("line") is not None else pp.get("UD/Line"), None)
+        if not name or line is None:
+            continue
+        key = _manual_odds_key_from_values(name, line)
+        if key in seen:
+            continue
+        seen.add(key)
+        prev = old.get(key, {})
+        rows.append({
+            "Pitcher": name,
+            "Matchup": str(pp.get("matchup") or pp.get("Matchup") or ""),
+            "Line": round(float(line), 1),
+            "Over Odds": _fmt_manual_price(prev.get("Over Odds")),
+            "Under Odds": _fmt_manual_price(prev.get("Under Odds")),
+            "Book": str(prev.get("Book") or ""),
+        })
+    return rows
+
+def _manual_market_apply_to_picks(picks, table_rows):
+    by_key = {}
+    for r in table_rows or []:
+        name = r.get("Pitcher")
+        line = safe_float(r.get("Line"), None)
+        over_px = safe_float(str(r.get("Over Odds", "")).replace("+", ""), None)
+        under_px = safe_float(str(r.get("Under Odds", "")).replace("+", ""), None)
+        if not name or line is None or (over_px is None and under_px is None):
+            continue
+        by_key[_manual_odds_key_from_values(name, line)] = {
+            "name": str(name), "line": float(line), "over": over_px, "under": under_px, "book": str(r.get("Book") or "Manual")
+        }
+    updated = 0
+    out = []
+    for pp in picks or []:
+        p2 = dict(pp)
+        name = str(p2.get("pitcher") or p2.get("Pitcher") or "").strip()
+        line = safe_float(p2.get("line") if p2.get("line") is not None else p2.get("UD/Line"), None)
+        m = by_key.get(_manual_odds_key_from_values(name, line))
+        if m and line is not None:
+            priced_rows = []
+            if m.get("over") is not None:
+                priced_rows.append({"Source":"ManualMarket", "Provider":m.get("book") or "Manual", "Player":name, "Matched Name":name, "Market":"pitcher_strikeouts", "Line":line, "Side":"OVER", "Price":int(m["over"])})
+            if m.get("under") is not None:
+                priced_rows.append({"Source":"ManualMarket", "Provider":m.get("book") or "Manual", "Player":name, "Matched Name":name, "Market":"pitcher_strikeouts", "Line":line, "Side":"UNDER", "Price":int(m["under"])})
+            proj = safe_float(p2.get("projection"), None)
+            model_side = str(p2.get("pick_side") or "").upper()
+            if model_side not in ["OVER", "UNDER"] and proj is not None:
+                model_side = "OVER" if proj > line else "UNDER"
+            intel = build_market_odds_intelligence(priced_rows, line, model_side, None)
+            p2.update(intel)
+            p2["market_source"] = m.get("book") or "Manual"
+            if intel.get("market_agreement") == "AGREE":
+                p2["sharp_warning"] = "MARKET_AGREE"
+            elif intel.get("market_agreement") == "DISAGREE":
+                p2["sharp_warning"] = "MARKET_DISAGREE"
+            else:
+                p2["sharp_warning"] = p2.get("sharp_warning") or "NONE"
+            updated += 1
+        out.append(p2)
+    return out, updated
+
+if st.session_state.get("loaded_picks"):
+    with st.sidebar:
+        st.divider()
+        st.header("Manual Odds Table")
+        st.caption("Auto-filled from the refreshed board. Enter odds only, then press Apply. Exact pitcher + exact line are already locked.")
+        defaults = _manual_market_default_rows(st.session_state.loaded_picks)
+        edited = st.data_editor(
+            pd.DataFrame(defaults),
+            key="manual_market_editor",
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            column_config={
+                "Pitcher": st.column_config.TextColumn("Pitcher", disabled=True),
+                "Matchup": st.column_config.TextColumn("Matchup", disabled=True),
+                "Line": st.column_config.NumberColumn("Line", disabled=True, format="%.1f"),
+                "Over Odds": st.column_config.TextColumn("Over Odds", help="Example: +106 or -145"),
+                "Under Odds": st.column_config.TextColumn("Under Odds", help="Example: -130 or +115"),
+                "Book": st.column_config.TextColumn("Book", help="Optional: FanDuel, DK, consensus, etc."),
+            },
+        )
+        if st.button("✅ Apply manual odds to player cards", use_container_width=True):
+            table_records = edited.to_dict("records") if hasattr(edited, "to_dict") else list(edited or [])
+            st.session_state.manual_market_table = table_records
+            st.session_state.loaded_picks, count = _manual_market_apply_to_picks(st.session_state.loaded_picks, table_records)
+            st.success(f"Applied manual market odds to {count} player card(s).")
+        st.caption("Use Refresh first, enter odds, then Apply. Save official snapshot only after cards/slates look right.")
 
 saved = load_json(PICK_LOG, [])
 
@@ -11108,6 +11232,17 @@ def render_kproj_pitcher_card(p):
         sign = '+' if impact >= 0 else ''
         attr_items.append(f"<div style='display:flex;justify-content:space-between;gap:10px;border-top:1px solid rgba(255,255,255,.07);padding:5px 0;'><span>{html.escape(str(ar.get('Layer','Layer')))}</span><b>{sign}{impact:.2f} K</b></div>")
     attr_html = "".join(attr_items) if attr_items else "<div class='kpi-sub'>No attribution rows available</div>"
+    def _card_pct(v):
+        x = safe_float(v, None)
+        if x is None:
+            return "—"
+        if abs(x) <= 1:
+            x *= 100.0
+        return f"{x:.1f}%"
+    market_o_display = p.get('market_over_odds', '—')
+    market_u_display = p.get('market_under_odds', '—')
+    fair_o_display = _card_pct(p.get('market_over_implied'))
+    fair_u_display = _card_pct(p.get('market_under_implied'))
     st.markdown(f"""
     <div class="pick-card" style="border-color:rgba(90,100,255,.45);box-shadow:0 0 26px rgba(90,100,255,.16);">
       <div style="display:grid;grid-template-columns:1.25fr .75fr .75fr .75fr .9fr;gap:18px;align-items:center;">
@@ -11126,7 +11261,7 @@ def render_kproj_pitcher_card(p):
       <div class="hr-soft"></div>
       <div class="mobile-decision-grid">
         <div class="mobile-info-card"><div class="small-muted">Integrity</div><div class="kpi-value">{p.get('decision_integrity_score', '—')}</div><div class="kpi-sub">{p.get('decision_integrity_label', '')}</div></div>
-        <div class="mobile-info-card"><div class="small-muted">Market</div><div class="kpi-value" style="font-size:16px;">{p.get('market_lean', 'NO_MARKET')}</div><div class="kpi-sub">O {p.get('market_over_odds', '—')} | U {p.get('market_under_odds', '—')}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Market</div><div class="kpi-value" style="font-size:16px;">{p.get('market_lean', 'NO_MARKET')}</div><div class="kpi-sub">O {market_o_display} | U {market_u_display}<br>Fair O {fair_o_display} | U {fair_u_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Sharp</div><div class="kpi-value" style="font-size:18px;">{p.get('sharp_warning', 'NONE')}</div><div class="kpi-sub">{p.get('market_agreement', '')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Line Audit</div><div class="kpi-value" style="font-size:16px;">{p.get('line_history_grade', '—')}</div><div class="kpi-sub">L10 {p.get('line_l10_avg', '—')} | HR {'' if p.get('line_recent_hit_rate') is None else str(round((p.get('line_recent_hit_rate') or 0)*100))+'%'}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Innings</div><div class="kpi-value" style="font-size:18px;">{p.get('projected_ip', '—')} IP</div><div class="kpi-sub">Pull: {p.get('early_pull_label', '—')} | Pitches {p.get('projected_pitches', '—')}</div></div>
@@ -23058,6 +23193,429 @@ def render_line_aware_smart_confirm_panel():
     except Exception as e:
         st.info(f"Line-Aware Smart Confirm waiting: {e}")
 
+
+
+
+
+# =========================
+# V11.17 ROLE / LEASH / EDGE CALIBRATION 2.1
+# Version: ROLE_LEASH_DECISION_2_1_2026_06_21
+# Purpose:
+# - Keeps Line-Aware Smart Final K Projection untouched.
+# - Adds opener/bulk detection, manager leash confidence, historical line difficulty,
+#   BF-to-K validation, and edge bucket calibration as a final decision filter.
+# - Designed to catch workload misses like low-IP bulk arms being treated as short outings.
+# =========================
+ROLE_LEASH_DECISION_2_1_VERSION = "ROLE_LEASH_DECISION_2_1_2026_06_21"
+
+
+def _rl21_num(x, default=None):
+    try:
+        if x in (None, "", "—", "NO LINE", "NO_UD_LINE", "WAITING_FOR_UD_LINE", "nan"):
+            return default
+        if isinstance(x, str):
+            x = x.replace("%", "").replace("+", "").strip()
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+def _rl21_rate_pct(x):
+    v = _rl21_num(x, None)
+    if v is None:
+        return None
+    if abs(v) <= 1.0:
+        v *= 100.0
+    return float(v)
+
+
+def _rl21_side(decision, edge=None):
+    s = str(decision or "").upper()
+    if "OVER" in s:
+        return "OVER"
+    if "UNDER" in s:
+        return "UNDER"
+    if edge is not None:
+        return "OVER" if edge > 0 else "UNDER" if edge < 0 else "PASS"
+    return "PASS"
+
+
+def _rl21_edge_bucket(edge):
+    e = abs(_rl21_num(edge, 0) or 0)
+    if e < 0.50:
+        return "THIN_0_0.49"
+    if e < 1.00:
+        return "SMALL_0.50_0.99"
+    if e < 1.50:
+        return "MEDIUM_1.00_1.49"
+    if e < 2.00:
+        return "STRONG_1.50_1.99"
+    return "ELITE_2.00_PLUS"
+
+
+def _rl21_expected_k_from_bf(row):
+    exp_bf = _rl21_num(row.get("Exp BF"), None)
+    for c in ["Projected BF", "expected_bf", "TPC Season Avg BF", "TPC Recent5 Avg BF"]:
+        if exp_bf is None:
+            exp_bf = _rl21_num(row.get(c), None)
+    pk = _rl21_rate_pct(row.get("Pitcher K%"))
+    if pk is None:
+        pk = _rl21_rate_pct(row.get("pitcher_k"))
+    ok = _rl21_rate_pct(row.get("Opp K%"))
+    if ok is None:
+        ok = _rl21_rate_pct(row.get("opp_k"))
+    if exp_bf is None or pk is None:
+        return None, "BFK_NO_DATA"
+    blended = pk if ok is None else (pk * 0.70 + ok * 0.30)
+    expected_k = exp_bf * (blended / 100.0)
+    whiff = _rl21_rate_pct(row.get("Putaway/Whiff"))
+    if whiff is not None:
+        if whiff >= 29:
+            expected_k += 0.15
+        elif whiff <= 19:
+            expected_k -= 0.12
+    return round(float(expected_k), 2), "BFK_OK"
+
+
+def _rl21_recent_ip_bf_context(row):
+    ip_floor = _rl21_num(row.get("IP Floor") or row.get("ip_floor") or row.get("Projected IP"), None)
+    season_ip = _rl21_num(row.get("TPC Season Avg IP"), None)
+    recent5_bf = _rl21_num(row.get("TPC Recent5 Avg BF"), None)
+    season_bf = _rl21_num(row.get("TPC Season Avg BF"), None)
+    pitch_count = _rl21_num(row.get("TPC Season Avg Pitch Count"), None)
+    role_score = _rl21_num(row.get("Role Score"), None)
+    starter_score = _rl21_num(row.get("Starter Score"), None)
+    return ip_floor, season_ip, recent5_bf, season_bf, pitch_count, role_score, starter_score
+
+
+def _rl21_open_bulk_detection(row):
+    """Detect workload mismatch: model expects opener/short IP, but history/market suggests bulk/starter volume."""
+    ip_floor, season_ip, recent5_bf, season_bf, pitch_count, role_score, starter_score = _rl21_recent_ip_bf_context(row)
+    labels = []
+    risk_score = 0
+
+    if ip_floor is not None and ip_floor <= 2.25:
+        labels.append("MODEL_SHORT_IP")
+        risk_score += 2
+        if season_ip is not None and season_ip >= 3.75:
+            labels.append("SEASON_IP_BULKISH")
+            risk_score += 3
+        if recent5_bf is not None and recent5_bf >= 16:
+            labels.append("RECENT5_BF_BULKISH")
+            risk_score += 3
+        if season_bf is not None and season_bf >= 15:
+            labels.append("SEASON_BF_BULKISH")
+            risk_score += 2
+        if pitch_count is not None and pitch_count >= 55:
+            labels.append("PITCH_COUNT_BULKISH")
+            risk_score += 2
+    else:
+        if ip_floor is not None and ip_floor >= 4.7:
+            labels.append("STARTER_IP_PROFILE")
+        elif ip_floor is not None:
+            labels.append("MID_IP_PROFILE")
+
+    if starter_score is not None and starter_score >= 80:
+        labels.append("STARTER_SCORE_HIGH")
+        risk_score -= 1
+    if role_score is not None and role_score < 45 and ip_floor is not None and ip_floor <= 2.25:
+        labels.append("ROLE_UNCERTAIN")
+        risk_score += 1
+
+    if risk_score >= 6:
+        status = "BULK_ROLE_RED_FLAG"
+    elif risk_score >= 4:
+        status = "BULK_ROLE_WARNING"
+    elif "MODEL_SHORT_IP" in labels:
+        status = "SHORT_ROLE_CONFIRMED_OR_UNKNOWN"
+    else:
+        status = "ROLE_NORMAL"
+    return status, "+".join(labels) if labels else "NO_ROLE_FLAGS", risk_score
+
+
+def _rl21_leash_confidence(row):
+    ip_floor, season_ip, recent5_bf, season_bf, pitch_count, role_score, starter_score = _rl21_recent_ip_bf_context(row)
+    score = 50
+    notes = []
+    if ip_floor is not None:
+        if ip_floor >= 5.2:
+            score += 18; notes.append("IP_5.2_PLUS")
+        elif ip_floor >= 4.5:
+            score += 8; notes.append("IP_OK")
+        elif ip_floor <= 2.25:
+            score -= 18; notes.append("LOW_IP_FLOOR")
+    if season_ip is not None:
+        if season_ip >= 5.2:
+            score += 12; notes.append("SEASON_LONG")
+        elif season_ip <= 2.5:
+            score -= 10; notes.append("SEASON_SHORT")
+    if recent5_bf is not None:
+        if recent5_bf >= 22:
+            score += 12; notes.append("RECENT_BF_LONG")
+        elif recent5_bf >= 17:
+            score += 6; notes.append("RECENT_BF_OK")
+        elif recent5_bf <= 10:
+            score -= 10; notes.append("RECENT_BF_SHORT")
+    if pitch_count is not None:
+        if pitch_count >= 85:
+            score += 10; notes.append("PITCHCOUNT_LONG")
+        elif pitch_count >= 65:
+            score += 5; notes.append("PITCHCOUNT_OK")
+        elif pitch_count <= 45:
+            score -= 8; notes.append("PITCHCOUNT_SHORT")
+    if starter_score is not None and starter_score >= 80:
+        score += 5; notes.append("STARTER_SCORE_HIGH")
+    if role_score is not None and role_score < 45:
+        score -= 4; notes.append("ROLE_LOW")
+    score = max(0, min(100, round(score, 1)))
+    if score >= 72:
+        label = "HIGH_LEASH_CONFIDENCE"
+    elif score >= 55:
+        label = "MEDIUM_LEASH_CONFIDENCE"
+    elif score >= 40:
+        label = "LOW_LEASH_CONFIDENCE"
+    else:
+        label = "VERY_LOW_LEASH_CONFIDENCE"
+    return score, label, "+".join(notes) if notes else "NO_LEASH_DATA"
+
+
+def _rl21_workload_guard(row, side, edge):
+    role_status, role_reason, role_risk = _rl21_open_bulk_detection(row)
+    leash_score, leash_label, leash_reason = _rl21_leash_confidence(row)
+    ip_floor = _rl21_num(row.get("IP Floor") or row.get("ip_floor"), None)
+    line = _rl21_num(row.get("UD/Line"), None)
+    proj = _rl21_num(row.get("Line-Aware Smart Final K Projection"), None)
+    abs_edge = abs(_rl21_num(edge, 0) or 0)
+
+    # Main fix for Gusto/Perkins-type misses:
+    # Do not trust UNDERS created mostly by a 1-2 IP assumption if the role has bulk/starter signals.
+    if side == "UNDER" and role_status in ("BULK_ROLE_RED_FLAG", "BULK_ROLE_WARNING"):
+        return "UNDER_ROLE_LEASH_DANGER", role_status, role_reason, leash_score, leash_label, leash_reason
+
+    # Low-leash overs are fragile unless edge is strong.
+    if side == "OVER" and leash_label in ("LOW_LEASH_CONFIDENCE", "VERY_LOW_LEASH_CONFIDENCE") and abs_edge < 1.50:
+        return "OVER_LOW_LEASH_WARNING", role_status, role_reason, leash_score, leash_label, leash_reason
+
+    # If a pitcher has big edge and normal/high leash, support it.
+    if side in ("OVER", "UNDER") and abs_edge >= 1.50 and leash_label in ("HIGH_LEASH_CONFIDENCE", "MEDIUM_LEASH_CONFIDENCE"):
+        return "WORKLOAD_SUPPORTS_STRONG_EDGE", role_status, role_reason, leash_score, leash_label, leash_reason
+
+    return "WORKLOAD_NEUTRAL", role_status, role_reason, leash_score, leash_label, leash_reason
+
+
+def _rl21_bfk_validation(row, proj, edge, side):
+    exp_k, status = _rl21_expected_k_from_bf(row)
+    if exp_k is None or proj is None:
+        return exp_k, None, "BFK_NO_DATA"
+    gap = round(float(proj) - float(exp_k), 2)
+    abs_edge = abs(_rl21_num(edge, 0) or 0)
+    if side == "OVER" and gap >= 1.35 and abs_edge < 1.50:
+        label = "BFK_OVER_OVERSTATED_WARNING"
+    elif side == "UNDER" and gap <= -1.35 and abs_edge < 1.50:
+        label = "BFK_UNDER_OVERSTATED_WARNING"
+    elif abs(gap) <= 0.75:
+        label = "BFK_SUPPORTS_PROJECTION"
+    else:
+        label = "BFK_NEUTRAL"
+    return exp_k, gap, label
+
+
+def _rl21_line_difficulty(row, side):
+    grade = str(row.get("Line Grade") or row.get("line_history_grade") or row.get("Line Audit") or "").upper()
+    if not grade:
+        return "LINE_DIFFICULTY_NO_DATA"
+    if side == "OVER" and any(x in grade for x in ["SET_HIGH", "ABOVE_HISTORY", "HIGH"]):
+        return "LINE_DIFFICULTY_OVER_EXPENSIVE"
+    if side == "UNDER" and any(x in grade for x in ["BUY_LOW", "LOW"]):
+        return "LINE_DIFFICULTY_UNDER_EXPENSIVE"
+    if side == "OVER" and "BUY_LOW" in grade:
+        return "LINE_DIFFICULTY_OVER_VALUE"
+    if side == "UNDER" and ("SET_HIGH" in grade or "ABOVE_HISTORY" in grade):
+        return "LINE_DIFFICULTY_UNDER_VALUE"
+    return "LINE_DIFFICULTY_NEUTRAL"
+
+
+def _rl21_line_move(row, side):
+    ld = _rl21_num(row.get("true_line_delta"), None)
+    if ld is None:
+        ld = _rl21_num(row.get("line_delta"), None)
+    if ld is None:
+        return "LINE_MOVE_NO_DATA", None
+    if side == "OVER" and ld >= 0.5:
+        return "LINE_MOVE_AGAINST_OVER", ld
+    if side == "OVER" and ld <= -0.5:
+        return "LINE_MOVE_FAVORS_OVER", ld
+    if side == "UNDER" and ld <= -0.5:
+        return "LINE_MOVE_AGAINST_UNDER", ld
+    if side == "UNDER" and ld >= 0.5:
+        return "LINE_MOVE_FAVORS_UNDER", ld
+    return "LINE_MOVE_NEUTRAL", ld
+
+
+def _rl21_market(row, side):
+    lean = str(row.get("market_lean") or row.get("Market Lean") or row.get("Manual Market Lean") or "").upper()
+    agree = str(row.get("market_agreement") or row.get("Market Agree") or row.get("Manual Market Agreement") or "").upper()
+    if side in agree and ("AGREE" in agree or "YES" in agree or "TRUE" in agree):
+        return "MARKET_CONFIRMS"
+    if side and side in lean:
+        return "MARKET_CONFIRMS"
+    if (side == "OVER" and "UNDER" in lean) or (side == "UNDER" and "OVER" in lean):
+        return "MARKET_DISAGREES"
+    return "MARKET_NO_SIGNAL"
+
+
+def _rl21_decision(row):
+    proj = _rl21_num(row.get("Line-Aware Smart Final K Projection"), _rl21_num(row.get("K PROJ"), None))
+    line = _rl21_num(row.get("UD/Line"), None)
+    if proj is None or line is None:
+        return row.get("Line-Aware Smart Decision", row.get("Decision", "NO LINE")), None, "NO_LINE_OR_PROJECTION", {}
+    edge = round(proj - line, 2)
+    orig = str(row.get("Line-Aware Smart Decision") or row.get("Decision") or "")
+    side = _rl21_side(orig, edge)
+    bucket = _rl21_edge_bucket(edge)
+    abs_edge = abs(edge)
+
+    exp_k, bf_gap, bf_label = _rl21_bfk_validation(row, proj, edge, side)
+    workload_label, role_status, role_reason, leash_score, leash_label, leash_reason = _rl21_workload_guard(row, side, edge)
+    line_diff = _rl21_line_difficulty(row, side)
+    line_move, line_delta = _rl21_line_move(row, side)
+    market = _rl21_market(row, side)
+
+    warnings = []
+    confirms = []
+    for lab in [bf_label, workload_label, line_diff, line_move, market]:
+        if any(x in str(lab) for x in ["WARNING", "DANGER", "DISAGREE", "AGAINST", "EXPENSIVE", "RED_FLAG"]):
+            warnings.append(lab)
+        if any(x in str(lab) for x in ["SUPPORTS", "VALUE", "FAVORS", "CONFIRMS"]):
+            confirms.append(lab)
+
+    # Gusto/Perkins protection: strong under edge caused by very low IP can be neutralized to PASS.
+    if side == "UNDER" and workload_label == "UNDER_ROLE_LEASH_DANGER":
+        if abs_edge >= 1.50:
+            dec = "🚫 PASS — UNDER BULK/LEASH DANGER"
+        else:
+            dec = "🚫 PASS — UNDER ROLE RISK"
+    elif side == "OVER" and workload_label == "OVER_LOW_LEASH_WARNING" and abs_edge < 1.50:
+        dec = "🚫 PASS — OVER LOW LEASH RISK" if abs_edge < 1.00 else "⚠️ OVER LEAN — LOW LEASH"
+    elif side == "OVER":
+        if abs_edge >= 2.00:
+            dec = "🔥 OVER — ELITE EDGE"
+        elif abs_edge >= 1.50:
+            dec = "🔥 OVER" if not warnings else "⚠️ OVER — STRONG EDGE / WARNING"
+        elif abs_edge >= 1.00:
+            dec = "⚠️ OVER LEAN" if warnings else "🔥 OVER"
+        elif abs_edge >= 0.65:
+            dec = "🚫 PASS — OVER FILTER WARNING" if warnings else "⚠️ OVER LEAN"
+        else:
+            dec = "🚫 PASS — TRUE EDGE THIN"
+    elif side == "UNDER":
+        if abs_edge >= 2.00:
+            dec = "🔥 UNDER — ELITE EDGE" if not warnings else "⚠️ UNDER — ELITE EDGE / WARNING"
+        elif abs_edge >= 1.50:
+            dec = "🔥 UNDER" if not warnings else "⚠️ UNDER — STRONG EDGE / WARNING"
+        elif abs_edge >= 1.00:
+            dec = "⚠️ UNDER LEAN" if warnings else "🔥 UNDER"
+        elif abs_edge >= 0.65:
+            dec = "🚫 PASS — UNDER FILTER WARNING" if warnings else "⚠️ UNDER LEAN"
+        else:
+            dec = "🚫 PASS — TRUE EDGE THIN"
+    else:
+        dec = "🚫 PASS — NO SIDE"
+
+    if market == "MARKET_CONFIRMS" and "LEAN" in dec and abs_edge >= 0.75 and not warnings:
+        dec = dec.replace("⚠️", "🔥").replace(" LEAN", " — MARKET CONFIRMS")
+
+    info = {
+        "edge": edge,
+        "bucket": bucket,
+        "exp_k": exp_k,
+        "bf_gap": bf_gap,
+        "bf_label": bf_label,
+        "workload_label": workload_label,
+        "role_status": role_status,
+        "role_reason": role_reason,
+        "leash_score": leash_score,
+        "leash_label": leash_label,
+        "leash_reason": leash_reason,
+        "line_diff": line_diff,
+        "line_move": line_move,
+        "line_delta": line_delta,
+        "market": market,
+        "warnings": len(warnings),
+        "confirms": len(confirms),
+    }
+    reason = (
+        f"edge {edge:+.2f} ({bucket}); role={role_status}; workload={workload_label}; "
+        f"leash={leash_score} {leash_label}; BF-K expected={exp_k if exp_k is not None else 'NA'} "
+        f"gap={bf_gap if bf_gap is not None else 'NA'} {bf_label}; {line_diff}; {line_move}; {market}; "
+        f"warnings={len(warnings)} confirms={len(confirms)}"
+    )
+    return dec, edge, reason, info
+
+
+def _rl21_apply(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    d = df.copy()
+    decisions, edges, reasons = [], [], []
+    buckets, expks, bfgaps, bfks = [], [], [], []
+    workload, role_statuses, role_reasons = [], [], []
+    leash_scores, leash_labels, leash_reasons = [], [], []
+    line_diffs, line_moves, markets = [], [], []
+
+    for _, rr in d.iterrows():
+        dec, edge, reason, info = _rl21_decision(rr.to_dict())
+        decisions.append(dec); edges.append(edge); reasons.append(reason)
+        buckets.append(info.get("bucket", "")); expks.append(info.get("exp_k", "")); bfgaps.append(info.get("bf_gap", "")); bfks.append(info.get("bf_label", ""))
+        workload.append(info.get("workload_label", "")); role_statuses.append(info.get("role_status", "")); role_reasons.append(info.get("role_reason", ""))
+        leash_scores.append(info.get("leash_score", "")); leash_labels.append(info.get("leash_label", "")); leash_reasons.append(info.get("leash_reason", ""))
+        line_diffs.append(info.get("line_diff", "")); line_moves.append(info.get("line_move", "")); markets.append(info.get("market", ""))
+
+    d["Edge Bucket 2.1"] = buckets
+    d["BF-K Expected K 2.1"] = expks
+    d["BF-K Gap 2.1"] = bfgaps
+    d["BF-K Validation 2.1"] = bfks
+    d["Open/Bulk Role Signal 2.1"] = role_statuses
+    d["Open/Bulk Role Reason 2.1"] = role_reasons
+    d["Workload Guard 2.1"] = workload
+    d["Manager Leash Score 2.1"] = leash_scores
+    d["Manager Leash Confidence 2.1"] = leash_labels
+    d["Manager Leash Reason 2.1"] = leash_reasons
+    d["Line Difficulty Signal 2.1"] = line_diffs
+    d["Line Movement Signal 2.1"] = line_moves
+    d["Market Advisor Signal 2.1"] = markets
+    d["Decision 2.1 Reason"] = reasons
+    d["Decision 2.1 Version"] = ROLE_LEASH_DECISION_2_1_VERSION
+    d["Pre-Decision 2.1"] = d.get("Line-Aware Smart Decision", d.get("Decision", ""))
+    d["Decision 2.1"] = decisions
+
+    # Final decision sync only; do not change projections/IP math.
+    try:
+        d["Line-Aware Smart Decision"] = d["Decision 2.1"]
+        if "Decision" in d.columns:
+            d["Decision"] = d["Decision 2.1"]
+        if "Main Engine Action" in d.columns:
+            d["Main Engine Action"] = d["Decision 2.1"]
+        if "Line-Aware Smart Edge" in d.columns:
+            d["Line-Aware Smart Edge"] = edges
+        if "Edge Gap" in d.columns:
+            d["Edge Gap"] = edges
+    except Exception:
+        pass
+    return d
+
+
+if "build_kproj_table" in globals():
+    _prev_role_leash_decision_2_1_build_kproj_table = build_kproj_table
+    def build_kproj_table(board):
+        df = _prev_role_leash_decision_2_1_build_kproj_table(board)
+        try:
+            return _rl21_apply(df)
+        except Exception:
+            return df
 
 
 # =========================
