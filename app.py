@@ -82,6 +82,8 @@ BULLPEN_LEARNING_FILE = os.path.join(STORAGE_DIR, "bullpen_learning_engine.json"
 UMPIRE_LEARNING_FILE = os.path.join(STORAGE_DIR, "umpire_learning_engine.json")
 GRADED_FEATURES_FILE = os.path.join(STORAGE_DIR, "graded_feature_bank.json")
 SAVED_ODDS_FILE = os.path.join(STORAGE_DIR, "saved_manual_market_odds.json")
+SAVED_ODDS_BACKUP_FILE = os.path.join(STORAGE_DIR, "saved_manual_market_odds_backup.json")
+SAVED_ODDS_LOCAL_FILE = "saved_manual_market_odds.json"
 
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 MLB_LIVE = "https://statsapi.mlb.com/api/v1.1"
@@ -436,27 +438,88 @@ def _pct_display(v):
         x *= 100.0
     return f"{x:.1f}%"
 
+def _manual_saved_key(row):
+    """Stable key for saved manual odds. Uses pitcher + line so old slates do not fight new lines."""
+    return (
+        normalize_name((row or {}).get("Pitcher") or (row or {}).get("pitcher") or ""),
+        None if safe_float((row or {}).get("Line"), None) is None else round(float(safe_float((row or {}).get("Line"), None)), 2),
+    )
+
+def _manual_saved_name_key(row):
+    return normalize_name((row or {}).get("Pitcher") or (row or {}).get("pitcher") or "")
+
+def _clean_manual_odds_row(r, keep_blank=False):
+    """Clean one manual odds row. Blank odds are ignored unless keep_blank is explicitly True."""
+    if not isinstance(r, dict):
+        return None
+    name = str(r.get("Pitcher") or r.get("pitcher") or "").strip()
+    line = safe_float(r.get("Line") if r.get("Line") is not None else r.get("line"), None)
+    if not name or line is None:
+        return None
+    over = _fmt_manual_price(r.get("Over Odds") if r.get("Over Odds") is not None else r.get("over_odds"))
+    under = _fmt_manual_price(r.get("Under Odds") if r.get("Under Odds") is not None else r.get("under_odds"))
+    if not keep_blank and not over and not under:
+        return None
+    return {
+        "Pitcher": name,
+        "Matchup": str(r.get("Matchup") or r.get("matchup") or ""),
+        "Line": round(float(line), 1),
+        "Over Odds": over,
+        "Under Odds": under,
+        "Book": str(r.get("Book") or r.get("book") or "Manual"),
+        "Saved At": california_now().strftime("%Y-%m-%d %H:%M:%S PT") if "california_now" in globals() else datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
 def load_saved_manual_odds_rows():
-    rows = load_json(SAVED_ODDS_FILE, [])
-    return rows if isinstance(rows, list) else []
+    """Load saved manual odds from primary, backup, or local fallback."""
+    for path in [SAVED_ODDS_FILE, SAVED_ODDS_BACKUP_FILE, SAVED_ODDS_LOCAL_FILE]:
+        rows = load_json(path, [])
+        if isinstance(rows, list) and rows:
+            cleaned = []
+            seen = set()
+            for r in rows:
+                cr = _clean_manual_odds_row(r, keep_blank=False)
+                if not cr:
+                    continue
+                k = _manual_saved_key(cr)
+                if k in seen:
+                    continue
+                seen.add(k)
+                cleaned.append(cr)
+            if cleaned:
+                return cleaned
+    return []
 
 def save_manual_odds_rows(rows):
-    cleaned = []
-    for r in rows or []:
-        name = str(r.get("Pitcher") or "").strip()
-        line = safe_float(r.get("Line"), None)
-        if not name or line is None:
+    """Merge-save manual odds without letting blank rows erase previously saved prices."""
+    existing = load_saved_manual_odds_rows()
+    merged = {}
+    order = []
+    for r in existing:
+        cr = _clean_manual_odds_row(r, keep_blank=False)
+        if not cr:
             continue
-        cleaned.append({
-            "Pitcher": name,
-            "Matchup": str(r.get("Matchup") or ""),
-            "Line": round(float(line), 1),
-            "Over Odds": _fmt_manual_price(r.get("Over Odds")),
-            "Under Odds": _fmt_manual_price(r.get("Under Odds")),
-            "Book": str(r.get("Book") or "Manual"),
-            "Saved At": california_now().strftime("%Y-%m-%d %H:%M:%S PT") if "california_now" in globals() else datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        })
-    save_json(SAVED_ODDS_FILE, cleaned)
+        k = _manual_saved_key(cr)
+        merged[k] = cr
+        order.append(k)
+
+    for r in rows or []:
+        cr = _clean_manual_odds_row(r, keep_blank=False)
+        if not cr:
+            continue
+        k = _manual_saved_key(cr)
+        prev = merged.get(k, {})
+        if not cr.get("Over Odds") and prev.get("Over Odds"):
+            cr["Over Odds"] = prev.get("Over Odds")
+        if not cr.get("Under Odds") and prev.get("Under Odds"):
+            cr["Under Odds"] = prev.get("Under Odds")
+        merged[k] = cr
+        if k not in order:
+            order.append(k)
+
+    cleaned = [merged[k] for k in order if k in merged]
+    for path in [SAVED_ODDS_FILE, SAVED_ODDS_BACKUP_FILE, SAVED_ODDS_LOCAL_FILE]:
+        save_json(path, cleaned)
     return cleaned
 
 def log_source_request(source, status, message=""):
@@ -10091,8 +10154,48 @@ def _manual_market_default_rows(picks):
         })
     return rows
 
+def _manual_market_reconcile_pick(p2):
+    """UI/market-only reconciliation so displayed odds, no-vig lean, and agree badge cannot argue."""
+    if not isinstance(p2, dict):
+        return p2
+    over_px = safe_float(str(p2.get("market_over_odds", "")).replace("+", ""), None)
+    under_px = safe_float(str(p2.get("market_under_odds", "")).replace("+", ""), None)
+    line = safe_float(p2.get("line") if p2.get("line") is not None else p2.get("UD/Line"), None)
+    proj = safe_float(p2.get("projection"), None)
+    model_side = str(p2.get("pick_side") or "").upper()
+    if model_side not in ["OVER", "UNDER"] and proj is not None and line is not None:
+        model_side = "OVER" if proj > line else "UNDER"
+
+    nv = no_vig_two_way(over_px, under_px)
+    if nv.get("over") is not None and nv.get("under") is not None:
+        market_lean = "OVER" if nv["over"] >= nv["under"] else "UNDER"
+        diff = abs(float(nv["over"]) - float(nv["under"]))
+        strength = "STRONG" if diff >= 0.10 else "MEDIUM" if diff >= 0.055 else "LIGHT"
+        agreement = "AGREE" if model_side in ["OVER", "UNDER"] and market_lean == model_side else "DISAGREE" if model_side in ["OVER", "UNDER"] else "NO_MODEL_SIDE"
+        p2["market_lean"] = market_lean
+        p2["market_strength"] = strength
+        p2["market_agreement"] = agreement
+        p2["market_over_implied"] = round(float(nv["over"]), 4)
+        p2["market_under_implied"] = round(float(nv["under"]), 4)
+        p2["market_over_no_vig"] = float(nv["over"])
+        p2["market_under_no_vig"] = float(nv["under"])
+        p2["market_vig"] = nv.get("vig")
+        p2["market_no_vig_side_prob"] = nv.get("over") if model_side == "OVER" else nv.get("under") if model_side == "UNDER" else None
+        p2["market_no_vig_note"] = f"No-vig O {_pct_display(nv.get('over'))} | U {_pct_display(nv.get('under'))} | Vig {_pct_display(nv.get('vig'))}"
+        p2["market_note"] = f"Manual odds reconciled: Market {market_lean} {strength}; agreement={agreement}; over={p2.get('market_over_odds')}; under={p2.get('market_under_odds')}"
+        p2["market_agreement_score"] = 50 + ({"LIGHT": 6, "MEDIUM": 12, "STRONG": 18}.get(strength, 4) if agreement == "AGREE" else -{"LIGHT": 8, "MEDIUM": 16, "STRONG": 25}.get(strength, 10))
+        p2["market_agreement_score"] = int(round(clamp(p2["market_agreement_score"], 0, 100)))
+        p2["sharp_warning"] = "MARKET_AGREE" if agreement == "AGREE" else "MARKET_DISAGREE" if agreement == "DISAGREE" else p2.get("sharp_warning", "NONE")
+    elif over_px is not None or under_px is not None:
+        p2["market_lean"] = "OVER_PRICE_ONLY" if over_px is not None else "UNDER_PRICE_ONLY"
+        p2["market_strength"] = "THIN"
+        p2["market_agreement"] = "PARTIAL_MARKET"
+        p2["sharp_warning"] = p2.get("sharp_warning") or "NONE"
+    return p2
+
 def _manual_market_apply_to_picks(picks, table_rows):
     by_key = {}
+    by_name = {}
     for r in table_rows or []:
         name = r.get("Pitcher")
         line = safe_float(r.get("Line"), None)
@@ -10100,9 +10203,16 @@ def _manual_market_apply_to_picks(picks, table_rows):
         under_px = safe_float(str(r.get("Under Odds", "")).replace("+", ""), None)
         if not name or line is None or (over_px is None and under_px is None):
             continue
-        by_key[_manual_odds_key_from_values(name, line)] = {
-            "name": str(name), "line": float(line), "over": over_px, "under": under_px, "book": str(r.get("Book") or "Manual")
+        payload = {
+            "name": str(name),
+            "line": float(line),
+            "over": over_px,
+            "under": under_px,
+            "book": str(r.get("Book") or "Manual"),
         }
+        by_key[_manual_odds_key_from_values(name, line)] = payload
+        by_name[normalize_name(name)] = payload
+
     updated = 0
     out = []
     for pp in picks or []:
@@ -10110,36 +10220,19 @@ def _manual_market_apply_to_picks(picks, table_rows):
         name = str(p2.get("pitcher") or p2.get("Pitcher") or "").strip()
         line = safe_float(p2.get("line") if p2.get("line") is not None else p2.get("UD/Line"), None)
         m = by_key.get(_manual_odds_key_from_values(name, line))
+        # Fallback: if the saved row has the same pitcher but the board line format changed slightly.
+        if not m:
+            m = by_name.get(normalize_name(name))
         if m and line is not None:
-            priced_rows = []
-            if m.get("over") is not None:
-                priced_rows.append({"Source":"ManualMarket", "Provider":m.get("book") or "Manual", "Player":name, "Matched Name":name, "Market":"pitcher_strikeouts", "Line":line, "Side":"OVER", "Price":int(m["over"])})
-            if m.get("under") is not None:
-                priced_rows.append({"Source":"ManualMarket", "Provider":m.get("book") or "Manual", "Player":name, "Matched Name":name, "Market":"pitcher_strikeouts", "Line":line, "Side":"UNDER", "Price":int(m["under"])})
-            proj = safe_float(p2.get("projection"), None)
-            model_side = str(p2.get("pick_side") or "").upper()
-            if model_side not in ["OVER", "UNDER"] and proj is not None:
-                model_side = "OVER" if proj > line else "UNDER"
-            intel = build_market_odds_intelligence(priced_rows, line, model_side, None)
-            nv = no_vig_two_way(m.get("over"), m.get("under"))
-            if nv.get("over") is not None:
-                intel["market_over_no_vig"] = nv.get("over")
-                intel["market_under_no_vig"] = nv.get("under")
-                intel["market_vig"] = nv.get("vig")
-                intel["market_no_vig_side_prob"] = nv.get("over") if model_side == "OVER" else nv.get("under")
-                intel["market_no_vig_note"] = f"No-vig O {_pct_display(nv.get('over'))} | U {_pct_display(nv.get('under'))} | Vig {_pct_display(nv.get('vig'))}"
-            p2.update(intel)
+            p2["market_over_odds"] = None if m.get("over") is None else int(m["over"])
+            p2["market_under_odds"] = None if m.get("under") is None else int(m["under"])
             p2["market_source"] = m.get("book") or "Manual"
             p2["saved_manual_odds_loaded"] = True
-            if intel.get("market_agreement") == "AGREE":
-                p2["sharp_warning"] = "MARKET_AGREE"
-            elif intel.get("market_agreement") == "DISAGREE":
-                p2["sharp_warning"] = "MARKET_DISAGREE"
-            else:
-                p2["sharp_warning"] = p2.get("sharp_warning") or "NONE"
+            p2 = _manual_market_reconcile_pick(p2)
             updated += 1
         out.append(p2)
     return out, updated
+
 
 if st.session_state.get("loaded_picks"):
     with st.sidebar:
@@ -10169,13 +10262,17 @@ if st.session_state.get("loaded_picks"):
             if st.button("✅ Apply odds to cards", use_container_width=True):
                 st.session_state.manual_market_table = table_records
                 st.session_state.loaded_picks, count = _manual_market_apply_to_picks(st.session_state.loaded_picks, table_records)
+                st.session_state.saved_manual_odds_auto_applied = True
                 st.success(f"Applied manual market odds to {count} player card(s).")
+                st.rerun()
         with c_save:
             if st.button("💾 Save Odds", use_container_width=True):
                 saved_rows = save_manual_odds_rows(table_records)
                 st.session_state.manual_market_table = saved_rows
                 st.session_state.loaded_picks, count = _manual_market_apply_to_picks(st.session_state.loaded_picks, saved_rows)
+                st.session_state.saved_manual_odds_auto_applied = True
                 st.success(f"Saved {len(saved_rows)} odds row(s) and applied them to {count} card(s).")
+                st.rerun()
         with st.expander("No-Vig Calculator", expanded=False):
             nv_o = st.text_input("Over odds", value="-110", key="manual_nv_over")
             nv_u = st.text_input("Under odds", value="-110", key="manual_nv_under")
@@ -10203,6 +10300,9 @@ if st.session_state.get("loaded_picks"):
     board_status = "LIVE REFRESHED BOARD — NOT OFFICIAL UNLESS SAVED"
 else:
     board = [p for p in saved if p.get("date") in dates]
+    saved_rows_for_board = load_saved_manual_odds_rows()
+    if saved_rows_for_board:
+        board, _manual_saved_count = _manual_market_apply_to_picks(board, saved_rows_for_board)
     board_status = "SAVED OFFICIAL SNAPSHOTS"
 
 if hide_no_line:
