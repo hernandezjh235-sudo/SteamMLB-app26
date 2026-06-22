@@ -81,6 +81,7 @@ CALIBRATION_ENGINE_FILE = os.path.join(STORAGE_DIR, "true_calibration_engine.jso
 BULLPEN_LEARNING_FILE = os.path.join(STORAGE_DIR, "bullpen_learning_engine.json")
 UMPIRE_LEARNING_FILE = os.path.join(STORAGE_DIR, "umpire_learning_engine.json")
 GRADED_FEATURES_FILE = os.path.join(STORAGE_DIR, "graded_feature_bank.json")
+SAVED_ODDS_FILE = os.path.join(STORAGE_DIR, "saved_manual_market_odds.json")
 
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 MLB_LIVE = "https://statsapi.mlb.com/api/v1.1"
@@ -405,6 +406,58 @@ def save_json(path, data):
             json.dump(data, f, indent=2)
     except Exception:
         pass
+
+# =========================
+# SAVED MANUAL ODDS + NO-VIG HELPERS
+# =========================
+def american_to_implied_prob(price):
+    """Convert American odds to implied probability as a decimal."""
+    x = safe_float(str(price).replace("+", ""), None)
+    if x is None or x == 0:
+        return None
+    if x > 0:
+        return 100.0 / (x + 100.0)
+    return abs(x) / (abs(x) + 100.0)
+
+def no_vig_two_way(over_price, under_price):
+    """Return no-vig over/under probabilities for a paired two-way market."""
+    o = american_to_implied_prob(over_price)
+    u = american_to_implied_prob(under_price)
+    if o is None or u is None or (o + u) <= 0:
+        return {"over": None, "under": None, "vig": None}
+    total = o + u
+    return {"over": o / total, "under": u / total, "vig": total - 1.0}
+
+def _pct_display(v):
+    x = safe_float(v, None)
+    if x is None:
+        return "—"
+    if abs(x) <= 1:
+        x *= 100.0
+    return f"{x:.1f}%"
+
+def load_saved_manual_odds_rows():
+    rows = load_json(SAVED_ODDS_FILE, [])
+    return rows if isinstance(rows, list) else []
+
+def save_manual_odds_rows(rows):
+    cleaned = []
+    for r in rows or []:
+        name = str(r.get("Pitcher") or "").strip()
+        line = safe_float(r.get("Line"), None)
+        if not name or line is None:
+            continue
+        cleaned.append({
+            "Pitcher": name,
+            "Matchup": str(r.get("Matchup") or ""),
+            "Line": round(float(line), 1),
+            "Over Odds": _fmt_manual_price(r.get("Over Odds")),
+            "Under Odds": _fmt_manual_price(r.get("Under Odds")),
+            "Book": str(r.get("Book") or "Manual"),
+            "Saved At": california_now().strftime("%Y-%m-%d %H:%M:%S PT") if "california_now" in globals() else datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    save_json(SAVED_ODDS_FILE, cleaned)
+    return cleaned
 
 def log_source_request(source, status, message=""):
     rows = load_json(REQUEST_LOG_FILE, [])
@@ -9531,6 +9584,10 @@ def render_pick_card(p):
     market_u_display = p.get('market_under_odds', '—')
     fair_o_display = _card_pct(p.get('market_over_implied'))
     fair_u_display = _card_pct(p.get('market_under_implied'))
+    no_vig_o_display = _card_pct(p.get('market_over_no_vig'))
+    no_vig_u_display = _card_pct(p.get('market_under_no_vig'))
+    slate_q = st.session_state.get('slate_quality_info') or compute_slate_quality_score([p])
+    slate_badge_text = f"{slate_q.get('emoji','⚪')} {slate_q.get('label','NO BOARD')} {slate_q.get('score',0)}/100"
 
     st.markdown(f"""
     <div class="pick-card">
@@ -9543,6 +9600,7 @@ def render_pick_card(p):
           <span class="badge">{p.get('line_source')}</span>
           <span class="badge good-badge">{p.get('projection_source')}</span>
           <span class="badge">Lineup: {p.get('lineup_status')}</span>
+          <span class="badge">Slate: {slate_badge_text}</span>
         </div>
         <div><div class="small-muted">Final K Projection</div><div class="big-number {color_class}">{card_k_projection}</div><div class="small-muted">{card_k_projection_source} | BF {p.get('expected_bf')} | PPB {p.get('ppb')}</div></div>
         <div><div class="small-muted">Line</div><div class="big-number">{line_display}</div><div class="small-muted">Edge: {edge_display} K</div></div>
@@ -9564,7 +9622,7 @@ def render_pick_card(p):
         <div class="mobile-info-card"><div class="small-muted">Official Filter</div><div class="kpi-value" style="font-size:17px;">{p.get('official_play_filter', '—')}</div><div class="kpi-sub">{p.get('official_filter_note', '')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Reliability</div><div class="kpi-value">{p.get('reliability_score', '—')}</div><div class="kpi-sub">{p.get('reliability_label', '')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Integrity</div><div class="kpi-value">{p.get('decision_integrity_score', '—')}</div><div class="kpi-sub">{p.get('decision_integrity_label', '')}</div></div>
-        <div class="mobile-info-card"><div class="small-muted">Market</div><div class="kpi-value" style="font-size:16px;">{p.get('market_lean', 'NO_MARKET')}</div><div class="kpi-sub">O {market_o_display} | U {market_u_display}<br>Fair O {fair_o_display} | U {fair_u_display}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Market / No-Vig</div><div class="kpi-value" style="font-size:16px;">{p.get('market_lean', 'NO_MARKET')}</div><div class="kpi-sub">O {market_o_display} | U {market_u_display}<br>Fair O {fair_o_display} | U {fair_u_display}<br>No-Vig O {no_vig_o_display} | U {no_vig_u_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Sharp / Line</div><div class="kpi-value" style="font-size:16px;">{p.get('sharp_warning', 'NONE')}</div><div class="kpi-sub">{p.get('line_history_grade', '—')} | L10 {p.get('line_l10_avg', '—')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Umpire Zone</div><div class="kpi-value" style="font-size:16px;">{p.get('umpire_strike_zone_score', '—')}</div><div class="kpi-sub">K nudge {p.get('umpire_k_nudge', 0)} | {p.get('umpire', 'Unknown')}</div></div>
       </div>
@@ -9923,6 +9981,7 @@ with st.sidebar:
         st.session_state.loaded_picks = []
         st.session_state.last_refresh_time = None
         st.session_state.pop("manual_market_table", None)
+        st.session_state.pop("saved_manual_odds_auto_applied", None)
         st.success("Cache cleared. Now click REFRESH LIVE BOARD again.")
     st.caption("SportsGameOdds and OpticOdds are removed from this build. Manual table controls the Market card only.")
 
@@ -9975,7 +10034,8 @@ if refresh_btn:
 
     st.session_state.loaded_picks = projections
     st.session_state.last_refresh_time = now_iso()
-    st.success(f"Refreshed {len(projections)} pitchers. Nothing officially saved yet.")
+    st.session_state.pop("saved_manual_odds_auto_applied", None)
+    st.success(f"Refreshed {len(projections)} pitchers. Nothing officially saved yet. Saved odds can auto-load below if the toggle is on.")
 
 if save_btn:
     if not st.session_state.get("loaded_picks"):
@@ -10003,7 +10063,9 @@ def _fmt_manual_price(v):
     return f"{int(x):+d}"
 
 def _manual_market_default_rows(picks):
-    old_rows = st.session_state.get("manual_market_table", []) or []
+    # Order of priority for prefill: current session edits first, then saved disk odds.
+    saved_rows = load_saved_manual_odds_rows()
+    old_rows = (saved_rows or []) + (st.session_state.get("manual_market_table", []) or [])
     old = {}
     for r in old_rows:
         old[_manual_odds_key_from_values(r.get("Pitcher"), r.get("Line"))] = r
@@ -10059,8 +10121,16 @@ def _manual_market_apply_to_picks(picks, table_rows):
             if model_side not in ["OVER", "UNDER"] and proj is not None:
                 model_side = "OVER" if proj > line else "UNDER"
             intel = build_market_odds_intelligence(priced_rows, line, model_side, None)
+            nv = no_vig_two_way(m.get("over"), m.get("under"))
+            if nv.get("over") is not None:
+                intel["market_over_no_vig"] = nv.get("over")
+                intel["market_under_no_vig"] = nv.get("under")
+                intel["market_vig"] = nv.get("vig")
+                intel["market_no_vig_side_prob"] = nv.get("over") if model_side == "OVER" else nv.get("under")
+                intel["market_no_vig_note"] = f"No-vig O {_pct_display(nv.get('over'))} | U {_pct_display(nv.get('under'))} | Vig {_pct_display(nv.get('vig'))}"
             p2.update(intel)
             p2["market_source"] = m.get("book") or "Manual"
+            p2["saved_manual_odds_loaded"] = True
             if intel.get("market_agreement") == "AGREE":
                 p2["sharp_warning"] = "MARKET_AGREE"
             elif intel.get("market_agreement") == "DISAGREE":
@@ -10092,12 +10162,36 @@ if st.session_state.get("loaded_picks"):
                 "Book": st.column_config.TextColumn("Book", help="Optional: FanDuel, DK, consensus, etc."),
             },
         )
-        if st.button("✅ Apply manual odds to player cards", use_container_width=True):
-            table_records = edited.to_dict("records") if hasattr(edited, "to_dict") else list(edited or [])
-            st.session_state.manual_market_table = table_records
-            st.session_state.loaded_picks, count = _manual_market_apply_to_picks(st.session_state.loaded_picks, table_records)
-            st.success(f"Applied manual market odds to {count} player card(s).")
-        st.caption("Use Refresh first, enter odds, then Apply. Save official snapshot only after cards/slates look right.")
+        table_records = edited.to_dict("records") if hasattr(edited, "to_dict") else list(edited or [])
+        auto_load_saved_odds = st.toggle("Auto-load saved odds onto player cards", value=True, key="auto_load_saved_manual_odds")
+        c_apply, c_save = st.columns(2)
+        with c_apply:
+            if st.button("✅ Apply odds to cards", use_container_width=True):
+                st.session_state.manual_market_table = table_records
+                st.session_state.loaded_picks, count = _manual_market_apply_to_picks(st.session_state.loaded_picks, table_records)
+                st.success(f"Applied manual market odds to {count} player card(s).")
+        with c_save:
+            if st.button("💾 Save Odds", use_container_width=True):
+                saved_rows = save_manual_odds_rows(table_records)
+                st.session_state.manual_market_table = saved_rows
+                st.session_state.loaded_picks, count = _manual_market_apply_to_picks(st.session_state.loaded_picks, saved_rows)
+                st.success(f"Saved {len(saved_rows)} odds row(s) and applied them to {count} card(s).")
+        with st.expander("No-Vig Calculator", expanded=False):
+            nv_o = st.text_input("Over odds", value="-110", key="manual_nv_over")
+            nv_u = st.text_input("Under odds", value="-110", key="manual_nv_under")
+            nv = no_vig_two_way(nv_o, nv_u)
+            a, b, c = st.columns(3)
+            a.metric("No-Vig Over", _pct_display(nv.get("over")))
+            b.metric("No-Vig Under", _pct_display(nv.get("under")))
+            c.metric("Sportsbook Vig", _pct_display(nv.get("vig")))
+        if auto_load_saved_odds and not st.session_state.get("saved_manual_odds_auto_applied"):
+            saved_rows = load_saved_manual_odds_rows()
+            if saved_rows:
+                st.session_state.manual_market_table = saved_rows
+                st.session_state.loaded_picks, count = _manual_market_apply_to_picks(st.session_state.loaded_picks, saved_rows)
+                st.session_state.saved_manual_odds_auto_applied = True
+                st.caption(f"Auto-loaded saved manual odds onto {count} card(s).")
+        st.caption("Use Refresh first, enter odds, then Apply or Save Odds. Saved odds reload after app restart/close.")
 
 saved = load_json(PICK_LOG, [])
 
@@ -10116,9 +10210,12 @@ if hide_no_line:
 if only_strong:
     board = [p for p in board if p.get("signal_type") == "good"]
 
+st.session_state.slate_quality_info = compute_slate_quality_score(board)
+
 st.info(f"{APP_VERSION} | {board_status} | Last refresh: {st.session_state.get('last_refresh_time') or 'Not refreshed this session'} | Last save added: {st.session_state.get('last_saved_count', 0)}")
 
 render_kpis(board, bankroll)
+render_slate_quality_score(board)
 
 def display_clean_real_prop_rows(rows, **kwargs):
     cleaned = clean_real_prop_debug_rows(rows)
@@ -11433,6 +11530,11 @@ def render_kproj_pitcher_card(p):
     market_u_display = p.get('market_under_odds', '—')
     fair_o_display = _card_pct(p.get('market_over_implied'))
     fair_u_display = _card_pct(p.get('market_under_implied'))
+    no_vig_o_display = _card_pct(p.get('market_over_no_vig'))
+    no_vig_u_display = _card_pct(p.get('market_under_no_vig'))
+    no_vig_note_display = html.escape(str(p.get('market_no_vig_note') or 'No paired odds saved yet'))
+    slate_q = st.session_state.get('slate_quality_info') or compute_slate_quality_score([p])
+    slate_badge_text = f"{slate_q.get('emoji','⚪')} {slate_q.get('label','NO BOARD')} {slate_q.get('score',0)}/100"
     st.markdown(f"""
     <div class="pick-card" style="border-color:rgba(90,100,255,.45);box-shadow:0 0 26px rgba(90,100,255,.16);">
       <div style="display:grid;grid-template-columns:1.25fr .75fr .75fr .75fr .9fr;gap:18px;align-items:center;">
@@ -11442,6 +11544,7 @@ def render_kproj_pitcher_card(p):
           <span class="badge {line_badge}">{d['line_source']} Line</span>
           <span class="badge {lineup_badge}">Lineup: {p.get('lineup_status')}</span>
           <span class="badge">K Upside: {p.get('elite_upside_score', 0)}/100</span>
+          <span class="badge">Slate: {slate_badge_text}</span>
         </div>
         <div><div class="small-muted">Final K Projection</div><div class="big-number green">{d['projection']}</div><div class="small-muted">{card_k_projection_source} | BF {bf:.1f} | IP {p.get('projected_ip', '—')}</div></div>
         <div><div class="small-muted">Line</div><div class="big-number">{line_display}</div><div class="small-muted">Needs {needs_display}</div></div>
@@ -11451,7 +11554,7 @@ def render_kproj_pitcher_card(p):
       <div class="hr-soft"></div>
       <div class="mobile-decision-grid">
         <div class="mobile-info-card"><div class="small-muted">Integrity</div><div class="kpi-value">{p.get('decision_integrity_score', '—')}</div><div class="kpi-sub">{p.get('decision_integrity_label', '')}</div></div>
-        <div class="mobile-info-card"><div class="small-muted">Market</div><div class="kpi-value" style="font-size:16px;">{p.get('market_lean', 'NO_MARKET')}</div><div class="kpi-sub">O {market_o_display} | U {market_u_display}<br>Fair O {fair_o_display} | U {fair_u_display}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Market / No-Vig</div><div class="kpi-value" style="font-size:16px;">{p.get('market_lean', 'NO_MARKET')}</div><div class="kpi-sub">O {market_o_display} | U {market_u_display}<br>Fair O {fair_o_display} | U {fair_u_display}<br>No-Vig O {no_vig_o_display} | U {no_vig_u_display}<br>{no_vig_note_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Sharp</div><div class="kpi-value" style="font-size:18px;">{p.get('sharp_warning', 'NONE')}</div><div class="kpi-sub">{p.get('market_agreement', '')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Line Audit</div><div class="kpi-value" style="font-size:16px;">{p.get('line_history_grade', '—')}</div><div class="kpi-sub">L10 {p.get('line_l10_avg', '—')} | HR {'' if p.get('line_recent_hit_rate') is None else str(round((p.get('line_recent_hit_rate') or 0)*100))+'%'}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Innings</div><div class="kpi-value" style="font-size:18px;">{p.get('projected_ip', '—')} IP</div><div class="kpi-sub">Pull: {p.get('early_pull_label', '—')} | Pitches {p.get('projected_pitches', '—')}</div></div>
