@@ -7289,6 +7289,83 @@ def _best_market_side_price(priced_rows, line, side):
     px, row = sorted(matches, key=lambda x: x[0])[-1]
     return px, row
 
+def _projection_side_from_projection_line(projection, line, fallback_side=None):
+    """Return the true projection side from K projection vs line.
+
+    This is intentionally separate from final action/pass logic. A card can PASS,
+    but the market agreement badge must still compare the market to the raw
+    projection side. Example: 6.69 projection vs 6.5 line = OVER. If no-vig
+    market leans UNDER, that is DISAGREE/CONFLICT, not AGREE.
+    """
+    proj = safe_float(projection, None)
+    ln = safe_float(line, None)
+    if proj is not None and ln is not None:
+        if proj > ln:
+            return "OVER"
+        if proj < ln:
+            return "UNDER"
+    fb = str(fallback_side or "").upper()
+    return fb if fb in ["OVER", "UNDER"] else "NO_MODEL_SIDE"
+
+def _market_strength_from_no_vig_probs(over_prob, under_prob):
+    if over_prob is None or under_prob is None:
+        return "NONE"
+    diff = abs(float(over_prob) - float(under_prob))
+    if diff >= 0.16:
+        return "ELITE"
+    if diff >= 0.10:
+        return "STRONG"
+    if diff >= 0.055:
+        return "MEDIUM"
+    return "LIGHT"
+
+def reconcile_market_agreement_fields(p):
+    """Final safety pass so odds, no-vig lean, and agreement badge cannot conflict.
+
+    Uses projection-vs-line as the model side for market agreement. This fixes
+    cases where the final decision is PASS or probability shrink changes labels
+    while the card still shows an Over/Under projection edge.
+    """
+    if not isinstance(p, dict):
+        return p
+    over_px = safe_float(str(p.get("market_over_odds", "")).replace("+", ""), None)
+    under_px = safe_float(str(p.get("market_under_odds", "")).replace("+", ""), None)
+    model_side = _projection_side_from_projection_line(
+        p.get("projection") or p.get("Final Projection") or p.get("K PROJ"),
+        p.get("line") if p.get("line") is not None else p.get("UD/Line"),
+        p.get("pick_side"),
+    )
+    p["projection_market_side"] = model_side
+
+    nv = no_vig_two_way(over_px, under_px)
+    if nv.get("over") is not None and nv.get("under") is not None:
+        market_lean = "OVER" if float(nv["over"]) >= float(nv["under"]) else "UNDER"
+        strength = _market_strength_from_no_vig_probs(nv.get("over"), nv.get("under"))
+        if model_side in ["OVER", "UNDER"]:
+            agreement = "AGREE" if market_lean == model_side else "DISAGREE"
+        else:
+            agreement = "NO_MODEL_SIDE"
+        p["market_lean"] = market_lean
+        p["market_strength"] = strength
+        p["market_agreement"] = agreement
+        p["market_over_implied"] = round(float(nv["over"]), 4)
+        p["market_under_implied"] = round(float(nv["under"]), 4)
+        p["market_over_no_vig"] = float(nv["over"])
+        p["market_under_no_vig"] = float(nv["under"])
+        p["market_vig"] = nv.get("vig")
+        p["market_no_vig_side_prob"] = nv.get("over") if model_side == "OVER" else nv.get("under") if model_side == "UNDER" else None
+        p["market_no_vig_note"] = f"No-vig O {_pct_display(nv.get('over'))} | U {_pct_display(nv.get('under'))} | Vig {_pct_display(nv.get('vig'))}"
+        agree_add = {"LIGHT": 6, "MEDIUM": 12, "GOOD": 10, "STRONG": 18, "ELITE": 24}
+        disagree_sub = {"LIGHT": 8, "MEDIUM": 16, "GOOD": 13, "STRONG": 25, "ELITE": 32}
+        p["market_agreement_score"] = int(round(clamp(50 + (agree_add.get(strength, 4) if agreement == "AGREE" else -disagree_sub.get(strength, 10) if agreement == "DISAGREE" else 0), 0, 100)))
+        p["market_note"] = f"Market {market_lean} {strength}; projection_side={model_side}; agreement={agreement}; over={over_px}; under={under_px}"
+        p["sharp_warning"] = "MARKET_AGREE" if agreement == "AGREE" else "MARKET_DISAGREE" if agreement == "DISAGREE" else p.get("sharp_warning", "NONE")
+    elif over_px is not None or under_px is not None:
+        p["market_lean"] = "OVER_PRICE_ONLY" if over_px is not None else "UNDER_PRICE_ONLY"
+        p["market_strength"] = "THIN"
+        p["market_agreement"] = "PARTIAL_MARKET"
+    return p
+
 def build_market_odds_intelligence(priced_rows, active_line, model_side, fair_probability=None):
     """Read sportsbook prices for OVER/UNDER and grade market agreement.
 
@@ -8221,7 +8298,8 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         priced_rows = []
         for src in [sportsbook_data, manual_market_data, sgo_data, optic_data]:
             priced_rows.extend(src.get("rows", []))
-        market_intel = build_market_odds_intelligence(priced_rows, active_line, pick_side, fair_prob)
+        market_model_side = _projection_side_from_projection_line(mean, active_line, pick_side)
+        market_intel = build_market_odds_intelligence(priced_rows, active_line, market_model_side, fair_prob)
         line_history = build_line_history_audit(recent_rows, active_line, projection=mean)
         recent_form_engine = build_recent_vs_season_form_engine(recent_rows, season_k9=profile.get("K/9"), projection=mean)
         matching_priced = []
@@ -8723,6 +8801,7 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         }
     }
     out = apply_trap_line_to_projection_row(out)
+    out = reconcile_market_agreement_fields(out)
     sharp = build_sharp_disagreement_warning(out)
     out.update(sharp)
     out = apply_official_play_filter_2_0(out)
@@ -10354,36 +10433,9 @@ def _manual_market_reconcile_pick(p2):
     under_px = safe_float(str(p2.get("market_under_odds", "")).replace("+", ""), None)
     line = safe_float(p2.get("line") if p2.get("line") is not None else p2.get("UD/Line"), None)
     proj = safe_float(p2.get("projection"), None)
-    model_side = str(p2.get("pick_side") or "").upper()
-    if model_side not in ["OVER", "UNDER"] and proj is not None and line is not None:
-        model_side = "OVER" if proj > line else "UNDER"
+    model_side = _projection_side_from_projection_line(proj, line, p2.get("pick_side"))
 
-    nv = no_vig_two_way(over_px, under_px)
-    if nv.get("over") is not None and nv.get("under") is not None:
-        market_lean = "OVER" if nv["over"] >= nv["under"] else "UNDER"
-        diff = abs(float(nv["over"]) - float(nv["under"]))
-        strength = "ELITE" if diff >= 0.16 else "STRONG" if diff >= 0.10 else "GOOD" if diff >= 0.055 else "LIGHT"
-        agreement = "AGREE" if model_side in ["OVER", "UNDER"] and market_lean == model_side else "DISAGREE" if model_side in ["OVER", "UNDER"] else "NO_MODEL_SIDE"
-        p2["market_lean"] = market_lean
-        p2["market_strength"] = strength
-        p2["market_agreement"] = agreement
-        p2["market_over_implied"] = round(float(nv["over"]), 4)
-        p2["market_under_implied"] = round(float(nv["under"]), 4)
-        p2["market_over_no_vig"] = float(nv["over"])
-        p2["market_under_no_vig"] = float(nv["under"])
-        p2["market_vig"] = nv.get("vig")
-        p2["market_no_vig_side_prob"] = nv.get("over") if model_side == "OVER" else nv.get("under") if model_side == "UNDER" else None
-        p2["market_no_vig_note"] = f"No-vig O {_pct_display(nv.get('over'))} | U {_pct_display(nv.get('under'))} | Vig {_pct_display(nv.get('vig'))}"
-        p2["market_note"] = f"Manual odds reconciled: Market {market_lean} {strength}; agreement={agreement}; over={p2.get('market_over_odds')}; under={p2.get('market_under_odds')}"
-        p2["market_agreement_score"] = 50 + ({"LIGHT": 6, "GOOD": 10, "MEDIUM": 12, "STRONG": 18, "ELITE": 24}.get(strength, 4) if agreement == "AGREE" else -{"LIGHT": 8, "GOOD": 13, "MEDIUM": 16, "STRONG": 25, "ELITE": 32}.get(strength, 10))
-        p2["market_agreement_score"] = int(round(clamp(p2["market_agreement_score"], 0, 100)))
-        p2["sharp_warning"] = "MARKET_AGREE" if agreement == "AGREE" else "MARKET_DISAGREE" if agreement == "DISAGREE" else p2.get("sharp_warning", "NONE")
-    elif over_px is not None or under_px is not None:
-        p2["market_lean"] = "OVER_PRICE_ONLY" if over_px is not None else "UNDER_PRICE_ONLY"
-        p2["market_strength"] = "THIN"
-        p2["market_agreement"] = "PARTIAL_MARKET"
-        p2["sharp_warning"] = p2.get("sharp_warning") or "NONE"
-    return p2
+    return reconcile_market_agreement_fields(p2)
 
 def _manual_market_apply_to_picks(picks, table_rows):
     by_key = {}
@@ -11846,7 +11898,7 @@ def render_kproj_pitcher_card(p):
       <div class="hr-soft"></div>
       <div class="mobile-decision-grid">
         <div class="mobile-info-card"><div class="small-muted">Integrity</div><div class="kpi-value">{p.get('decision_integrity_score', '—')}</div><div class="kpi-sub">{p.get('decision_integrity_label', '')}</div></div>
-        <div class="mobile-info-card"><div class="small-muted">Market / No-Vig</div><div class="kpi-value" style="font-size:16px;">{p.get('market_lean', 'NO_MARKET')}</div><div class="kpi-sub">O {market_o_display} | U {market_u_display}<br>Fair O {fair_o_display} | U {fair_u_display}<br>No-Vig O {no_vig_o_display} | U {no_vig_u_display}<br>{no_vig_note_display}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Market / No-Vig</div><div class="kpi-value" style="font-size:16px;">{p.get('market_lean', 'NO_MARKET')}</div><div class="kpi-sub">O {market_o_display} | U {market_u_display}<br>Fair O {fair_o_display} | U {fair_u_display}<br>No-Vig O {no_vig_o_display} | U {no_vig_u_display}<br>{no_vig_note_display}<br>Proj Side {p.get('projection_market_side', p.get('pick_side', '—'))}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Sharp</div><div class="kpi-value" style="font-size:18px;">{p.get('sharp_warning', 'NONE')}</div><div class="kpi-sub">{p.get('market_agreement', '')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Line Audit</div><div class="kpi-value" style="font-size:16px;">{p.get('line_history_grade', '—')}</div><div class="kpi-sub">L10 {p.get('line_l10_avg', '—')} | HR {'' if p.get('line_recent_hit_rate') is None else str(round((p.get('line_recent_hit_rate') or 0)*100))+'%'}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Innings</div><div class="kpi-value" style="font-size:18px;">{p.get('projected_ip', '—')} IP</div><div class="kpi-sub">Pull: {p.get('early_pull_label', '—')} | Pitches {p.get('projected_pitches', '—')}</div></div>
