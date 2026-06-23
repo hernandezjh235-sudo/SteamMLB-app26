@@ -10170,7 +10170,7 @@ def _manual_market_reconcile_pick(p2):
     if nv.get("over") is not None and nv.get("under") is not None:
         market_lean = "OVER" if nv["over"] >= nv["under"] else "UNDER"
         diff = abs(float(nv["over"]) - float(nv["under"]))
-        strength = "STRONG" if diff >= 0.10 else "MEDIUM" if diff >= 0.055 else "LIGHT"
+        strength = "ELITE" if diff >= 0.16 else "STRONG" if diff >= 0.10 else "GOOD" if diff >= 0.055 else "LIGHT"
         agreement = "AGREE" if model_side in ["OVER", "UNDER"] and market_lean == model_side else "DISAGREE" if model_side in ["OVER", "UNDER"] else "NO_MODEL_SIDE"
         p2["market_lean"] = market_lean
         p2["market_strength"] = strength
@@ -10183,7 +10183,7 @@ def _manual_market_reconcile_pick(p2):
         p2["market_no_vig_side_prob"] = nv.get("over") if model_side == "OVER" else nv.get("under") if model_side == "UNDER" else None
         p2["market_no_vig_note"] = f"No-vig O {_pct_display(nv.get('over'))} | U {_pct_display(nv.get('under'))} | Vig {_pct_display(nv.get('vig'))}"
         p2["market_note"] = f"Manual odds reconciled: Market {market_lean} {strength}; agreement={agreement}; over={p2.get('market_over_odds')}; under={p2.get('market_under_odds')}"
-        p2["market_agreement_score"] = 50 + ({"LIGHT": 6, "MEDIUM": 12, "STRONG": 18}.get(strength, 4) if agreement == "AGREE" else -{"LIGHT": 8, "MEDIUM": 16, "STRONG": 25}.get(strength, 10))
+        p2["market_agreement_score"] = 50 + ({"LIGHT": 6, "GOOD": 10, "MEDIUM": 12, "STRONG": 18, "ELITE": 24}.get(strength, 4) if agreement == "AGREE" else -{"LIGHT": 8, "GOOD": 13, "MEDIUM": 16, "STRONG": 25, "ELITE": 32}.get(strength, 10))
         p2["market_agreement_score"] = int(round(clamp(p2["market_agreement_score"], 0, 100)))
         p2["sharp_warning"] = "MARKET_AGREE" if agreement == "AGREE" else "MARKET_DISAGREE" if agreement == "DISAGREE" else p2.get("sharp_warning", "NONE")
     elif over_px is not None or under_px is not None:
@@ -23599,7 +23599,7 @@ def render_line_aware_smart_confirm_panel():
 #   BF-to-K validation, and edge bucket calibration as a final decision filter.
 # - Designed to catch workload misses like low-IP bulk arms being treated as short outings.
 # =========================
-ROLE_LEASH_DECISION_2_1_VERSION = "ROLE_LEASH_DECISION_2_1_2026_06_21"
+ROLE_LEASH_DECISION_2_1_VERSION = "ROLE_LEASH_DECISION_2_1_MARKET_TREND_BFK_CONFLICT_2026_06_22"
 
 
 def _rl21_num(x, default=None):
@@ -23860,6 +23860,231 @@ def _rl21_market(row, side):
     return "MARKET_NO_SIGNAL"
 
 
+def _rl21_american_to_implied(price):
+    """American odds parser for manual odds. Negative odds are favorites; positive odds are underdogs."""
+    v = _rl21_num(price, None)
+    if v is None or v == 0:
+        return None
+    if v > 0:
+        return 100.0 / (v + 100.0)
+    return abs(v) / (abs(v) + 100.0)
+
+
+def _rl21_no_vig(over_price, under_price):
+    o = _rl21_american_to_implied(over_price)
+    u = _rl21_american_to_implied(under_price)
+    if o is None or u is None or (o + u) <= 0:
+        return None, None, None
+    tot = o + u
+    return o / tot, u / tot, tot - 1.0
+
+
+def _rl21_find_odds(row):
+    over = None
+    under = None
+    for c in ["market_over_odds", "Over Odds", "over_odds", "Manual Over Odds", "OverOdds"]:
+        over = _rl21_num(row.get(c), None)
+        if over is not None:
+            break
+    for c in ["market_under_odds", "Under Odds", "under_odds", "Manual Under Odds", "UnderOdds"]:
+        under = _rl21_num(row.get(c), None)
+        if under is not None:
+            break
+    return over, under
+
+
+def _rl21_market_strength_score(row, side):
+    """Score how forcefully the saved odds/no-vig market supports or opposes the model side.
+    This does not change K/IP projections; it is a decision/confidence layer only.
+    """
+    over_px, under_px = _rl21_find_odds(row)
+    no_vig_o, no_vig_u, vig = _rl21_no_vig(over_px, under_px)
+
+    if no_vig_o is None or no_vig_u is None:
+        # Fallback to existing labels when paired odds were not saved.
+        status = _rl21_market(row, side)
+        if status == "MARKET_CONFIRMS":
+            return 58, "MARKET_STRENGTH_LABEL_ONLY_CONFIRMS", None, None, vig
+        if status == "MARKET_DISAGREES":
+            return 38, "MARKET_STRENGTH_LABEL_ONLY_DISAGREES", None, None, vig
+        return 50, "MARKET_STRENGTH_NO_ODDS", None, None, vig
+
+    market_side = "OVER" if no_vig_o >= no_vig_u else "UNDER"
+    side_prob = no_vig_o if side == "OVER" else no_vig_u if side == "UNDER" else None
+    gap = abs(no_vig_o - no_vig_u)
+
+    if gap >= 0.16:
+        tier = "ELITE"
+    elif gap >= 0.10:
+        tier = "STRONG"
+    elif gap >= 0.055:
+        tier = "GOOD"
+    elif gap >= 0.025:
+        tier = "LIGHT"
+    else:
+        tier = "NEUTRAL"
+
+    # 50 is neutral. Above 50 supports the model side; below 50 fights it.
+    if side in ("OVER", "UNDER") and market_side == side:
+        score = 50 + min(45, gap * 220)
+        label = f"MARKET_{tier}_CONFIRMS_{side}"
+    elif side in ("OVER", "UNDER"):
+        score = 50 - min(45, gap * 240)
+        label = f"MARKET_{tier}_DISAGREES_{side}"
+    else:
+        score = 50
+        label = f"MARKET_{tier}_NO_MODEL_SIDE"
+    return round(float(max(0, min(100, score))), 1), label, no_vig_o, no_vig_u, vig
+
+
+def _rl21_parse_last_k_results(row):
+    """Return recent K results oldest -> newest when possible."""
+    raw = None
+    for c in ["TPC Last K Results", "Last K Results", "last_k_results", "Recent K Results", "K Results"]:
+        if row.get(c) not in (None, "", "—"):
+            raw = row.get(c)
+            break
+    vals = []
+    if raw is not None:
+        if isinstance(raw, (list, tuple)):
+            items = raw
+        else:
+            s = str(raw).replace("[", "").replace("]", "").replace(";", ",")
+            items = s.split(",")
+        for it in items:
+            v = _rl21_num(str(it).strip(), None)
+            if v is not None:
+                vals.append(float(v))
+    return vals
+
+
+def _rl21_trend_direction_score(row, line=None, side=None):
+    vals = _rl21_parse_last_k_results(row)
+    if len(vals) < 3:
+        # Fallback from recent label only.
+        rf = str(row.get("Recent Form") or row.get("recent_vs_season_flag") or "").upper()
+        if any(x in rf for x in ["HOT", "BUY_LOW", "OVER"]):
+            return 62, "TREND_UP_LABEL_ONLY", None, None, None
+        if any(x in rf for x in ["DIP", "SELL", "UNDER"]):
+            return 38, "TREND_DOWN_LABEL_ONLY", None, None, None
+        return 50, "TREND_NO_SAMPLE", None, None, None
+
+    last5 = vals[-5:]
+    last3 = vals[-3:]
+    older = vals[:-3] if len(vals) > 3 else vals[:1]
+    avg5 = sum(last5) / len(last5)
+    avg3 = sum(last3) / len(last3)
+    older_avg = sum(older) / len(older) if older else avg5
+    slope = avg3 - older_avg
+
+    # Weighted recency: newest matters most.
+    weights = list(range(1, len(last5) + 1))
+    wavg = sum(v * w for v, w in zip(last5, weights)) / sum(weights)
+
+    score = 50 + slope * 8.0
+    label = "TREND_NEUTRAL"
+    if slope >= 0.75:
+        label = "TREND_UP_STRONG"
+    elif slope >= 0.30:
+        label = "TREND_UP"
+    elif slope <= -0.75:
+        label = "TREND_DOWN_STRONG"
+    elif slope <= -0.30:
+        label = "TREND_DOWN"
+
+    # Extra context relative to the prop line.
+    ln = _rl21_num(line, None)
+    if ln is not None and side in ("OVER", "UNDER"):
+        recent_clear = sum(1 for v in last5 if (v > ln if side == "OVER" else v < ln)) / len(last5)
+        if side == "OVER" and recent_clear >= 0.70:
+            score += 5
+        elif side == "OVER" and recent_clear <= 0.30:
+            score -= 7
+        elif side == "UNDER" and recent_clear >= 0.70:
+            score += 5
+        elif side == "UNDER" and recent_clear <= 0.30:
+            score -= 7
+    return round(float(max(0, min(100, score))), 1), label, round(avg3, 2), round(avg5, 2), round(wavg, 2)
+
+
+def _rl21_bf_to_k_conversion_score(row, proj=None):
+    """Recent/season K per BF conversion projection. Extension of BF-K validation, not a replacement."""
+    exp_bf = _rl21_num(row.get("Exp BF"), None)
+    if exp_bf is None:
+        exp_bf = _rl21_num(row.get("Projected BF"), None)
+    vals = _rl21_parse_last_k_results(row)
+    recent5_bf = _rl21_num(row.get("TPC Recent5 Avg BF"), None)
+    season_bf = _rl21_num(row.get("TPC Season Avg BF"), None)
+    season_k = _rl21_num(row.get("TPC Season Avg K"), None)
+
+    projections = []
+    notes = []
+    if exp_bf is not None and recent5_bf is not None and recent5_bf > 0 and vals:
+        recent_avg_k = sum(vals[-5:]) / min(5, len(vals))
+        conv = recent_avg_k / recent5_bf
+        projections.append(exp_bf * conv)
+        notes.append(f"RECENT_BF_CONV_{conv:.3f}")
+    if exp_bf is not None and season_bf is not None and season_bf > 0 and season_k is not None:
+        conv = season_k / season_bf
+        projections.append(exp_bf * conv)
+        notes.append(f"SEASON_BF_CONV_{conv:.3f}")
+
+    # Fallback to existing blended BF-K expected model.
+    fallback, status = _rl21_expected_k_from_bf(row)
+    if fallback is not None:
+        projections.append(float(fallback))
+        notes.append(status)
+
+    if not projections:
+        return None, None, "BFK_CONVERSION_NO_DATA", None
+
+    # Weight recent/season/fallback conservatively.
+    conv_proj = sum(projections) / len(projections)
+    p = _rl21_num(proj, None)
+    gap = None if p is None else round(float(p) - float(conv_proj), 2)
+    if gap is None:
+        label = "BFK_CONVERSION_REFERENCE"
+    elif abs(gap) <= 0.65:
+        label = "BFK_CONVERSION_SUPPORTS"
+    elif gap > 1.25:
+        label = "BFK_CONVERSION_PROJECTION_HIGH"
+    elif gap < -1.25:
+        label = "BFK_CONVERSION_PROJECTION_LOW"
+    else:
+        label = "BFK_CONVERSION_NEUTRAL"
+    return round(float(conv_proj), 2), gap, label, "+".join(notes)
+
+
+def _rl21_conflict_score(row, side, market_label, trend_label, bf_label, bf_conv_label, workload_label, line_diff):
+    """Unified conflict score: projection vs market vs recent form vs workload/BF signals."""
+    pts = 0
+    reasons = []
+    for lab in [market_label, trend_label, bf_label, bf_conv_label, workload_label, line_diff]:
+        s = str(lab or "").upper()
+        if any(x in s for x in ["DISAGREE", "DANGER", "RED_FLAG", "AGAINST", "EXPENSIVE"]):
+            pts += 2; reasons.append(s)
+        elif any(x in s for x in ["WARNING", "DOWN_STRONG", "PROJECTION_HIGH", "PROJECTION_LOW"]):
+            pts += 1.5; reasons.append(s)
+        elif "TREND_DOWN" in s and side == "OVER":
+            pts += 1.5; reasons.append(s)
+        elif "TREND_UP" in s and side == "UNDER":
+            pts += 1.5; reasons.append(s)
+    rf = str(row.get("Recent Form") or "").upper()
+    if side == "OVER" and any(x in rf for x in ["RECENT_UNDER", "DIP", "SELL"]):
+        pts += 1; reasons.append("RECENT_FORM_FIGHTS_OVER")
+    if side == "UNDER" and any(x in rf for x in ["HOT", "BUY_LOW", "RECENT_OVER"]):
+        pts += 1; reasons.append("RECENT_FORM_FIGHTS_UNDER")
+    if pts >= 5:
+        label = "CONFLICT_HIGH"
+    elif pts >= 3:
+        label = "CONFLICT_MEDIUM"
+    elif pts >= 1.5:
+        label = "CONFLICT_LOW"
+    else:
+        label = "CONFLICT_CLEAN"
+    return round(float(min(10, pts)), 1), label, "+".join(reasons[:6]) if reasons else "NO_MAJOR_CONFLICTS"
+
+
 def _rl21_decision(row):
     proj = _rl21_num(row.get("Line-Aware Smart Final K Projection"), _rl21_num(row.get("K PROJ"), None))
     line = _rl21_num(row.get("UD/Line"), None)
@@ -23876,10 +24101,14 @@ def _rl21_decision(row):
     line_diff = _rl21_line_difficulty(row, side)
     line_move, line_delta = _rl21_line_move(row, side)
     market = _rl21_market(row, side)
+    market_strength_score, market_strength_label, no_vig_o, no_vig_u, market_vig = _rl21_market_strength_score(row, side)
+    trend_score, trend_label, trend_l3, trend_l5, trend_weighted = _rl21_trend_direction_score(row, line=line, side=side)
+    bf_conv_proj, bf_conv_gap, bf_conv_label, bf_conv_note = _rl21_bf_to_k_conversion_score(row, proj=proj)
+    conflict_score, conflict_label, conflict_reason = _rl21_conflict_score(row, side, market_strength_label, trend_label, bf_label, bf_conv_label, workload_label, line_diff)
 
     warnings = []
     confirms = []
-    for lab in [bf_label, workload_label, line_diff, line_move, market]:
+    for lab in [bf_label, bf_conv_label, workload_label, line_diff, line_move, market, market_strength_label, trend_label, conflict_label]:
         if any(x in str(lab) for x in ["WARNING", "DANGER", "DISAGREE", "AGAINST", "EXPENSIVE", "RED_FLAG"]):
             warnings.append(lab)
         if any(x in str(lab) for x in ["SUPPORTS", "VALUE", "FAVORS", "CONFIRMS"]):
@@ -23918,7 +24147,15 @@ def _rl21_decision(row):
     else:
         dec = "🚫 PASS — NO SIDE"
 
-    if market == "MARKET_CONFIRMS" and "LEAN" in dec and abs_edge >= 0.75 and not warnings:
+    # Unified conflict protection. This is intentionally decision-only and does not change K/IP projection math.
+    if conflict_label == "CONFLICT_HIGH" and "🔥" in dec:
+        dec = dec.replace("🔥", "⚠️") + " / HIGH CONFLICT"
+    elif conflict_label == "CONFLICT_HIGH" and "LEAN" in dec:
+        dec = "🚫 PASS — HIGH CONFLICT"
+    elif conflict_label == "CONFLICT_MEDIUM" and "🔥" in dec and abs_edge < 1.50:
+        dec = dec.replace("🔥", "⚠️") + " / CONFLICT"
+
+    if market == "MARKET_CONFIRMS" and "LEAN" in dec and abs_edge >= 0.75 and not warnings and conflict_label in ("CONFLICT_CLEAN", "CONFLICT_LOW"):
         dec = dec.replace("⚠️", "🔥").replace(" LEAN", " — MARKET CONFIRMS")
 
     info = {
@@ -23937,13 +24174,33 @@ def _rl21_decision(row):
         "line_move": line_move,
         "line_delta": line_delta,
         "market": market,
+        "market_strength_score": market_strength_score,
+        "market_strength_label": market_strength_label,
+        "no_vig_over": None if no_vig_o is None else round(float(no_vig_o), 4),
+        "no_vig_under": None if no_vig_u is None else round(float(no_vig_u), 4),
+        "market_vig": None if market_vig is None else round(float(market_vig), 4),
+        "trend_score": trend_score,
+        "trend_label": trend_label,
+        "trend_l3": trend_l3,
+        "trend_l5": trend_l5,
+        "trend_weighted": trend_weighted,
+        "bf_conv_proj": bf_conv_proj,
+        "bf_conv_gap": bf_conv_gap,
+        "bf_conv_label": bf_conv_label,
+        "bf_conv_note": bf_conv_note,
+        "conflict_score": conflict_score,
+        "conflict_label": conflict_label,
+        "conflict_reason": conflict_reason,
         "warnings": len(warnings),
         "confirms": len(confirms),
     }
     reason = (
         f"edge {edge:+.2f} ({bucket}); role={role_status}; workload={workload_label}; "
         f"leash={leash_score} {leash_label}; BF-K expected={exp_k if exp_k is not None else 'NA'} "
-        f"gap={bf_gap if bf_gap is not None else 'NA'} {bf_label}; {line_diff}; {line_move}; {market}; "
+        f"gap={bf_gap if bf_gap is not None else 'NA'} {bf_label}; "
+        f"BF-K conversion={bf_conv_proj if bf_conv_proj is not None else 'NA'} {bf_conv_label}; "
+        f"trend={trend_score} {trend_label}; market_strength={market_strength_score} {market_strength_label}; "
+        f"conflict={conflict_score} {conflict_label}; {line_diff}; {line_move}; {market}; "
         f"warnings={len(warnings)} confirms={len(confirms)}"
     )
     return dec, edge, reason, info
@@ -23958,6 +24215,10 @@ def _rl21_apply(df):
     workload, role_statuses, role_reasons = [], [], []
     leash_scores, leash_labels, leash_reasons = [], [], []
     line_diffs, line_moves, markets = [], [], []
+    market_strength_scores, market_strength_labels, no_vig_overs, no_vig_unders, market_vigs = [], [], [], [], []
+    trend_scores, trend_labels, trend_l3s, trend_l5s, trend_weighteds = [], [], [], [], []
+    bf_conv_projs, bf_conv_gaps, bf_conv_labels, bf_conv_notes = [], [], [], []
+    conflict_scores, conflict_labels, conflict_reasons = [], [], []
 
     for _, rr in d.iterrows():
         dec, edge, reason, info = _rl21_decision(rr.to_dict())
@@ -23966,6 +24227,11 @@ def _rl21_apply(df):
         workload.append(info.get("workload_label", "")); role_statuses.append(info.get("role_status", "")); role_reasons.append(info.get("role_reason", ""))
         leash_scores.append(info.get("leash_score", "")); leash_labels.append(info.get("leash_label", "")); leash_reasons.append(info.get("leash_reason", ""))
         line_diffs.append(info.get("line_diff", "")); line_moves.append(info.get("line_move", "")); markets.append(info.get("market", ""))
+        market_strength_scores.append(info.get("market_strength_score", "")); market_strength_labels.append(info.get("market_strength_label", ""))
+        no_vig_overs.append(info.get("no_vig_over", "")); no_vig_unders.append(info.get("no_vig_under", "")); market_vigs.append(info.get("market_vig", ""))
+        trend_scores.append(info.get("trend_score", "")); trend_labels.append(info.get("trend_label", "")); trend_l3s.append(info.get("trend_l3", "")); trend_l5s.append(info.get("trend_l5", "")); trend_weighteds.append(info.get("trend_weighted", ""))
+        bf_conv_projs.append(info.get("bf_conv_proj", "")); bf_conv_gaps.append(info.get("bf_conv_gap", "")); bf_conv_labels.append(info.get("bf_conv_label", "")); bf_conv_notes.append(info.get("bf_conv_note", ""))
+        conflict_scores.append(info.get("conflict_score", "")); conflict_labels.append(info.get("conflict_label", "")); conflict_reasons.append(info.get("conflict_reason", ""))
 
     d["Edge Bucket 2.1"] = buckets
     d["BF-K Expected K 2.1"] = expks
@@ -23980,6 +24246,23 @@ def _rl21_apply(df):
     d["Line Difficulty Signal 2.1"] = line_diffs
     d["Line Movement Signal 2.1"] = line_moves
     d["Market Advisor Signal 2.1"] = markets
+    d["Market Strength Score 2.2"] = market_strength_scores
+    d["Market Strength Label 2.2"] = market_strength_labels
+    d["No-Vig Over 2.2"] = no_vig_overs
+    d["No-Vig Under 2.2"] = no_vig_unders
+    d["Market Vig 2.2"] = market_vigs
+    d["Trend Direction Score 2.2"] = trend_scores
+    d["Trend Direction Label 2.2"] = trend_labels
+    d["Trend L3 Avg 2.2"] = trend_l3s
+    d["Trend L5 Avg 2.2"] = trend_l5s
+    d["Trend Weighted Avg 2.2"] = trend_weighteds
+    d["BF-to-K Conversion Projection 2.2"] = bf_conv_projs
+    d["BF-to-K Conversion Gap 2.2"] = bf_conv_gaps
+    d["BF-to-K Conversion Label 2.2"] = bf_conv_labels
+    d["BF-to-K Conversion Note 2.2"] = bf_conv_notes
+    d["Conflict Score 2.2"] = conflict_scores
+    d["Conflict Label 2.2"] = conflict_labels
+    d["Conflict Reason 2.2"] = conflict_reasons
     d["Decision 2.1 Reason"] = reasons
     d["Decision 2.1 Version"] = ROLE_LEASH_DECISION_2_1_VERSION
     d["Pre-Decision 2.1"] = d.get("Line-Aware Smart Decision", d.get("Decision", ""))
