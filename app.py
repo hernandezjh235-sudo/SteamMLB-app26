@@ -9976,10 +9976,10 @@ def compute_slate_quality_score(picks):
 
     # Risk signals: capped so one noisy slate cannot auto-drop to 0 when it still
     # contains many good plays.
-    score -= min(14, opener_bulk * 0.7)
+    score -= min(10, opener_bulk * 0.45)
     score -= min(10, low_leash * 0.8)
     score -= min(8, thin_edge * 0.8)
-    score -= min(10, low_ip * 0.6)
+    score -= min(6, low_ip * 0.35)
     score -= min(8, unknown_role * 0.8)
     score -= min(6, high_line_difficulty * 0.7)
     score -= min(5, no_line * 0.5)
@@ -9999,8 +9999,10 @@ def compute_slate_quality_score(picks):
         score = max(score, 56)
     elif strong_edge >= 7 and (avg_conf >= 55 or official_like >= 4):
         score = max(score, 47)
+    elif strong_edge >= 6 and playable_edge >= 10:
+        score = max(score, 52)
     elif strong_edge >= 5 and playable_edge >= 10:
-        score = max(score, 42)
+        score = max(score, 47)
 
     score = max(0, min(100, int(round(score))))
 
