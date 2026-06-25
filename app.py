@@ -9654,18 +9654,131 @@ def _latest_matching_pick_for_manual_grade(picks, pitcher_name, date_value=None,
         return (str(row.get("official_snapshot_saved_at") or row.get("created_at") or ""), i)
     return sorted(candidates, key=key)[-1]
 
+
+def _parse_manual_pick_side_line(value):
+    """Parse Pick values like 'O 4.5', 'U 5.5', 'OVER 6.5', 'UNDER 3.5', or NL."""
+    import re
+    txt = str(value or "").strip().upper().replace("OVER", "O").replace("UNDER", "U")
+    if not txt or txt in ["NL", "NO LINE", "NO_LINE", "PASS"]:
+        return None, None
+    side = None
+    if txt.startswith("O"):
+        side = "OVER"
+    elif txt.startswith("U"):
+        side = "UNDER"
+    m = re.search(r"([0-9]+(?:\.[0-9]+)?)", txt)
+    line = safe_float(m.group(1), None) if m else None
+    return side, line
+
+def _manual_grade_result_from_row(row, colmap, actual, side, line):
+    """Use Result column if present; otherwise compute from side/line/actual."""
+    result_col = None
+    for c in row.index:
+        if normalize_name(c).replace(" ", "_") in ["result", "grade", "outcome"]:
+            result_col = c
+            break
+    if result_col is not None:
+        raw = str(row.get(result_col) or "").strip().upper()
+        if raw in ["WIN", "W", "✅", "HIT", "CASH"]:
+            return "WIN", True
+        if raw in ["LOSS", "LOSE", "L", "❌", "MISS"]:
+            return "LOSS", False
+        if raw in ["PUSH", "VOID", "NL", "NO LINE", "NO_LINE"]:
+            return raw.replace(" ", "_"), None
+    if line is not None and side in ["OVER", "UNDER"] and actual is not None:
+        win = actual > line if side == "OVER" else actual < line
+        return ("WIN" if win else "LOSS"), bool(win)
+    return "NO_LINE", None
+
+def _manual_grade_synthetic_row(row, colmap, result_ids):
+    """Create a RESULT_LOG row directly from a recovered grade CSV when old before-snapshots are gone."""
+    pitcher = str(row.get(colmap["pitcher"]) or "").strip()
+    actual = safe_float(row.get(colmap["actual"]), None)
+    if not pitcher or actual is None:
+        return None, "missing_pitcher_or_actual"
+    date_value = row.get(colmap.get("date")) if colmap.get("date") else ""
+    actual_ip = _parse_manual_ip(row.get(colmap["actual_ip"])) if colmap.get("actual_ip") else None
+
+    # Side/line can come from Pick column like O 4.5, or separate line/side columns.
+    pick_raw = row.get(colmap.get("pick_side")) if colmap.get("pick_side") else ""
+    side, line = _parse_manual_pick_side_line(pick_raw)
+    if line is None and colmap.get("line"):
+        line = safe_float(row.get(colmap["line"]), None)
+    if side is None and colmap.get("pick_side"):
+        raw_side = str(row.get(colmap["pick_side"]) or "").upper()
+        if raw_side.startswith("O"):
+            side = "OVER"
+        elif raw_side.startswith("U"):
+            side = "UNDER"
+
+    graded_result, win = _manual_grade_result_from_row(row, colmap, actual, side, line)
+
+    # If no projection was recovered, use the line as a neutral placeholder so Calibration/Learning tabs populate.
+    # It is clearly marked as recovered-only and DOES NOT change future projections.
+    projection = line if line is not None else actual
+    rec = {
+        "pick_id": f"manual_recovered::{str(date_value)[:10]}::{normalize_name(pitcher)}::{side or 'NO_SIDE'}::{line if line is not None else 'NL'}",
+        "date": str(date_value)[:10],
+        "pitcher": pitcher,
+        "pitcher_id": "",
+        "market": "pitcher_ks",
+        "prop_type": "pitcher_ks",
+        "pick_side": side or "NO_LINE",
+        "line": line,
+        "final_line": line,
+        "projection": projection,
+        "final_projection": projection,
+        "opening_projection": projection,
+        "actual": actual,
+        "actual_ip": actual_ip,
+        "graded": True,
+        "graded_at": now_iso(),
+        "graded_result": graded_result,
+        "win": win,
+        "grading_source": "MANUAL_RECOVERED_CSV_NO_SNAPSHOT",
+        "actual_result_source": "MANUAL_RECOVERED_CSV",
+        "line_source": "RECOVERED_CSV",
+        "data_score": 50,
+        "risk_label": "RECOVERED_ONLY",
+        "lineup_locked": False,
+        "price_is_real": False,
+        "abs_edge": None if line is None or projection is None else abs(float(projection) - float(line)),
+        "fair_probability": 0.5,
+        "ev": None,
+        "note": "Recovered grade imported without old before-game snapshot. Projection placeholder=line; use for win/loss learning backup only.",
+    }
+    if actual_ip is not None:
+        rec["actual_ip"] = actual_ip
+    if projection is not None:
+        rec["final_projection_error"] = round(actual - projection, 2)
+        rec["opening_projection_error"] = round(actual - projection, 2)
+        rec["projection_drift"] = 0.0
+        try:
+            rec["projection_drift_label"] = projection_drift_label(projection, projection, actual)
+        except Exception:
+            pass
+    key = _grade_result_key(rec)
+    if key in result_ids:
+        return None, "duplicate"
+    return rec, None
+
 def grade_finished_games_from_manual_dataframe(manual_df, allow_overwrite=False):
     """
-    Secure manual fallback: user uploads/pastes actual outcomes, then we match them to
-    saved official before-game snapshots and write the same RESULT_LOG learning rows as
-    the automatic MLB boxscore grader. This makes Learning Lab read real graded outcomes.
+    Manual grading import.
+
+    FIXED: Old version required saved before-game snapshots and therefore imported 0 rows
+    after Streamlit wiped the snapshot file. This version first tries to match snapshots;
+    if none exist, it creates recovered RESULT_LOG rows directly from the CSV so Learning
+    Lab / Calibration Audit can use the grade history again.
     """
     diag = {
         "status": "NO_DATA",
         "manual_rows": 0,
         "matched": 0,
         "graded": 0,
+        "synthetic_recovered_added": 0,
         "already_graded_skipped": 0,
+        "duplicates_skipped": 0,
         "unmatched_pitchers": [],
         "missing_actual_k": [],
         "pick_log_path": PICK_LOG,
@@ -9687,109 +9800,108 @@ def grade_finished_games_from_manual_dataframe(manual_df, allow_overwrite=False)
 
     for _, row in manual_df.iterrows():
         pitcher = row.get(colmap["pitcher"])
-        actual = safe_float(row.get(colmap["actual"]))
+        actual = safe_float(row.get(colmap["actual"]), None)
         if actual is None:
             diag["missing_actual_k"].append(str(pitcher))
             continue
         date_value = row.get(colmap.get("date")) if colmap.get("date") else None
         match = _latest_matching_pick_for_manual_grade(picks, pitcher, date_value=date_value, allow_overwrite=allow_overwrite)
-        if not match:
-            diag["unmatched_pitchers"].append(str(pitcher))
+
+        # Path A: normal snapshot match.
+        if match:
+            idx, p = match
+            if p.get("graded") and not allow_overwrite:
+                diag["already_graded_skipped"] += 1
+                continue
+            diag["matched"] += 1
+            p["actual"] = actual
+            if colmap.get("actual_ip"):
+                aip = _parse_manual_ip(row.get(colmap["actual_ip"]))
+                if aip is not None:
+                    p["actual_ip"] = aip
+            for src_key, dest_key in [
+                ("actual_bf", "actual_bf"), ("actual_er", "actual_er"),
+                ("actual_hits", "actual_hits"), ("actual_bb", "actual_bb"),
+                ("actual_pitches", "actual_pitches"), ("actual_hr", "actual_hr"),
+            ]:
+                if colmap.get(src_key):
+                    val = safe_float(row.get(colmap[src_key]))
+                    if val is not None:
+                        p[dest_key] = val
+            p["graded"] = True
+            p["graded_at"] = now_iso()
+            p["grading_source"] = "MANUAL_ACTUAL_IMPORT"
+            p["actual_result_source"] = "MANUAL_IMPORT"
+            p["final_projection"] = p.get("final_projection", p.get("projection"))
+            p["final_line"] = p.get("final_line", p.get("line"))
+            p["projection_drift"] = None if safe_float(p.get("opening_projection")) is None or safe_float(p.get("final_projection")) is None else round(safe_float(p.get("final_projection")) - safe_float(p.get("opening_projection")), 2)
+            p["final_projection_error"] = None if safe_float(p.get("actual")) is None or safe_float(p.get("final_projection")) is None else round(safe_float(p.get("actual")) - safe_float(p.get("final_projection")), 2)
+            p["opening_projection_error"] = None if safe_float(p.get("actual")) is None or safe_float(p.get("opening_projection")) is None else round(safe_float(p.get("actual")) - safe_float(p.get("opening_projection")), 2)
+            try:
+                p["projection_drift_label"] = projection_drift_label(p.get("opening_projection"), p.get("final_projection"), p.get("actual"))
+            except Exception:
+                pass
+            line = safe_float(p.get("line"))
+            side = str(p.get("pick_side") or "").upper()
+            if line is not None and side in ["OVER", "UNDER"]:
+                win = (actual > line) if side == "OVER" else (actual < line)
+                p["win"] = bool(win)
+                p["graded_result"] = "WIN" if win else "LOSS"
+            else:
+                p["win"] = None
+                p["graded_result"] = "NO LINE"
+            p["new_learning_scale"] = round(update_learning(p["pitcher_id"], p.get("projection"), actual), 3) if p.get("pitcher_id") else None
+            for fn in [update_deep_context_learning_after_grade, update_k_miss_reason_learning, update_volume_miss_learning_after_grade, update_manager_pull_learning_after_grade]:
+                try:
+                    extra = fn(p)
+                    if isinstance(extra, dict):
+                        p.update(extra)
+                except Exception as _e:
+                    p[f"{getattr(fn, '__name__', 'learning')}_error"] = str(_e)[:120]
+            picks[idx] = p
+            grade_key = _grade_result_key(p)
+            if grade_key not in result_ids:
+                results.append(dict(p))
+                result_ids.add(grade_key)
+            elif allow_overwrite:
+                for j, rr in enumerate(results):
+                    if _grade_result_key(rr) == grade_key:
+                        results[j] = dict(p)
+                        break
+            diag["graded"] += 1
             continue
-        idx, p = match
-        if p.get("graded") and not allow_overwrite:
-            diag["already_graded_skipped"] += 1
-            continue
-        diag["matched"] += 1
-        p["actual"] = actual
-        if colmap.get("actual_ip"):
-            aip = _parse_manual_ip(row.get(colmap["actual_ip"]))
-            if aip is not None:
-                p["actual_ip"] = aip
-        if colmap.get("actual_bf"):
-            abf = safe_float(row.get(colmap["actual_bf"]))
-            if abf is not None:
-                p["actual_bf"] = abf
-        if colmap.get("actual_er"):
-            aer = safe_float(row.get(colmap["actual_er"]))
-            if aer is not None:
-                p["actual_er"] = aer
-        if colmap.get("actual_hits"):
-            ah = safe_float(row.get(colmap["actual_hits"]))
-            if ah is not None:
-                p["actual_hits"] = ah
-        if colmap.get("actual_bb"):
-            abb = safe_float(row.get(colmap["actual_bb"]))
-            if abb is not None:
-                p["actual_bb"] = abb
-        if colmap.get("actual_pitches"):
-            apc = safe_float(row.get(colmap["actual_pitches"]))
-            if apc is not None:
-                p["actual_pitches"] = apc
-        if colmap.get("actual_hr"):
-            ahr = safe_float(row.get(colmap["actual_hr"]))
-            if ahr is not None:
-                p["actual_hr"] = ahr
-        # Manual grading metadata.
-        p["graded"] = True
-        p["graded_at"] = now_iso()
-        p["grading_source"] = "MANUAL_ACTUAL_IMPORT"
-        p["actual_result_source"] = "MANUAL_IMPORT"
-        p["final_projection"] = p.get("final_projection", p.get("projection"))
-        p["final_line"] = p.get("final_line", p.get("line"))
-        p["projection_drift"] = None if safe_float(p.get("opening_projection")) is None or safe_float(p.get("final_projection")) is None else round(safe_float(p.get("final_projection")) - safe_float(p.get("opening_projection")), 2)
-        p["final_projection_error"] = None if safe_float(p.get("actual")) is None or safe_float(p.get("final_projection")) is None else round(safe_float(p.get("actual")) - safe_float(p.get("final_projection")), 2)
-        p["opening_projection_error"] = None if safe_float(p.get("actual")) is None or safe_float(p.get("opening_projection")) is None else round(safe_float(p.get("actual")) - safe_float(p.get("opening_projection")), 2)
-        try:
-            p["projection_drift_label"] = projection_drift_label(p.get("opening_projection"), p.get("final_projection"), p.get("actual"))
-        except Exception:
-            pass
-        line = safe_float(p.get("line"))
-        side = str(p.get("pick_side") or "").upper()
-        if line is not None and side in ["OVER", "UNDER"]:
-            win = (actual > line) if side == "OVER" else (actual < line)
-            p["win"] = bool(win)
-            p["graded_result"] = "WIN" if win else "LOSS"
+
+        # Path B: RECOVERY MODE. No snapshot found; add direct RESULT_LOG row.
+        rec, reason = _manual_grade_synthetic_row(row, colmap, result_ids)
+        if rec is not None:
+            results.append(rec)
+            result_ids.add(_grade_result_key(rec))
+            diag["graded"] += 1
+            diag["synthetic_recovered_added"] += 1
         else:
-            p["win"] = None
-            p["graded_result"] = "NO LINE"
-        p["new_learning_scale"] = round(update_learning(p["pitcher_id"], p.get("projection"), actual), 3) if p.get("pitcher_id") else None
-        try:
-            update_deep_context_learning_after_grade(p)
-        except Exception as _e:
-            p["deep_learning_update_error"] = str(_e)[:160]
-        try:
-            _miss_info = update_k_miss_reason_learning(p)
-            p.update(_miss_info)
-        except Exception as _e:
-            p["miss_reason"] = p.get("miss_reason") or "UNCLASSIFIED"
-            p["miss_reason_detail"] = str(_e)[:120]
-        try:
-            _volume_info = update_volume_miss_learning_after_grade(p)
-            p.update(_volume_info)
-        except Exception as _e:
-            p["volume_miss_label"] = p.get("volume_miss_label") or "UNCLASSIFIED"
-            p["volume_learning_detail"] = str(_e)[:120]
-        try:
-            _mgr_info = update_manager_pull_learning_after_grade(p)
-            p.update(_mgr_info)
-        except Exception as _e:
-            p["manager_pull_learning_error"] = str(_e)[:120]
-        picks[idx] = p
-        grade_key = _grade_result_key(p)
-        if grade_key not in result_ids:
-            results.append(dict(p))
-            result_ids.add(grade_key)
-        else:
-            # Keep RESULT_LOG in sync if overwriting.
-            for j, rr in enumerate(results):
-                if rr.get("pick_id") == p.get("pick_id"):
-                    results[j] = dict(p)
-                    break
-        diag["graded"] += 1
+            if reason == "duplicate":
+                diag["duplicates_skipped"] += 1
+            else:
+                diag["unmatched_pitchers"].append(str(pitcher))
 
     save_json(PICK_LOG, picks[-10000:])
     save_json(RESULT_LOG, results[-10000:])
+    try:
+        build_model_calibration_profile(results)
+    except Exception:
+        pass
+    try:
+        rebuild_manager_pull_learning_from_results_v11_21(results=results, merge_existing=True)
+    except Exception:
+        pass
+    try:
+        write_safe_backup(reason="manual_grade_import")
+    except Exception:
+        pass
+    try:
+        st.session_state["graded_history"] = _learning_lab_normalize_results_df(pd.DataFrame(results))
+    except Exception:
+        pass
     diag["status"] = "OK"
     diag["results_after"] = len(results)
     diag["saved_snapshots"] = len(picks)
@@ -27412,3 +27524,271 @@ def ml_build_board(board):
         df = df.sort_values('ML Edge %', ascending=False)
     return df
 
+
+
+
+
+# ============================================================
+# EMBEDDED 96 RECOVERED GRADES AUTO IMPORT
+# Added so you DO NOT have to upload the CSV. It writes recovered
+# rows directly into RESULT_LOG. It does NOT need saved snapshots.
+# ============================================================
+try:
+    import io as _embedded_io
+    import re as _embedded_re
+
+    EMBEDDED_HISTORICAL_GRADES_CSV = r"""Date,Pitcher,Pick,Actual_K,Actual_IP,Result
+2026-06-15,Chase Burns,O 7.5,7,5.0,LOSS
+2026-06-15,MacKenzie Gore,O 5.5,10,7.0,WIN
+2026-06-15,Dustin May,O 4.5,9,9.0,WIN
+2026-06-15,Ryan Gusto,U 3.5,1,3.1,WIN
+2026-06-15,J.T. Ginn,U 4.5,3,6.0,WIN
+2026-06-15,Zack Wheeler,O 6.5,9,6.0,WIN
+2026-06-15,Shota Imanaga,U 6.5,3,5.2,WIN
+2026-06-15,Ryne Nelson,U 4.5,5,7.0,LOSS
+2026-06-15,Jared Jones,NL,4,4.0,NL
+2026-06-15,Nick Martinez,O 3.5,6,5.1,WIN
+2026-06-15,Eric Lauer,U 3.5,4,6.0,LOSS
+2026-06-15,Andrew Alvarez,U 4.5,5,4.0,LOSS
+2026-06-15,Mitch Spence,U 3.5,1,4.0,WIN
+2026-06-15,Michael Lorenzen,U 4.5,5,5.0,LOSS
+2026-06-15,Walbert Ureña,U 4.5,3,7.0,WIN
+2026-06-15,Tobias Myers,U 2.5,1,1.1,WIN
+2026-06-16,Framber Valdez,O 4.5,6,6.0,WIN
+2026-06-16,Hunter Brown,O 6.5,7,5.2,WIN
+2026-06-16,Michael King,O 4.5,5,4.1,WIN
+2026-06-16,Andre Pallante,O 3.5,6,7.0,WIN
+2026-06-16,Brandon Young,U 4.5,2,6.0,WIN
+2026-06-16,Logan Gilbert,O 6.5,10,7.0,WIN
+2026-06-16,Justin Wrobleski,U 4.5,5,6.0,LOSS
+2026-06-16,Drew Rasmussen,O 5.5,7,7.0,WIN
+2026-06-16,Kumar Rocker,U 4.5,4,3.1,WIN
+2026-06-16,Zebby Matthews,O 4.5,4,7.0,LOSS
+2026-06-16,Davis Martin,O 5.5,4,3.1,LOSS
+2026-06-16,Gerrit Cole,U 5.5,6,6.0,LOSS
+2026-06-16,Payton Tolle,O 4.5,6,5.0,WIN
+2026-06-16,Michael Wacha,O 4.5,3,6.0,LOSS
+2026-06-16,Foster Griffin,U 5.5,6,6.0,LOSS
+2026-06-16,Reid Detmers,O 5.5,6,7.0,WIN
+2026-06-16,Merrill Kelly,U 4.5,4,5.1,WIN
+2026-06-16,Jesús Luzardo,O 6.5,9,7.0,WIN
+2026-06-16,Tyler Phillips,U 3.5,4,4.0,LOSS
+2026-06-16,Brady Singer,U 4.5,5,5.0,LOSS
+2026-06-16,Kodai Senga,U 5.5,5,4.0,WIN
+2026-06-16,Robert Gasser,U 4.5,5,5.2,LOSS
+2026-06-16,Slade Cecconi,U 4.5,4,5.2,WIN
+2026-06-16,Edward Cabrera,U 5.5,3,4.1,WIN
+2026-06-16,Ryan Feltner,U 3.5,7,4.2,LOSS
+2026-06-16,Jack Perkins,U 4.5,6,5.0,LOSS
+2026-06-18,Tatsuya Imai,O 4.5,11,6.0,WIN
+2026-06-18,Cam Schlittler,O 6.5,13,6.0,WIN
+2026-06-18,Jacob Misiorowski,O 8.5,7,6.0,LOSS
+2026-06-18,Jacob deGrom,O 6.5,9,6.0,WIN
+2026-06-18,José Soriano,O 3.5,6,5.0,WIN
+2026-06-18,Landen Roupp,O 5.5,7,6.0,WIN
+2026-06-18,Roki Sasaki,U 5.5,6,5.2,LOSS
+2026-06-18,Jeffrey Springs,O 4.5,4,3.2,LOSS
+2026-06-18,Bryce Miller,O 4.5,7,5.0,WIN
+2026-06-18,Tarik Skubal,O 6.5,8,5.2,WIN
+2026-06-18,Trey Gibson,U 3.5,8,5.0,LOSS
+2026-06-18,Ben Brown,U 4.5,4,6.0,WIN
+2026-06-18,Kevin Gausman,O 5.5,3,2.0,LOSS
+2026-06-18,Griffin Jax,U 4.5,5,5.0,LOSS
+2026-06-18,Martín Pérez,O 3.5,5,6.0,WIN
+2026-06-18,Kyle Freeland,U 4.5,8,7.1,LOSS
+2026-06-18,Ranger Suarez,U 5.5,5,6.2,WIN
+2026-06-18,Bubba Chandler,U 4.5,1,6.0,WIN
+2026-06-18,Rhett Lowder,U 4.5,5,5.1,LOSS
+2026-06-18,Connor Prielipp,O 3.5,4,6.0,WIN
+2026-06-18,Michael Soroka,O 5.5,0,1.0,LOSS
+2026-06-18,Michael McGreevy,O 3.5,5,5.0,WIN
+2026-06-18,Seth Lugo,U 6.5,5,6.0,WIN
+2026-06-18,Randy Vásquez,O 3.5,6,3.1,WIN
+2026-06-26,Miles Mikolas,U 3.5,1,3.1,WIN
+2026-06-26,Aaron Nola,O 4.5,5,5.0,WIN
+2026-06-26,Matthew Liberatore,O 3.5,3,5.0,LOSS
+2026-06-26,Mitch Bratt,O 3.5,3,3.0,LOSS
+2026-06-26,Trey Gibson,U 4.5,5,4.0,LOSS
+2026-06-26,José Soriano,O 6.5,4,3.0,LOSS
+2026-06-26,Martín Pérez,U 4.5,4,4.0,WIN
+2026-06-26,JP Sears,O 3.5,5,5.2,WIN
+2026-06-26,Joe Ryan,O 5.5,9,6.0,WIN
+2026-06-26,Shohei Ohtani,O 6.5,8,6.0,WIN
+2026-06-26,Ryan Weathers,O 5.5,6,6.0,WIN
+2026-06-26,Tarik Skubal,O 6.5,9,6.0,WIN
+2026-06-26,Eury Pérez,O 4.5,1,4.2,LOSS
+2026-06-26,Jacob deGrom,O 6.5,8,6.0,WIN
+2026-06-26,Braxton Ashcraft,O 5.5,10,6.0,WIN
+2026-06-26,Bryan Woo,O 5.5,4,4.0,LOSS
+2026-06-26,Erick Fedde,O 3.5,2,4.0,LOSS
+2026-06-26,Tanner Bibee,U 5.5,3,6.0,WIN
+2026-06-26,Gage Jump,O 4.5,7,,WIN
+2026-06-26,Tyler Mahle,O 4.5,4,5.2,LOSS
+2026-06-26,Mike Burrows,O 3.5,3,6.0,LOSS
+2026-06-26,Trey Yesavage,U 5.5,5,5.2,WIN
+2026-06-26,Kyle Freeland,O 3.5,4,6.0,WIN
+2026-06-26,Ranger Suarez,U 4.5,9,6.0,LOSS
+2026-06-26,Rhett Lowder,O 3.5,5,,WIN
+2026-06-26,Shane Drohan,U 4.5,5,4.1,LOSS
+2026-06-26,Noah Cameron,O 4.5,5,5.0,WIN
+2026-06-26,Nolan McLean,O 5.5,8,,WIN
+2026-06-26,Javier Assad,U 3.5,5,,LOSS
+2026-06-26,Sean Manaea,O 3.5,4,,WIN
+"""
+
+    def _embedded_parse_pick_96(pick_text):
+        s = str(pick_text or "").strip().upper()
+        if not s or s in ["NL", "NO LINE", "NO_LINE"]:
+            return None, None
+        side = "OVER" if s.startswith("O") else "UNDER" if s.startswith("U") else None
+        m = _embedded_re.search(r"(\d+(?:\.\d+)?)", s)
+        line = float(m.group(1)) if m else None
+        return side, line
+
+    def _embedded_make_result_key_96(date, pitcher, side, line):
+        try:
+            nm = normalize_name(pitcher)
+        except Exception:
+            nm = str(pitcher).lower().strip()
+        return f"EMBEDDED_96|{str(date)[:10]}|{nm}|{side}|{line}"
+
+    def _embedded_import_96_grades_now():
+        df = pd.read_csv(_embedded_io.StringIO(EMBEDDED_HISTORICAL_GRADES_CSV))
+        results = load_json(RESULT_LOG, []) if 'load_json' in globals() else []
+        if not isinstance(results, list):
+            results = []
+        existing = set()
+        for r in results:
+            if isinstance(r, dict):
+                existing.add(str(r.get('recovery_key') or r.get('pick_id') or ''))
+        added = 0
+        skipped = 0
+        bad = 0
+        for _, row in df.iterrows():
+            date = str(row.get('Date','')).strip()[:10]
+            pitcher = str(row.get('Pitcher','')).strip()
+            side, line = _embedded_parse_pick_96(row.get('Pick'))
+            if not pitcher or side is None or line is None:
+                bad += 1
+                continue
+            try:
+                actual_k = float(row.get('Actual_K'))
+            except Exception:
+                bad += 1
+                continue
+            actual_ip = row.get('Actual_IP', None)
+            try:
+                if pd.isna(actual_ip) or str(actual_ip).strip() == '':
+                    actual_ip = None
+            except Exception:
+                pass
+            result = str(row.get('Result','')).strip().upper()
+            if result not in ['WIN','LOSS']:
+                win = bool(actual_k > line) if side == 'OVER' else bool(actual_k < line)
+                result = 'WIN' if win else 'LOSS'
+            else:
+                win = result == 'WIN'
+            key = _embedded_make_result_key_96(date, pitcher, side, line)
+            if key in existing:
+                skipped += 1
+                continue
+            rec = {
+                'pick_id': key,
+                'recovery_key': key,
+                'recovered_from_csv': True,
+                'source': 'EMBEDDED_96_RECOVERED_GRADES',
+                'date': date,
+                'graded_at': now_iso() if 'now_iso' in globals() else '',
+                'pitcher': pitcher,
+                'Pitcher': pitcher,
+                'pitcher_name': pitcher,
+                'market': 'pitcher_ks',
+                'prop_type': 'pitcher_ks',
+                'pick_side': side,
+                'side': side,
+                'line': float(line),
+                'final_line': float(line),
+                'UD/Line': float(line),
+                # original projection was not in recovered CSV, so line is used as neutral placeholder
+                'projection': float(line),
+                'final_projection': float(line),
+                'opening_projection': float(line),
+                'K PROJ': float(line),
+                'actual': float(actual_k),
+                'actual_k': float(actual_k),
+                'Actual_K': float(actual_k),
+                'actual_ip': actual_ip,
+                'Actual_IP': actual_ip,
+                'graded': True,
+                'graded_result': result,
+                'Result': result,
+                'win': bool(win),
+                'grading_source': 'EMBEDDED_96_RECOVERY_NO_SNAPSHOT',
+                'actual_result_source': 'EMBEDDED_96_RECOVERY',
+                'line_source': 'RECOVERED_CSV',
+                'data_score': 50,
+                'risk_label': 'RECOVERED_ONLY',
+                'price_is_real': False,
+                'lineup_locked': False,
+                'fair_probability': 0.5,
+                'note': 'Recovered 96-row CSV embedded into code. Original projections/snapshots were unavailable; line used as neutral projection placeholder.',
+            }
+            try:
+                rec['final_projection_error'] = round(float(actual_k) - float(line), 2)
+                rec['opening_projection_error'] = round(float(actual_k) - float(line), 2)
+                rec['projection_drift'] = 0.0
+            except Exception:
+                pass
+            results.append(rec)
+            existing.add(key)
+            added += 1
+        save_json(RESULT_LOG, results[-10000:])
+        try:
+            os.makedirs('learning_data', exist_ok=True)
+            pd.DataFrame(results).to_csv('learning_data/auto_result_log_embedded_96_backup.csv', index=False)
+        except Exception:
+            pass
+        try:
+            write_safe_backup(reason='embedded_96_recovered_grades')
+        except Exception:
+            pass
+        return {'added': added, 'skipped_duplicates': skipped, 'bad_or_nl_rows': bad, 'total_result_log_rows': len(results)}
+
+    _embedded_marker_path = os.path.join(STORAGE_DIR, 'embedded_96_recovered_grades_imported.marker') if 'STORAGE_DIR' in globals() else 'embedded_96_recovered_grades_imported.marker'
+    # Auto import once on app start. If Streamlit storage wipes, marker disappears and it imports again.
+    if not os.path.exists(_embedded_marker_path):
+        _embedded_result = _embedded_import_96_grades_now()
+        try:
+            with open(_embedded_marker_path, 'w', encoding='utf-8') as _f:
+                _f.write(str(_embedded_result))
+        except Exception:
+            pass
+        try:
+            st.success(f"✅ Embedded recovered grades imported: {_embedded_result.get('added', 0)} added. Total result rows: {_embedded_result.get('total_result_log_rows')}")
+            st.json(_embedded_result)
+            st.rerun()
+        except Exception:
+            pass
+
+    # Manual button in case user wants to force it again.
+    try:
+        with st.expander('🧯 Embedded 96 Grades Recovery', expanded=False):
+            st.caption('This is built into the code. It imports the recovered grades directly without saved snapshots.')
+            if st.button('🧯 IMPORT EMBEDDED 96 RECOVERED GRADES NOW', key='embedded_96_force_import_btn'):
+                _res = _embedded_import_96_grades_now()
+                st.success(f"Embedded import complete: {_res.get('added', 0)} added, {_res.get('skipped_duplicates', 0)} duplicates skipped.")
+                st.json(_res)
+                try:
+                    st.rerun()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+except Exception as _embedded_96_err:
+    try:
+        st.warning(f'Embedded 96 grades import did not run: {_embedded_96_err}')
+    except Exception:
+        pass
+# ============================================================
+# END EMBEDDED 96 RECOVERED GRADES AUTO IMPORT
+# ============================================================
