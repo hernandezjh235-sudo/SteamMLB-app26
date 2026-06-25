@@ -18341,32 +18341,76 @@ def build_baseball_iq_board(board):
 
     return pd.DataFrame(rows)
 
+def _biq_is_best_play_candidate(row):
+    """Strict Baseball IQ best-play filter. Read-only. Does not touch projections."""
+    try:
+        if str(row.get("Module", "")).upper() != "K UPSIDE":
+            return False
+        pick = str(row.get("Model Pick", "")).upper()
+        if not pick or "NO LINE" in pick or "AVOID" in pick or "TRACK" in pick:
+            return False
+        # Keep the Best Plays table strict. PASS/lean items can still live on the K board,
+        # but Baseball IQ should surface only the cleanest plays to win.
+        if "PASS" in pick and "PLAYABLE" not in pick and "OFFICIAL" not in pick and "🔥" not in pick:
+            return False
+        score = _iq_num(row.get("Baseball IQ Score"), 0)
+        return score >= 60
+    except Exception:
+        return False
+
+def _biq_recent_grade_summary():
+    """Small after-grading summary for Baseball IQ. Read-only, no projection impact."""
+    try:
+        results = load_json(RESULT_LOG, []) if "load_json" in globals() and "RESULT_LOG" in globals() else []
+    except Exception:
+        results = []
+    finished = []
+    for r in results[-75:]:
+        res = str(r.get("graded_result") or "").upper()
+        if res in ["WIN", "LOSS"]:
+            finished.append(res)
+    if not finished:
+        return {"samples": 0, "hit_rate": None, "note": "No graded K samples yet."}
+    wins = sum(1 for x in finished if x == "WIN")
+    return {"samples": len(finished), "hit_rate": round(wins / max(1, len(finished)) * 100, 1), "note": f"Last {len(finished)} graded plays: {wins}-{len(finished)-wins}."}
+
 def render_baseball_iq_tab(board):
-    st.markdown("### 🧠 Baseball IQ")
-    st.caption("Read-only context layer. It does not change projections, picks, K Upside, FS, or Moneyline outputs.")
+    st.markdown("### 🧠 Baseball IQ — Best Plays Only")
+    st.caption("Read-only AI-style board. Shows only the cleanest K plays to win. It does not change projections, decisions, odds, or player cards.")
     df = build_baseball_iq_board(board)
     if df is None or df.empty:
         st.info("No Baseball IQ rows yet. Refresh the board first.")
         return
 
+    kdf = df[df["Module"].astype(str).str.upper().eq("K UPSIDE")].copy() if "Module" in df.columns else df.copy()
+    if not kdf.empty:
+        kdf["Best Play Candidate"] = kdf.apply(_biq_is_best_play_candidate, axis=1)
+        best = kdf[kdf["Best Play Candidate"]].sort_values("Baseball IQ Score", ascending=False).head(12)
+    else:
+        best = pd.DataFrame()
+
+    summary = _biq_recent_grade_summary()
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("IQ Rows", len(df))
-    c2.metric("Elite IQ", int((df["IQ Label"] == "ELITE_IQ").sum()))
-    c3.metric("Good IQ", int((df["IQ Label"] == "GOOD_IQ").sum()))
-    c4.metric("Risk/Fade", int(df["IQ Label"].isin(["RISKY_IQ", "FADE_IQ"]).sum()))
+    c1.metric("K Plays Scanned", len(kdf))
+    c2.metric("Best Plays", len(best))
+    c3.metric("Elite/Good IQ", int(kdf["IQ Label"].isin(["ELITE_IQ", "GOOD_IQ"]).sum()) if "IQ Label" in kdf.columns else 0)
+    c4.metric("Recent Graded Hit %", "—" if summary.get("hit_rate") is None else f"{summary.get('hit_rate')}%")
 
-    st.markdown("#### Smartest Spots")
-    smart = df.sort_values("Baseball IQ Score", ascending=False).head(20)
-    st.dataframe(smart, use_container_width=True, hide_index=True)
+    st.markdown("#### 🏆 Likely Winners / Best K Plays")
+    if best is None or best.empty:
+        st.warning("No clean Baseball IQ best-play candidates right now. That means the board has no K play clearing the strict IQ filter yet.")
+    else:
+        show_cols = [c for c in ["Player", "Matchup", "Projection", "Line", "Model Pick", "Baseball IQ Score", "IQ Label", "Main Reasons"] if c in best.columns]
+        st.dataframe(best[show_cols], use_container_width=True, hide_index=True)
 
-    st.markdown("#### Riskiest Spots")
-    risky = df.sort_values("Baseball IQ Score", ascending=True).head(20)
-    st.dataframe(risky, use_container_width=True, hide_index=True)
+    st.markdown("#### 📚 After-Grading Read")
+    st.info(summary.get("note", "No graded samples yet.") + " Baseball IQ is advisory only and will not move projections.")
 
-    st.markdown("#### Full IQ Board")
-    st.dataframe(df.sort_values(["Module", "Baseball IQ Score"], ascending=[True, False]), use_container_width=True, hide_index=True)
-
-    st.info("This tab is informational only. Use it to learn context and miss reasons before allowing any future influence.")
+    with st.expander("Show full K IQ scan", expanded=False):
+        if kdf is None or kdf.empty:
+            st.info("No K IQ rows available.")
+        else:
+            st.dataframe(kdf.sort_values("Baseball IQ Score", ascending=False), use_container_width=True, hide_index=True)
 
 
 # =========================
@@ -26249,6 +26293,498 @@ def render_pitcher_fs_tab(board=None):
     except Exception:
         pass
 
+# =============================================================
+# OPPONENT TEAM K RANK ENGINE 3.1 — VERIFIED SOURCE SAFE ADD-ON
+# Source priority: MLB.com official team hitting leaderboard endpoint (BDFED),
+# with neutral fallback to existing Opp K% if live data is unavailable.
+# Safe rules:
+# - DOES NOT change K projections, IP projections, BF projections, odds, or player decisions.
+# - Adds context/export columns only.
+# - Uses pitcher handedness to choose opponent K% vs RHP/LHP when available.
+# =============================================================
+OPP_K_RANK_ENGINE_VERSION = "OPP_TEAM_K_RANK_3_1_MLB_OFFICIAL_SAFE_2026_06_24"
+
+try:
+    import datetime as _okr_dt
+except Exception:
+    _okr_dt = None
+
+
+def _okr_num(x, default=None):
+    try:
+        if x is None or x == "":
+            return default
+        if isinstance(x, str):
+            x = x.replace("%", "").replace(",", "").strip()
+        v = float(x)
+        if math.isnan(v):
+            return default
+        return v
+    except Exception:
+        try:
+            return safe_float(x, default)
+        except Exception:
+            return default
+
+
+def _okr_abbr(x):
+    s = str(x or "").strip().upper()
+    if not s:
+        return ""
+    aliases = {
+        "WSN": "WSH", "WAS": "WSH", "WASHINGTON": "WSH", "WASHINGTON NATIONALS": "WSH",
+        "CHW": "CWS", "CHISOX": "CWS", "CHICAGO WHITE SOX": "CWS", "WHITE SOX": "CWS",
+        "KCR": "KC", "KAN": "KC", "KANSAS CITY": "KC", "KANSAS CITY ROYALS": "KC",
+        "TBR": "TB", "TAM": "TB", "TAMPA BAY": "TB", "TAMPA BAY RAYS": "TB",
+        "SDP": "SD", "SAN DIEGO": "SD", "SAN DIEGO PADRES": "SD",
+        "SFG": "SF", "SAN FRANCISCO": "SF", "SAN FRANCISCO GIANTS": "SF",
+        "OAK": "ATH", "ATHLETICS": "ATH", "A'S": "ATH", "ATHLETICS ATHLETICS": "ATH",
+        "ARI": "AZ", "ARIZONA": "AZ", "ARIZONA DIAMONDBACKS": "AZ",
+        "LAA": "LAA", "LOS ANGELES ANGELS": "LAA", "ANGELS": "LAA",
+        "LAD": "LAD", "LOS ANGELES DODGERS": "LAD", "DODGERS": "LAD",
+        "NYM": "NYM", "NEW YORK METS": "NYM", "METS": "NYM",
+        "NYY": "NYY", "NEW YORK YANKEES": "NYY", "YANKEES": "NYY",
+        "TOR": "TOR", "TORONTO": "TOR", "TORONTO BLUE JAYS": "TOR", "BLUE JAYS": "TOR",
+        "COL": "COL", "COLORADO": "COL", "COLORADO ROCKIES": "COL", "ROCKIES": "COL",
+        "PIT": "PIT", "PITTSBURGH": "PIT", "PITTSBURGH PIRATES": "PIT", "PIRATES": "PIT",
+        "CIN": "CIN", "REDS": "CIN", "CINCINNATI REDS": "CIN",
+        "BAL": "BAL", "ORIOLES": "BAL", "BALTIMORE ORIOLES": "BAL",
+    }
+    if s in aliases:
+        return aliases[s]
+    # common MLB abbrevs pass through
+    return s[:3] if len(s) > 3 and " " not in s else s
+
+
+def _okr_field(d, names):
+    if not isinstance(d, dict):
+        return None
+    low = {str(k).lower(): k for k in d.keys()}
+    for name in names:
+        if name in d:
+            return d.get(name)
+        lk = str(name).lower()
+        if lk in low:
+            return d.get(low[lk])
+    return None
+
+
+def _okr_extract_stat_rows(payload):
+    if not isinstance(payload, dict):
+        return []
+    for key in ["stats", "rows", "data", "teams", "results"]:
+        v = payload.get(key)
+        if isinstance(v, list):
+            return v
+    # BDFED sometimes wraps under stats/items-like objects
+    for v in payload.values():
+        if isinstance(v, list) and v and isinstance(v[0], dict):
+            return v
+    return []
+
+
+def _okr_parse_team_stat_rows(rows, split_label, source_label):
+    parsed = []
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        team_obj = r.get("team") if isinstance(r.get("team"), dict) else {}
+        ab = (_okr_field(r, ["teamAbbrev", "teamAbbreviation", "abbreviation", "teamCode", "team", "teamName"]) or
+              _okr_field(team_obj, ["abbreviation", "teamCode", "name", "teamName"]))
+        ab = _okr_abbr(ab)
+        if not ab:
+            continue
+        # MLB/BDFED names vary. Try every common variant.
+        so = _okr_num(_okr_field(r, ["strikeouts", "strikeOuts", "so", "SO", "strike_outs", "k", "K"]), None)
+        pa = _okr_num(_okr_field(r, ["plateAppearances", "plate_appearances", "pa", "PA"]), None)
+        k_pct_raw = _okr_num(_okr_field(r, ["strikeoutRate", "strikeOutRate", "kRate", "kPercent", "kPct", "K%", "strikeoutPct"]), None)
+        # Some endpoints return K% as 24.1, some as .241.
+        k_pct = None
+        if k_pct_raw is not None:
+            k_pct = k_pct_raw / 100.0 if k_pct_raw > 1 else k_pct_raw
+        elif so is not None and pa and pa > 0:
+            k_pct = so / pa
+        if k_pct is None:
+            continue
+        parsed.append({
+            "Team": ab,
+            "Split": split_label,
+            "SO": so,
+            "PA": pa,
+            "K%": float(k_pct),
+            "Source": source_label,
+        })
+    return parsed
+
+
+def _okr_mlb_season():
+    try:
+        # Prefer the app slate date/session if present; otherwise current year.
+        y = int(st.session_state.get("season", 0) or 0)
+        if 2000 <= y <= 2100:
+            return y
+    except Exception:
+        pass
+    try:
+        return int((_okr_dt.date.today() if _okr_dt else None).year)
+    except Exception:
+        return 2026
+
+
+def _okr_fetch_bdfed_split(season, sit_code=None, last30=False):
+    """Official MLB.com stats backend used by MLB Stats pages. Returns parsed rows or []."""
+    try:
+        import requests
+        base = "https://bdfed.stitch.mlbinfra.com/bdfed/stats/team"
+        params = {
+            "stitch_env": "prod",
+            "sportId": 1,
+            "gameType": "R",
+            "group": "hitting",
+            "stats": "season",
+            "season": int(season),
+            "limit": 30,
+            "offset": 0,
+            "sortStat": "strikeouts",
+            "order": "desc",
+        }
+        if sit_code:
+            params["sitCodes"] = sit_code
+        if last30 and _okr_dt:
+            end = _okr_dt.date.today()
+            start = end - _okr_dt.timedelta(days=30)
+            # BDFED commonly honors startDate/endDate. If ignored, the source still returns season data.
+            params["startDate"] = start.strftime("%Y-%m-%d")
+            params["endDate"] = end.strftime("%Y-%m-%d")
+        r = requests.get(base, params=params, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return []
+        payload = r.json()
+        return _okr_parse_team_stat_rows(_okr_extract_stat_rows(payload), "", "MLB.com official team stats")
+    except Exception:
+        return []
+
+
+def _okr_rank_rows(rows, split_key_name):
+    # Higher K% = better K environment for pitcher; rank 1 is highest team strikeout rate.
+    rows = [dict(r) for r in rows or [] if r.get("Team") and _okr_num(r.get("K%"), None) is not None]
+    rows.sort(key=lambda x: x.get("K%", 0), reverse=True)
+    out = {}
+    for i, r in enumerate(rows, start=1):
+        ab = _okr_abbr(r.get("Team"))
+        out[ab] = {
+            f"K% {split_key_name}": round(float(r.get("K%", 0)) * 100, 1),
+            f"K Rank {split_key_name}": i,
+            f"K Source {split_key_name}": r.get("Source", ""),
+        }
+    return out
+
+
+def _okr_cache_fetch_table(season=None):
+    season = season or _okr_mlb_season()
+    # sitCodes convention on MLB Stats API/BDFED: vr = batting vs RHP, vl = batting vs LHP.
+    splits = {
+        "vs RHP": _okr_fetch_bdfed_split(season, "vr", False),
+        "vs LHP": _okr_fetch_bdfed_split(season, "vl", False),
+        "L30 vs RHP": _okr_fetch_bdfed_split(season, "vr", True),
+        "L30 vs LHP": _okr_fetch_bdfed_split(season, "vl", True),
+    }
+    # If last-30 pull fails or is ignored, keep blanks rather than faking ranks.
+    merged = {}
+    for split_name, rows in splits.items():
+        ranked = _okr_rank_rows(rows, split_name)
+        for ab, vals in ranked.items():
+            merged.setdefault(ab, {"Team": ab}).update(vals)
+    return merged
+
+# Streamlit cache wrapper, if Streamlit is available.
+try:
+    _okr_fetch_team_k_table = st.cache_data(ttl=6*60*60, show_spinner=False)(_okr_cache_fetch_table)
+except Exception:
+    _okr_fetch_team_k_table = _okr_cache_fetch_table
+
+
+def _okr_matchup_teams(matchup):
+    s = str(matchup or "").upper().replace("VS", "@").replace(" AT ", " @ ")
+    if "@" in s:
+        a, h = [x.strip() for x in s.split("@", 1)]
+        return _okr_abbr(a), _okr_abbr(h)
+    return "", ""
+
+
+def _okr_pitcher_team_from_board_item(p):
+    if not isinstance(p, dict):
+        return ""
+    for k in ["team", "Team", "Pitcher Team", "pitcher_team", "abbr", "team_abbr", "player_team", "Player Team"]:
+        v = p.get(k)
+        if v not in [None, "", "—"]:
+            return _okr_abbr(v)
+    return ""
+
+
+def _okr_pitcher_hand_from_any(row=None, p=None):
+    sources = []
+    if isinstance(row, dict):
+        sources.append(row)
+    if isinstance(p, dict):
+        sources.append(p)
+    keys = ["Pitcher Hand", "Throws", "Throwing Hand", "Hand", "P Hand", "p_throws", "throws", "arm", "Pitcher Throws"]
+    txts = []
+    for src in sources:
+        for k in keys:
+            try:
+                v = src.get(k)
+                if v not in [None, "", "—"]:
+                    txts.append(str(v).strip().upper())
+            except Exception:
+                pass
+    txt = " ".join(txts)
+    if "LHP" in txt or "LEFT" in txt or txt in ["L", "LH"]:
+        return "LHP"
+    if "RHP" in txt or "RIGHT" in txt or txt in ["R", "RH"]:
+        return "RHP"
+    for t in txts:
+        if t in ["L", "LH", "LHP"]:
+            return "LHP"
+        if t in ["R", "RH", "RHP"]:
+            return "RHP"
+    return "UNKNOWN"
+
+
+def _okr_environment_label(rank, k_pct):
+    r = _okr_num(rank, None)
+    k = _okr_num(k_pct, None)
+    if r is None and k is None:
+        return "NO VERIFIED TEAM K RANK"
+    if (r is not None and r <= 5) or (k is not None and k >= 25.0):
+        return "🔥 ELITE K MATCHUP"
+    if (r is not None and r <= 10) or (k is not None and k >= 23.5):
+        return "🟢 GOOD K MATCHUP"
+    if (r is not None and r >= 26) or (k is not None and k <= 18.5):
+        return "🔴 ELITE CONTACT TEAM"
+    if (r is not None and r >= 21) or (k is not None and k <= 20.5):
+        return "🟠 CONTACT RISK"
+    return "🟡 NEUTRAL K MATCHUP"
+
+
+def _okr_apply_team_k_ranks_to_df(df, board=None):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    d = df.copy()
+    table = {}
+    try:
+        table = _okr_fetch_team_k_table(_okr_mlb_season()) or {}
+    except Exception:
+        table = {}
+
+    board_lookup = {}
+    try:
+        for p in board or []:
+            nm = str(p.get("pitcher") or p.get("Pitcher") or p.get("Player") or "").strip().lower()
+            if nm:
+                board_lookup[nm] = p
+    except Exception:
+        board_lookup = {}
+
+    opp_teams, p_teams, hands = [], [], []
+    k_hand, rank_hand, label_hand, source_hand = [], [], [], []
+    k_rhp, r_rhp, k_lhp, r_lhp, k_l30_rhp, r_l30_rhp, k_l30_lhp, r_l30_lhp = [], [], [], [], [], [], [], []
+    top5_note = []
+
+    for _, row in d.iterrows():
+        rd = row.to_dict()
+        name_key = str(rd.get("Pitcher") or rd.get("pitcher") or "").strip().lower()
+        p = board_lookup.get(name_key, {})
+        matchup = rd.get("Matchup") or (p.get("matchup") if isinstance(p, dict) else "")
+        away, home = _okr_matchup_teams(matchup)
+        pt = _okr_pitcher_team_from_board_item(p) or _okr_abbr(rd.get("Team") or rd.get("Pitcher Team") or "")
+        # If pitcher team unavailable, leave opponent blank instead of guessing wrong.
+        opp = ""
+        if pt and away and home:
+            opp = home if pt == away else away if pt == home else ""
+        # fallback: if board dict has opponent/team fields
+        if not opp and isinstance(p, dict):
+            for k in ["opponent", "Opponent", "opp", "Opp"]:
+                if p.get(k):
+                    opp = _okr_abbr(p.get(k)); break
+        hand = _okr_pitcher_hand_from_any(rd, p)
+        rec = table.get(opp, {}) if opp else {}
+        vs_key = "vs LHP" if hand == "LHP" else "vs RHP" if hand == "RHP" else None
+        k_used = rec.get(f"K% {vs_key}") if vs_key else None
+        r_used = rec.get(f"K Rank {vs_key}") if vs_key else None
+        src_used = rec.get(f"K Source {vs_key}") if vs_key else ""
+        # fallback to existing row Opp K% only when verified table is missing; mark as fallback.
+        if k_used in [None, "", "—"]:
+            fallback = _okr_num(rd.get("Opp K%"), None)
+            if fallback is not None:
+                k_used = round(fallback if fallback > 1 else fallback * 100, 1)
+                src_used = "Existing app Opp K% fallback — not ranked"
+        label = _okr_environment_label(r_used, k_used)
+
+        opp_teams.append(opp or "")
+        p_teams.append(pt or "")
+        hands.append(hand)
+        k_hand.append(k_used if k_used is not None else "")
+        rank_hand.append(r_used if r_used is not None else "")
+        label_hand.append(label)
+        source_hand.append(src_used or "")
+        k_rhp.append(rec.get("K% vs RHP", "")); r_rhp.append(rec.get("K Rank vs RHP", ""))
+        k_lhp.append(rec.get("K% vs LHP", "")); r_lhp.append(rec.get("K Rank vs LHP", ""))
+        k_l30_rhp.append(rec.get("K% L30 vs RHP", "")); r_l30_rhp.append(rec.get("K Rank L30 vs RHP", ""))
+        k_l30_lhp.append(rec.get("K% L30 vs LHP", "")); r_l30_lhp.append(rec.get("K Rank L30 vs LHP", ""))
+        top5_note.append("TOP-5 K ENV" if _okr_num(r_used, 99) <= 5 else "")
+
+    d["Opponent Team"] = opp_teams
+    d["Pitcher Team"] = p_teams
+    d["Pitcher Hand"] = hands
+    d["Opponent K% vs Pitcher Hand"] = k_hand
+    d["Opponent K Rank vs Pitcher Hand"] = rank_hand
+    d["Opponent K Environment"] = label_hand
+    d["Opponent K Rank Source"] = source_hand
+    d["Opp K% vs RHP Official"] = k_rhp
+    d["Opp K Rank vs RHP Official"] = r_rhp
+    d["Opp K% vs LHP Official"] = k_lhp
+    d["Opp K Rank vs LHP Official"] = r_lhp
+    d["Opp L30 K% vs RHP Official"] = k_l30_rhp
+    d["Opp L30 K Rank vs RHP Official"] = r_l30_rhp
+    d["Opp L30 K% vs LHP Official"] = k_l30_lhp
+    d["Opp L30 K Rank vs LHP Official"] = r_l30_lhp
+    d["Opponent K Top-5 Note"] = top5_note
+    d["Opponent K Rank Engine Version"] = OPP_K_RANK_ENGINE_VERSION
+    return d
+
+
+def _okr_top5_test_table():
+    """Utility for Streamlit/debug: returns Top 5 team K environments by split from verified pull."""
+    try:
+        table = _okr_fetch_team_k_table(_okr_mlb_season()) or {}
+        rows = []
+        for team, rec in table.items():
+            for split in ["vs RHP", "vs LHP", "L30 vs RHP", "L30 vs LHP"]:
+                rows.append({
+                    "Split": split,
+                    "Team": team,
+                    "K%": rec.get(f"K% {split}"),
+                    "Rank": rec.get(f"K Rank {split}"),
+                    "Source": rec.get(f"K Source {split}"),
+                })
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return df
+        return df[df["Rank"].isin([1,2,3,4,5])].sort_values(["Split", "Rank"])
+    except Exception:
+        return pd.DataFrame()
+
+
+
+# =============================================================
+# OPPONENT K RANK CARD DISPLAY 3.2 — UI ONLY
+# Adds a clean matchup panel to player cards. Does NOT change projections.
+# =============================================================
+def _okr_card_context_from_row(card_row, p=None):
+    """Return verified Opponent K Rank context for player-card display.
+    Prefers the official MLB rank columns created by Opponent Team K Rank Engine.
+    Falls back to existing app Opp K% only if official ranks are unavailable.
+    """
+    try:
+        row = card_row if isinstance(card_row, dict) else {}
+        p = p if isinstance(p, dict) else {}
+        def _first(*keys):
+            for k in keys:
+                v = row.get(k, None)
+                if v not in (None, "", "—"):
+                    return v
+                v = p.get(k, None)
+                if v not in (None, "", "—"):
+                    return v
+            return None
+        opp_team = _first("Opponent Team", "Opponent", "opponent", "opp", "Opp")
+        p_hand = _okr_pitcher_hand_from_any(row, p) if "_okr_pitcher_hand_from_any" in globals() else (_first("Pitcher Hand", "Throws", "Pitcher Throws", "hand") or "UNKNOWN")
+        # If official rank columns have not been attached yet, compute live from the current pitcher dict.
+        if not opp_team:
+            opp_team = _okr_abbr(p.get("opponent") or p.get("Opponent") or p.get("opp") or p.get("Opp") or "") if isinstance(p, dict) else ""
+        if not opp_team:
+            matchup_guess = _first("Matchup", "matchup") or (p.get("matchup") if isinstance(p, dict) else "")
+            away_guess, home_guess = _okr_matchup_teams(matchup_guess) if "_okr_matchup_teams" in globals() else ("", "")
+            pt_guess = _okr_pitcher_team_from_board_item(p) if "_okr_pitcher_team_from_board_item" in globals() else ""
+            if pt_guess and away_guess and home_guess:
+                opp_team = home_guess if pt_guess == away_guess else away_guess if pt_guess == home_guess else ""
+        opp_team = opp_team or "—"
+        k_hand = _first("Opponent K% vs Pitcher Hand", "Matchup Hand K%")
+        rank_hand = _first("Opponent K Rank vs Pitcher Hand", "Opponent K Rank")
+        env = _first("Opponent K Environment")
+        src = _first("Opponent K Rank Source") or ""
+        # split details for display/audit
+        k_rhp = _first("Opp K% vs RHP Official", "Opp K% vs RHP")
+        r_rhp = _first("Opp K Rank vs RHP Official", "Opp K Rank vs RHP")
+        k_lhp = _first("Opp K% vs LHP Official", "Opp K% vs LHP")
+        r_lhp = _first("Opp K Rank vs LHP Official", "Opp K Rank vs LHP")
+        k_l30_rhp = _first("Opp L30 K% vs RHP Official")
+        r_l30_rhp = _first("Opp L30 K Rank vs RHP Official")
+        k_l30_lhp = _first("Opp L30 K% vs LHP Official")
+        r_l30_lhp = _first("Opp L30 K Rank vs LHP Official")
+        # If official columns are missing on the row, compute directly from official MLB table using p opponent + hand.
+        if (not k_hand or not rank_hand) and opp_team not in (None, "", "—") and p_hand in ("RHP", "LHP"):
+            try:
+                tbl = _okr_fetch_team_k_table(_okr_mlb_season()) if "_okr_fetch_team_k_table" in globals() else {}
+                rec = (tbl or {}).get(_okr_abbr(opp_team), {})
+                split = "vs RHP" if p_hand == "RHP" else "vs LHP"
+                k_hand = k_hand or rec.get(f"K% {split}")
+                rank_hand = rank_hand or rec.get(f"K Rank {split}")
+                src = src or rec.get(f"K Source {split}") or "MLB official live card pull"
+                k_rhp = k_rhp or rec.get("K% vs RHP")
+                r_rhp = r_rhp or rec.get("K Rank vs RHP")
+                k_lhp = k_lhp or rec.get("K% vs LHP")
+                r_lhp = r_lhp or rec.get("K Rank vs LHP")
+                k_l30_rhp = k_l30_rhp or rec.get("K% L30 vs RHP")
+                r_l30_rhp = r_l30_rhp or rec.get("K Rank L30 vs RHP")
+                k_l30_lhp = k_l30_lhp or rec.get("K% L30 vs LHP")
+                r_l30_lhp = r_l30_lhp or rec.get("K Rank L30 vs LHP")
+            except Exception:
+                pass
+        # fallback environment if official label missing
+        if not env:
+            env = _okr_environment_label(rank_hand, k_hand) if "_okr_environment_label" in globals() else "NO VERIFIED TEAM K RANK"
+        def _fmt_pct(v):
+            x = _okr_num(v, None) if "_okr_num" in globals() else safe_float(v, None)
+            if x is None:
+                return "—"
+            if abs(x) <= 1:
+                x *= 100.0
+            return f"{x:.1f}%"
+        def _fmt_rank(v):
+            x = _okr_num(v, None) if "_okr_num" in globals() else safe_float(v, None)
+            return "—" if x is None else f"#{int(x)}"
+        return {
+            "opp_team": str(opp_team),
+            "pitcher_hand": str(p_hand),
+            "k_hand": _fmt_pct(k_hand),
+            "rank_hand": _fmt_rank(rank_hand),
+            "env": str(env),
+            "source": str(src),
+            "rhp_line": f"RHP: {_fmt_pct(k_rhp)} / {_fmt_rank(r_rhp)}",
+            "lhp_line": f"LHP: {_fmt_pct(k_lhp)} / {_fmt_rank(r_lhp)}",
+            "l30_rhp_line": f"L30 RHP: {_fmt_pct(k_l30_rhp)} / {_fmt_rank(r_l30_rhp)}",
+            "l30_lhp_line": f"L30 LHP: {_fmt_pct(k_l30_lhp)} / {_fmt_rank(r_l30_lhp)}",
+        }
+    except Exception:
+        return {
+            "opp_team":"—", "pitcher_hand":"UNKNOWN", "k_hand":"—", "rank_hand":"—",
+            "env":"NO VERIFIED TEAM K RANK", "source":"", "rhp_line":"RHP: — / —",
+            "lhp_line":"LHP: — / —", "l30_rhp_line":"L30 RHP: — / —", "l30_lhp_line":"L30 LHP: — / —"
+        }
+
+# Wrap K projection table export/display without touching projection math.
+if "build_kproj_table" in globals():
+    _prev_okr_build_kproj_table = build_kproj_table
+    def build_kproj_table(board):
+        df = _prev_okr_build_kproj_table(board)
+        try:
+            return _okr_apply_team_k_ranks_to_df(df, board)
+        except Exception:
+            return df
+
+
 tab_kproj, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
@@ -26839,464 +27375,3 @@ def ml_build_board(board):
         df = df.sort_values('ML Edge %', ascending=False)
     return df
 
-# =============================================================
-# OPPONENT TEAM K RANK ENGINE 3.1 — VERIFIED SOURCE SAFE ADD-ON
-# Source priority: MLB.com official team hitting leaderboard endpoint (BDFED),
-# with neutral fallback to existing Opp K% if live data is unavailable.
-# Safe rules:
-# - DOES NOT change K projections, IP projections, BF projections, odds, or player decisions.
-# - Adds context/export columns only.
-# - Uses pitcher handedness to choose opponent K% vs RHP/LHP when available.
-# =============================================================
-OPP_K_RANK_ENGINE_VERSION = "OPP_TEAM_K_RANK_3_1_MLB_OFFICIAL_SAFE_2026_06_24"
-
-try:
-    import datetime as _okr_dt
-except Exception:
-    _okr_dt = None
-
-
-def _okr_num(x, default=None):
-    try:
-        if x is None or x == "":
-            return default
-        if isinstance(x, str):
-            x = x.replace("%", "").replace(",", "").strip()
-        v = float(x)
-        if math.isnan(v):
-            return default
-        return v
-    except Exception:
-        try:
-            return safe_float(x, default)
-        except Exception:
-            return default
-
-
-def _okr_abbr(x):
-    s = str(x or "").strip().upper()
-    if not s:
-        return ""
-    aliases = {
-        "WSN": "WSH", "WAS": "WSH", "WASHINGTON": "WSH", "WASHINGTON NATIONALS": "WSH",
-        "CHW": "CWS", "CHISOX": "CWS", "CHICAGO WHITE SOX": "CWS", "WHITE SOX": "CWS",
-        "KCR": "KC", "KAN": "KC", "KANSAS CITY": "KC", "KANSAS CITY ROYALS": "KC",
-        "TBR": "TB", "TAM": "TB", "TAMPA BAY": "TB", "TAMPA BAY RAYS": "TB",
-        "SDP": "SD", "SAN DIEGO": "SD", "SAN DIEGO PADRES": "SD",
-        "SFG": "SF", "SAN FRANCISCO": "SF", "SAN FRANCISCO GIANTS": "SF",
-        "OAK": "ATH", "ATHLETICS": "ATH", "A'S": "ATH", "ATHLETICS ATHLETICS": "ATH",
-        "ARI": "AZ", "ARIZONA": "AZ", "ARIZONA DIAMONDBACKS": "AZ",
-        "LAA": "LAA", "LOS ANGELES ANGELS": "LAA", "ANGELS": "LAA",
-        "LAD": "LAD", "LOS ANGELES DODGERS": "LAD", "DODGERS": "LAD",
-        "NYM": "NYM", "NEW YORK METS": "NYM", "METS": "NYM",
-        "NYY": "NYY", "NEW YORK YANKEES": "NYY", "YANKEES": "NYY",
-        "TOR": "TOR", "TORONTO": "TOR", "TORONTO BLUE JAYS": "TOR", "BLUE JAYS": "TOR",
-        "COL": "COL", "COLORADO": "COL", "COLORADO ROCKIES": "COL", "ROCKIES": "COL",
-        "PIT": "PIT", "PITTSBURGH": "PIT", "PITTSBURGH PIRATES": "PIT", "PIRATES": "PIT",
-        "CIN": "CIN", "REDS": "CIN", "CINCINNATI REDS": "CIN",
-        "BAL": "BAL", "ORIOLES": "BAL", "BALTIMORE ORIOLES": "BAL",
-    }
-    if s in aliases:
-        return aliases[s]
-    # common MLB abbrevs pass through
-    return s[:3] if len(s) > 3 and " " not in s else s
-
-
-def _okr_field(d, names):
-    if not isinstance(d, dict):
-        return None
-    low = {str(k).lower(): k for k in d.keys()}
-    for name in names:
-        if name in d:
-            return d.get(name)
-        lk = str(name).lower()
-        if lk in low:
-            return d.get(low[lk])
-    return None
-
-
-def _okr_extract_stat_rows(payload):
-    if not isinstance(payload, dict):
-        return []
-    for key in ["stats", "rows", "data", "teams", "results"]:
-        v = payload.get(key)
-        if isinstance(v, list):
-            return v
-    # BDFED sometimes wraps under stats/items-like objects
-    for v in payload.values():
-        if isinstance(v, list) and v and isinstance(v[0], dict):
-            return v
-    return []
-
-
-def _okr_parse_team_stat_rows(rows, split_label, source_label):
-    parsed = []
-    for r in rows or []:
-        if not isinstance(r, dict):
-            continue
-        team_obj = r.get("team") if isinstance(r.get("team"), dict) else {}
-        ab = (_okr_field(r, ["teamAbbrev", "teamAbbreviation", "abbreviation", "teamCode", "team", "teamName"]) or
-              _okr_field(team_obj, ["abbreviation", "teamCode", "name", "teamName"]))
-        ab = _okr_abbr(ab)
-        if not ab:
-            continue
-        # MLB/BDFED names vary. Try every common variant.
-        so = _okr_num(_okr_field(r, ["strikeouts", "strikeOuts", "so", "SO", "strike_outs", "k", "K"]), None)
-        pa = _okr_num(_okr_field(r, ["plateAppearances", "plate_appearances", "pa", "PA"]), None)
-        k_pct_raw = _okr_num(_okr_field(r, ["strikeoutRate", "strikeOutRate", "kRate", "kPercent", "kPct", "K%", "strikeoutPct"]), None)
-        # Some endpoints return K% as 24.1, some as .241.
-        k_pct = None
-        if k_pct_raw is not None:
-            k_pct = k_pct_raw / 100.0 if k_pct_raw > 1 else k_pct_raw
-        elif so is not None and pa and pa > 0:
-            k_pct = so / pa
-        if k_pct is None:
-            continue
-        parsed.append({
-            "Team": ab,
-            "Split": split_label,
-            "SO": so,
-            "PA": pa,
-            "K%": float(k_pct),
-            "Source": source_label,
-        })
-    return parsed
-
-
-def _okr_mlb_season():
-    try:
-        # Prefer the app slate date/session if present; otherwise current year.
-        y = int(st.session_state.get("season", 0) or 0)
-        if 2000 <= y <= 2100:
-            return y
-    except Exception:
-        pass
-    try:
-        return int((_okr_dt.date.today() if _okr_dt else None).year)
-    except Exception:
-        return 2026
-
-
-def _okr_fetch_bdfed_split(season, sit_code=None, last30=False):
-    """Official MLB.com stats backend used by MLB Stats pages. Returns parsed rows or []."""
-    try:
-        import requests
-        base = "https://bdfed.stitch.mlbinfra.com/bdfed/stats/team"
-        params = {
-            "stitch_env": "prod",
-            "sportId": 1,
-            "gameType": "R",
-            "group": "hitting",
-            "stats": "season",
-            "season": int(season),
-            "limit": 30,
-            "offset": 0,
-            "sortStat": "strikeouts",
-            "order": "desc",
-        }
-        if sit_code:
-            params["sitCodes"] = sit_code
-        if last30 and _okr_dt:
-            end = _okr_dt.date.today()
-            start = end - _okr_dt.timedelta(days=30)
-            # BDFED commonly honors startDate/endDate. If ignored, the source still returns season data.
-            params["startDate"] = start.strftime("%Y-%m-%d")
-            params["endDate"] = end.strftime("%Y-%m-%d")
-        r = requests.get(base, params=params, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code != 200:
-            return []
-        payload = r.json()
-        return _okr_parse_team_stat_rows(_okr_extract_stat_rows(payload), "", "MLB.com official team stats")
-    except Exception:
-        return []
-
-
-def _okr_rank_rows(rows, split_key_name):
-    # Higher K% = better K environment for pitcher; rank 1 is highest team strikeout rate.
-    rows = [dict(r) for r in rows or [] if r.get("Team") and _okr_num(r.get("K%"), None) is not None]
-    rows.sort(key=lambda x: x.get("K%", 0), reverse=True)
-    out = {}
-    for i, r in enumerate(rows, start=1):
-        ab = _okr_abbr(r.get("Team"))
-        out[ab] = {
-            f"K% {split_key_name}": round(float(r.get("K%", 0)) * 100, 1),
-            f"K Rank {split_key_name}": i,
-            f"K Source {split_key_name}": r.get("Source", ""),
-        }
-    return out
-
-
-def _okr_cache_fetch_table(season=None):
-    season = season or _okr_mlb_season()
-    # sitCodes convention on MLB Stats API/BDFED: vr = batting vs RHP, vl = batting vs LHP.
-    splits = {
-        "vs RHP": _okr_fetch_bdfed_split(season, "vr", False),
-        "vs LHP": _okr_fetch_bdfed_split(season, "vl", False),
-        "L30 vs RHP": _okr_fetch_bdfed_split(season, "vr", True),
-        "L30 vs LHP": _okr_fetch_bdfed_split(season, "vl", True),
-    }
-    # If last-30 pull fails or is ignored, keep blanks rather than faking ranks.
-    merged = {}
-    for split_name, rows in splits.items():
-        ranked = _okr_rank_rows(rows, split_name)
-        for ab, vals in ranked.items():
-            merged.setdefault(ab, {"Team": ab}).update(vals)
-    return merged
-
-# Streamlit cache wrapper, if Streamlit is available.
-try:
-    _okr_fetch_team_k_table = st.cache_data(ttl=6*60*60, show_spinner=False)(_okr_cache_fetch_table)
-except Exception:
-    _okr_fetch_team_k_table = _okr_cache_fetch_table
-
-
-def _okr_matchup_teams(matchup):
-    s = str(matchup or "").upper().replace("VS", "@").replace(" AT ", " @ ")
-    if "@" in s:
-        a, h = [x.strip() for x in s.split("@", 1)]
-        return _okr_abbr(a), _okr_abbr(h)
-    return "", ""
-
-
-def _okr_pitcher_team_from_board_item(p):
-    if not isinstance(p, dict):
-        return ""
-    for k in ["team", "Team", "Pitcher Team", "pitcher_team", "abbr", "team_abbr", "player_team", "Player Team"]:
-        v = p.get(k)
-        if v not in [None, "", "—"]:
-            return _okr_abbr(v)
-    return ""
-
-
-def _okr_pitcher_hand_from_any(row=None, p=None):
-    sources = []
-    if isinstance(row, dict):
-        sources.append(row)
-    if isinstance(p, dict):
-        sources.append(p)
-    keys = ["Pitcher Hand", "Throws", "Throwing Hand", "Hand", "P Hand", "p_throws", "throws", "arm", "Pitcher Throws"]
-    txts = []
-    for src in sources:
-        for k in keys:
-            try:
-                v = src.get(k)
-                if v not in [None, "", "—"]:
-                    txts.append(str(v).strip().upper())
-            except Exception:
-                pass
-    txt = " ".join(txts)
-    if "LHP" in txt or "LEFT" in txt or txt in ["L", "LH"]:
-        return "LHP"
-    if "RHP" in txt or "RIGHT" in txt or txt in ["R", "RH"]:
-        return "RHP"
-    for t in txts:
-        if t in ["L", "LH", "LHP"]:
-            return "LHP"
-        if t in ["R", "RH", "RHP"]:
-            return "RHP"
-    return "UNKNOWN"
-
-
-def _okr_environment_label(rank, k_pct):
-    r = _okr_num(rank, None)
-    k = _okr_num(k_pct, None)
-    if r is None and k is None:
-        return "NO VERIFIED TEAM K RANK"
-    if (r is not None and r <= 5) or (k is not None and k >= 25.0):
-        return "🔥 ELITE K MATCHUP"
-    if (r is not None and r <= 10) or (k is not None and k >= 23.5):
-        return "🟢 GOOD K MATCHUP"
-    if (r is not None and r >= 26) or (k is not None and k <= 18.5):
-        return "🔴 ELITE CONTACT TEAM"
-    if (r is not None and r >= 21) or (k is not None and k <= 20.5):
-        return "🟠 CONTACT RISK"
-    return "🟡 NEUTRAL K MATCHUP"
-
-
-def _okr_apply_team_k_ranks_to_df(df, board=None):
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return df
-    d = df.copy()
-    table = {}
-    try:
-        table = _okr_fetch_team_k_table(_okr_mlb_season()) or {}
-    except Exception:
-        table = {}
-
-    board_lookup = {}
-    try:
-        for p in board or []:
-            nm = str(p.get("pitcher") or p.get("Pitcher") or p.get("Player") or "").strip().lower()
-            if nm:
-                board_lookup[nm] = p
-    except Exception:
-        board_lookup = {}
-
-    opp_teams, p_teams, hands = [], [], []
-    k_hand, rank_hand, label_hand, source_hand = [], [], [], []
-    k_rhp, r_rhp, k_lhp, r_lhp, k_l30_rhp, r_l30_rhp, k_l30_lhp, r_l30_lhp = [], [], [], [], [], [], [], []
-    top5_note = []
-
-    for _, row in d.iterrows():
-        rd = row.to_dict()
-        name_key = str(rd.get("Pitcher") or rd.get("pitcher") or "").strip().lower()
-        p = board_lookup.get(name_key, {})
-        matchup = rd.get("Matchup") or (p.get("matchup") if isinstance(p, dict) else "")
-        away, home = _okr_matchup_teams(matchup)
-        pt = _okr_pitcher_team_from_board_item(p) or _okr_abbr(rd.get("Team") or rd.get("Pitcher Team") or "")
-        # If pitcher team unavailable, leave opponent blank instead of guessing wrong.
-        opp = ""
-        if pt and away and home:
-            opp = home if pt == away else away if pt == home else ""
-        # fallback: if board dict has opponent/team fields
-        if not opp and isinstance(p, dict):
-            for k in ["opponent", "Opponent", "opp", "Opp"]:
-                if p.get(k):
-                    opp = _okr_abbr(p.get(k)); break
-        hand = _okr_pitcher_hand_from_any(rd, p)
-        rec = table.get(opp, {}) if opp else {}
-        vs_key = "vs LHP" if hand == "LHP" else "vs RHP" if hand == "RHP" else None
-        k_used = rec.get(f"K% {vs_key}") if vs_key else None
-        r_used = rec.get(f"K Rank {vs_key}") if vs_key else None
-        src_used = rec.get(f"K Source {vs_key}") if vs_key else ""
-        # fallback to existing row Opp K% only when verified table is missing; mark as fallback.
-        if k_used in [None, "", "—"]:
-            fallback = _okr_num(rd.get("Opp K%"), None)
-            if fallback is not None:
-                k_used = round(fallback if fallback > 1 else fallback * 100, 1)
-                src_used = "Existing app Opp K% fallback — not ranked"
-        label = _okr_environment_label(r_used, k_used)
-
-        opp_teams.append(opp or "")
-        p_teams.append(pt or "")
-        hands.append(hand)
-        k_hand.append(k_used if k_used is not None else "")
-        rank_hand.append(r_used if r_used is not None else "")
-        label_hand.append(label)
-        source_hand.append(src_used or "")
-        k_rhp.append(rec.get("K% vs RHP", "")); r_rhp.append(rec.get("K Rank vs RHP", ""))
-        k_lhp.append(rec.get("K% vs LHP", "")); r_lhp.append(rec.get("K Rank vs LHP", ""))
-        k_l30_rhp.append(rec.get("K% L30 vs RHP", "")); r_l30_rhp.append(rec.get("K Rank L30 vs RHP", ""))
-        k_l30_lhp.append(rec.get("K% L30 vs LHP", "")); r_l30_lhp.append(rec.get("K Rank L30 vs LHP", ""))
-        top5_note.append("TOP-5 K ENV" if _okr_num(r_used, 99) <= 5 else "")
-
-    d["Opponent Team"] = opp_teams
-    d["Pitcher Team"] = p_teams
-    d["Pitcher Hand"] = hands
-    d["Opponent K% vs Pitcher Hand"] = k_hand
-    d["Opponent K Rank vs Pitcher Hand"] = rank_hand
-    d["Opponent K Environment"] = label_hand
-    d["Opponent K Rank Source"] = source_hand
-    d["Opp K% vs RHP Official"] = k_rhp
-    d["Opp K Rank vs RHP Official"] = r_rhp
-    d["Opp K% vs LHP Official"] = k_lhp
-    d["Opp K Rank vs LHP Official"] = r_lhp
-    d["Opp L30 K% vs RHP Official"] = k_l30_rhp
-    d["Opp L30 K Rank vs RHP Official"] = r_l30_rhp
-    d["Opp L30 K% vs LHP Official"] = k_l30_lhp
-    d["Opp L30 K Rank vs LHP Official"] = r_l30_lhp
-    d["Opponent K Top-5 Note"] = top5_note
-    d["Opponent K Rank Engine Version"] = OPP_K_RANK_ENGINE_VERSION
-    return d
-
-
-def _okr_top5_test_table():
-    """Utility for Streamlit/debug: returns Top 5 team K environments by split from verified pull."""
-    try:
-        table = _okr_fetch_team_k_table(_okr_mlb_season()) or {}
-        rows = []
-        for team, rec in table.items():
-            for split in ["vs RHP", "vs LHP", "L30 vs RHP", "L30 vs LHP"]:
-                rows.append({
-                    "Split": split,
-                    "Team": team,
-                    "K%": rec.get(f"K% {split}"),
-                    "Rank": rec.get(f"K Rank {split}"),
-                    "Source": rec.get(f"K Source {split}"),
-                })
-        df = pd.DataFrame(rows)
-        if df.empty:
-            return df
-        return df[df["Rank"].isin([1,2,3,4,5])].sort_values(["Split", "Rank"])
-    except Exception:
-        return pd.DataFrame()
-
-
-
-# =============================================================
-# OPPONENT K RANK CARD DISPLAY 3.2 — UI ONLY
-# Adds a clean matchup panel to player cards. Does NOT change projections.
-# =============================================================
-def _okr_card_context_from_row(card_row, p=None):
-    """Return verified Opponent K Rank context for player-card display.
-    Prefers the official MLB rank columns created by Opponent Team K Rank Engine.
-    Falls back to existing app Opp K% only if official ranks are unavailable.
-    """
-    try:
-        row = card_row if isinstance(card_row, dict) else {}
-        p = p if isinstance(p, dict) else {}
-        def _first(*keys):
-            for k in keys:
-                v = row.get(k, None)
-                if v not in (None, "", "—"):
-                    return v
-                v = p.get(k, None)
-                if v not in (None, "", "—"):
-                    return v
-            return None
-        opp_team = _first("Opponent Team", "Opponent", "opp", "Opp") or "—"
-        p_hand = _first("Pitcher Hand", "Throws", "Pitcher Throws") or "UNKNOWN"
-        k_hand = _first("Opponent K% vs Pitcher Hand", "Matchup Hand K%")
-        rank_hand = _first("Opponent K Rank vs Pitcher Hand", "Opponent K Rank")
-        env = _first("Opponent K Environment")
-        src = _first("Opponent K Rank Source") or ""
-        # split details for display/audit
-        k_rhp = _first("Opp K% vs RHP Official", "Opp K% vs RHP")
-        r_rhp = _first("Opp K Rank vs RHP Official", "Opp K Rank vs RHP")
-        k_lhp = _first("Opp K% vs LHP Official", "Opp K% vs LHP")
-        r_lhp = _first("Opp K Rank vs LHP Official", "Opp K Rank vs LHP")
-        k_l30_rhp = _first("Opp L30 K% vs RHP Official")
-        r_l30_rhp = _first("Opp L30 K Rank vs RHP Official")
-        k_l30_lhp = _first("Opp L30 K% vs LHP Official")
-        r_l30_lhp = _first("Opp L30 K Rank vs LHP Official")
-        # fallback environment if official label missing
-        if not env:
-            env = _okr_environment_label(rank_hand, k_hand) if "_okr_environment_label" in globals() else "NO VERIFIED TEAM K RANK"
-        def _fmt_pct(v):
-            x = _okr_num(v, None) if "_okr_num" in globals() else safe_float(v, None)
-            if x is None:
-                return "—"
-            if abs(x) <= 1:
-                x *= 100.0
-            return f"{x:.1f}%"
-        def _fmt_rank(v):
-            x = _okr_num(v, None) if "_okr_num" in globals() else safe_float(v, None)
-            return "—" if x is None else f"#{int(x)}"
-        return {
-            "opp_team": str(opp_team),
-            "pitcher_hand": str(p_hand),
-            "k_hand": _fmt_pct(k_hand),
-            "rank_hand": _fmt_rank(rank_hand),
-            "env": str(env),
-            "source": str(src),
-            "rhp_line": f"RHP: {_fmt_pct(k_rhp)} / {_fmt_rank(r_rhp)}",
-            "lhp_line": f"LHP: {_fmt_pct(k_lhp)} / {_fmt_rank(r_lhp)}",
-            "l30_rhp_line": f"L30 RHP: {_fmt_pct(k_l30_rhp)} / {_fmt_rank(r_l30_rhp)}",
-            "l30_lhp_line": f"L30 LHP: {_fmt_pct(k_l30_lhp)} / {_fmt_rank(r_l30_lhp)}",
-        }
-    except Exception:
-        return {
-            "opp_team":"—", "pitcher_hand":"UNKNOWN", "k_hand":"—", "rank_hand":"—",
-            "env":"NO VERIFIED TEAM K RANK", "source":"", "rhp_line":"RHP: — / —",
-            "lhp_line":"LHP: — / —", "l30_rhp_line":"L30 RHP: — / —", "l30_lhp_line":"L30 LHP: — / —"
-        }
-
-# Wrap K projection table export/display without touching projection math.
-if "build_kproj_table" in globals():
-    _prev_okr_build_kproj_table = build_kproj_table
-    def build_kproj_table(board):
-        df = _prev_okr_build_kproj_table(board)
-        try:
-            return _okr_apply_team_k_ranks_to_df(df, board)
-        except Exception:
-            return df
