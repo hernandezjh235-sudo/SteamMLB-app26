@@ -85,17 +85,6 @@ SAVED_ODDS_FILE = os.path.join(STORAGE_DIR, "saved_manual_market_odds.json")
 SAVED_ODDS_BACKUP_FILE = os.path.join(STORAGE_DIR, "saved_manual_market_odds_backup.json")
 SAVED_ODDS_LOCAL_FILE = "saved_manual_market_odds.json"
 
-# =========================
-# SAFE BACKUP / RESTORE STORAGE
-# =========================
-# Streamlit Cloud local files can disappear after a reboot/redeploy. These backups
-# give you a one-click export/import so grades, snapshots, and learning do not
-# depend on Streamlit runtime storage only.
-BACKUP_DIR = os.path.join(STORAGE_DIR, "safe_backups")
-LEARNING_DATA_DIR = "learning_data"
-LEARNING_DATA_BACKUP_DIR = os.path.join(LEARNING_DATA_DIR, "safe_backups")
-FULL_PITCHER_LOG_FILE = os.path.join(LEARNING_DATA_DIR, "pitcher_game_logs_opening_to_2026-06-24.csv")
-
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 MLB_LIVE = "https://statsapi.mlb.com/api/v1.1"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
@@ -419,112 +408,6 @@ def save_json(path, data):
             json.dump(data, f, indent=2)
     except Exception:
         pass
-
-# =========================
-# SAFE BACKUP / RESTORE HELPERS
-# =========================
-def critical_log_paths():
-    """Every file that matters for before snapshots, grading, learning, CLV, and saved odds."""
-    names = [
-        ("auto_pick_log.json", PICK_LOG),
-        ("auto_result_log.json", RESULT_LOG),
-        ("pitcher_learning.json", LEARN_FILE),
-        ("clv_tracker.json", CLV_FILE),
-        ("request_log.json", REQUEST_LOG_FILE),
-        ("signal_tracking.json", SIGNAL_TRACKING_FILE),
-        ("long_backtest_rows.json", LONG_BACKTEST_FILE),
-        ("locked_lineup_cache.json", LINEUP_CACHE_FILE),
-        ("line_history.json", LINE_HISTORY_FILE),
-        ("true_calibration_engine.json", CALIBRATION_ENGINE_FILE),
-        ("bullpen_learning_engine.json", BULLPEN_LEARNING_FILE),
-        ("umpire_learning_engine.json", UMPIRE_LEARNING_FILE),
-        ("graded_feature_bank.json", GRADED_FEATURES_FILE),
-        ("saved_manual_market_odds.json", SAVED_ODDS_FILE),
-        ("saved_manual_market_odds_backup.json", SAVED_ODDS_BACKUP_FILE),
-    ]
-    # These are defined later in the file in older builds; include only once available.
-    for var_name, fname in [
-        ("VOLUME_MISS_LEARNING_FILE", "k_volume_miss_learning.json"),
-        ("MANAGER_PULL_LEARNING_FILE", "manager_pull_learning.json"),
-        ("MISS_REASON_FILE", "k_miss_reason_learning.json"),
-    ]:
-        try:
-            p = globals().get(var_name)
-            if p:
-                names.append((fname, p))
-        except Exception:
-            pass
-    return names
-
-def build_safe_backup_bundle(reason="manual"):
-    bundle = {
-        "backup_version": "ONE_WAY_PICKZ_SAFE_BACKUP_V1",
-        "created_at": now_iso() if "now_iso" in globals() else datetime.now().isoformat(timespec="seconds"),
-        "reason": str(reason),
-        "storage_dir": STORAGE_DIR,
-        "app_version": globals().get("APP_VERSION", "UNKNOWN"),
-        "files": {},
-    }
-    for label, path in critical_log_paths():
-        try:
-            if path and os.path.exists(path):
-                with open(path, "r") as f:
-                    bundle["files"][label] = json.load(f)
-            else:
-                bundle["files"][label] = [] if label.endswith("_log.json") or "tracking" in label or "rows" in label else {}
-        except Exception as e:
-            bundle["files"][label] = {"_backup_read_error": str(e)}
-    return bundle
-
-def write_safe_backup(reason="auto"):
-    """Write a backup bundle to runtime storage and learning_data/safe_backups when possible."""
-    bundle = build_safe_backup_bundle(reason=reason)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname = f"one_way_pickz_backup_{stamp}_{str(reason).replace(' ', '_')[:24]}.json"
-    written = []
-    for folder in [BACKUP_DIR, LEARNING_DATA_BACKUP_DIR]:
-        try:
-            os.makedirs(folder, exist_ok=True)
-            path = os.path.join(folder, fname)
-            with open(path, "w") as f:
-                json.dump(bundle, f, indent=2)
-            written.append(path)
-        except Exception:
-            pass
-    return bundle, written
-
-def restore_safe_backup_bundle(bundle, overwrite=True):
-    """Restore logs from a backup JSON bundle made by build_safe_backup_bundle()."""
-    if not isinstance(bundle, dict) or "files" not in bundle:
-        return {"status": "BAD_BACKUP", "restored": 0}
-    by_label = dict(critical_log_paths())
-    restored = []
-    for label, data in (bundle.get("files") or {}).items():
-        path = by_label.get(label)
-        if not path:
-            continue
-        try:
-            if (not overwrite) and os.path.exists(path):
-                continue
-            save_json(path, data)
-            restored.append(label)
-        except Exception:
-            pass
-    return {"status": "OK", "restored": len(restored), "files": restored}
-
-def backup_counts_summary(bundle=None):
-    bundle = bundle or build_safe_backup_bundle(reason="summary")
-    files = bundle.get("files", {}) if isinstance(bundle, dict) else {}
-    def count(label):
-        obj = files.get(label)
-        return len(obj) if isinstance(obj, list) else (len(obj.keys()) if isinstance(obj, dict) else 0)
-    return {
-        "before_snapshots": count("auto_pick_log.json"),
-        "graded_results": count("auto_result_log.json"),
-        "pitcher_learning_entries": count("pitcher_learning.json"),
-        "long_backtest_rows": count("long_backtest_rows.json"),
-        "saved_manual_odds": count("saved_manual_market_odds.json"),
-    }
 
 # =========================
 # SAVED MANUAL ODDS + NO-VIG HELPERS
@@ -9181,10 +9064,6 @@ def save_many_once(new_picks):
             ids.add(p.get("pick_id"))
             added += 1
     save_json(PICK_LOG, picks[-10000:])
-    try:
-        write_safe_backup(reason="after_save_before_snapshot")
-    except Exception:
-        pass
     return added
 
 
@@ -9666,10 +9545,6 @@ def grade_finished_games():
         graded += 1
     save_json(PICK_LOG, picks[-10000:])
     save_json(RESULT_LOG, results[-10000:])
-    try:
-        write_safe_backup(reason="after_auto_grade")
-    except Exception:
-        pass
     return graded
 
 
@@ -9915,10 +9790,6 @@ def grade_finished_games_from_manual_dataframe(manual_df, allow_overwrite=False)
 
     save_json(PICK_LOG, picks[-10000:])
     save_json(RESULT_LOG, results[-10000:])
-    try:
-        write_safe_backup(reason="after_manual_grade")
-    except Exception:
-        pass
     diag["status"] = "OK"
     diag["results_after"] = len(results)
     diag["saved_snapshots"] = len(picks)
@@ -10723,109 +10594,6 @@ def render_calibration_audit_tab():
 # =========================
 # APP
 # =========================
-# =========================
-# FULL SEASON PITCHER GAME LOG EXPORT
-# =========================
-def _date_range_strings(start_date, end_date):
-    try:
-        sd = pd.to_datetime(start_date).date()
-        ed = pd.to_datetime(end_date).date()
-    except Exception:
-        return []
-    if ed < sd:
-        sd, ed = ed, sd
-    days = []
-    d = sd
-    while d <= ed:
-        days.append(d.strftime("%Y-%m-%d"))
-        d = d + timedelta(days=1)
-    return days
-
-def _boxscore_pitcher_rows(game_pk, game_date=None):
-    data = safe_get_json(f"{MLB_BASE}/game/{game_pk}/boxscore", timeout=20)
-    rows = []
-    if not isinstance(data, dict):
-        return rows
-    teams = data.get("teams") or {}
-    for side in ["away", "home"]:
-        team = (teams.get(side) or {}).get("team") or {}
-        players = (teams.get(side) or {}).get("players") or {}
-        pitcher_ids = (teams.get(side) or {}).get("pitchers") or []
-        for pid in pitcher_ids:
-            p = players.get(f"ID{pid}") or {}
-            person = p.get("person") or {}
-            stat = ((p.get("stats") or {}).get("pitching") or {})
-            if not stat:
-                continue
-            ip_txt = stat.get("inningsPitched")
-            ip_float = baseball_ip_to_float(ip_txt)
-            bf = safe_float(stat.get("battersFaced"), None)
-            so = safe_float(stat.get("strikeOuts"), None)
-            rows.append({
-                "Date": game_date,
-                "GamePK": game_pk,
-                "Team": team.get("abbreviation") or team.get("name"),
-                "TeamName": team.get("name"),
-                "HomeAway": side,
-                "PitcherID": person.get("id") or pid,
-                "Pitcher": person.get("fullName"),
-                "IP": ip_txt,
-                "IP_float": ip_float,
-                "BF": bf,
-                "SO": so,
-                "K%": None if not bf else round((so or 0) / bf * 100, 1),
-                "Pitches": safe_float(stat.get("numberOfPitches"), None),
-                "Strikes": safe_float(stat.get("strikes"), None),
-                "Balls": safe_float(stat.get("balls"), None),
-                "ER": safe_float(stat.get("earnedRuns"), None),
-                "R": safe_float(stat.get("runs"), None),
-                "H": safe_float(stat.get("hits"), None),
-                "BB": safe_float(stat.get("baseOnBalls"), None),
-                "HR": safe_float(stat.get("homeRuns"), None),
-                "HBP": safe_float(stat.get("hitBatsmen"), None),
-                "WP": safe_float(stat.get("wildPitches"), None),
-                "ERA": stat.get("era"),
-                "Note": stat.get("note"),
-            })
-    return rows
-
-def pull_pitcher_game_logs_by_boxscore(start_date="2026-03-26", end_date="2026-06-24", progress_slot=None):
-    """Pull every MLB pitcher game log row by schedule + boxscore.
-
-    This is slower than a single stats endpoint, but it is reliable for a full
-    game-by-game pitcher log because it uses MLB StatsAPI boxscores.
-    """
-    all_rows = []
-    days = _date_range_strings(start_date, end_date)
-    for di, d in enumerate(days):
-        sched = get_schedule(d)
-        games = []
-        for dd in sched.get("dates", []):
-            games.extend(dd.get("games", []) or [])
-        for g in games:
-            game_pk = g.get("gamePk")
-            if not game_pk:
-                continue
-            all_rows.extend(_boxscore_pitcher_rows(game_pk, game_date=d))
-        if progress_slot is not None:
-            try:
-                progress_slot.progress((di + 1) / max(1, len(days)))
-            except Exception:
-                pass
-    df = pd.DataFrame(all_rows)
-    if not df.empty:
-        df = df.drop_duplicates(subset=["Date", "GamePK", "PitcherID", "Team"], keep="last")
-        df = df.sort_values(["Date", "GamePK", "Team", "Pitcher"])
-    return df
-
-def save_full_pitcher_log_csv(df, path=FULL_PITCHER_LOG_FILE):
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        df.to_csv(path, index=False)
-        return path
-    except Exception:
-        return None
-
 st.markdown("""
 <div class="hero-panel">
   <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v11.17 SAFETY GATES + PASS DIRECTION</div>
@@ -27054,7 +26822,7 @@ if "build_kproj_table" in globals():
             return df
 
 
-tab_kproj, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab_full_logs, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab_kproj, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
     "MONEYLINE EDGE",
@@ -27062,7 +26830,6 @@ tab_kproj, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning
     "🧠 30D LEARNING IQ",
     "🧪 LEARNING LAB",
     "CALIBRATION AUDIT",
-    "📊 FULL PITCHER LOGS",
     "ALL PLAYERS",
     "REAL PROP BOARD",
     "STATCAST",
@@ -27091,48 +26858,6 @@ with tab_learning_lab:
 
 with tab_calibration:
     render_calibration_audit_tab()
-
-with tab_full_logs:
-    st.markdown('<div class="section-title-pro">📊 Full Pitcher Game Logs</div>', unsafe_allow_html=True)
-    st.caption("Pulls official MLB StatsAPI pitcher game logs from Opening Day through 2026-06-24 and creates a CSV you can download/use to rebuild grading/history.")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        full_log_start_tab = st.date_input("Start date", value=pd.to_datetime("2026-03-26").date(), key="full_pitcher_log_start_MAIN_TAB")
-    with c2:
-        full_log_end_tab = st.date_input("End date", value=pd.to_datetime("2026-06-24").date(), key="full_pitcher_log_end_MAIN_TAB")
-
-    st.warning("This can take a few minutes on Streamlit. Let it finish, then download the CSV.")
-
-    if st.button("📥 PULL OPENING DAY → 6/24/2026 PITCHER LOGS", use_container_width=True, key="pull_full_pitcher_logs_MAIN_TAB"):
-        prog = st.progress(0)
-        full_df = pull_pitcher_game_logs_by_boxscore(str(full_log_start_tab), str(full_log_end_tab), progress_slot=prog)
-        st.session_state["full_pitcher_game_logs_df"] = full_df
-        saved_path = save_full_pitcher_log_csv(full_df) if not full_df.empty else None
-        st.success(f"Pulled {len(full_df)} pitcher-game rows." + (f" Saved to {saved_path}" if saved_path else ""))
-
-    if os.path.exists(FULL_PITCHER_LOG_FILE):
-        if st.button("📂 Load Saved Pitcher Logs CSV", use_container_width=True, key="load_saved_full_pitcher_logs_MAIN_TAB"):
-            try:
-                st.session_state["full_pitcher_game_logs_df"] = pd.read_csv(FULL_PITCHER_LOG_FILE)
-                st.success(f"Loaded saved CSV: {FULL_PITCHER_LOG_FILE}")
-            except Exception as e:
-                st.error(f"Could not load saved CSV: {e}")
-
-    if isinstance(st.session_state.get("full_pitcher_game_logs_df"), pd.DataFrame) and not st.session_state["full_pitcher_game_logs_df"].empty:
-        _logs_df = st.session_state["full_pitcher_game_logs_df"]
-        st.write(f"Rows loaded: {len(_logs_df)}")
-        st.dataframe(_logs_df.tail(300), use_container_width=True, hide_index=True)
-        st.download_button(
-            "⬇️ Download Full Pitcher Game Logs CSV",
-            data=_logs_df.to_csv(index=False).encode("utf-8"),
-            file_name="pitcher_game_logs_opening_to_2026-06-24.csv",
-            mime="text/csv",
-            use_container_width=True,
-            key="download_full_pitcher_logs_MAIN_TAB",
-        )
-    else:
-        st.info("No pitcher log CSV loaded yet. Click the pull button above.")
 
 with tab2:
     st.markdown('<div class="section-title-pro">All Players</div>', unsafe_allow_html=True)
@@ -27467,59 +27192,6 @@ with tab6:
     st.code(VOLUME_MISS_LEARNING_FILE)
     st.write("Manager Pull Learning File:")
     st.code(MANAGER_PULL_LEARNING_FILE)
-
-    st.subheader("Safe Backup / Restore — Do Not Lose Grades Again")
-    current_bundle = build_safe_backup_bundle(reason="download_now")
-    st.write(backup_counts_summary(current_bundle))
-    backup_json = json.dumps(current_bundle, indent=2).encode("utf-8")
-    st.download_button(
-        "⬇️ Download FULL Backup Now (grades + snapshots + learning)",
-        data=backup_json,
-        file_name=f"one_way_pickz_FULL_BACKUP_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-        mime="application/json",
-        use_container_width=True,
-    )
-    if st.button("💾 Write Backup Copy Inside App Storage", use_container_width=True):
-        bundle, paths = write_safe_backup(reason="manual_settings_button")
-        st.success(f"Backup written: {len(paths)} copy/copies")
-        for pth in paths:
-            st.code(pth)
-    restore_file = st.file_uploader("Restore FULL Backup JSON", type=["json"], key="restore_full_backup_json")
-    if restore_file is not None:
-        try:
-            restore_bundle = json.load(restore_file)
-            st.write("Backup counts:", backup_counts_summary(restore_bundle))
-            if st.button("⚠️ RESTORE THIS BACKUP", use_container_width=True):
-                res = restore_safe_backup_bundle(restore_bundle, overwrite=True)
-                st.success(f"Restore complete: {res.get('restored')} files restored. Restart/rerun the app after this.")
-                st.write(res)
-        except Exception as e:
-            st.error(f"Could not read backup: {e}")
-
-    st.subheader("Full Pitcher Game Logs — Opening Day to 2026-06-24")
-    st.caption("Pulls MLB StatsAPI boxscores into one pitcher-game CSV. Use this to rebuild pitcher history/log inputs after the lost grading data.")
-    log_c1, log_c2 = st.columns(2)
-    with log_c1:
-        full_log_start = st.date_input("Start date", value=pd.to_datetime("2026-03-26").date(), key="full_pitcher_log_start")
-    with log_c2:
-        full_log_end = st.date_input("End date", value=pd.to_datetime("2026-06-24").date(), key="full_pitcher_log_end")
-    if st.button("📥 Pull + Save Full Pitcher Game Logs CSV", use_container_width=True):
-        prog = st.progress(0)
-        full_df = pull_pitcher_game_logs_by_boxscore(str(full_log_start), str(full_log_end), progress_slot=prog)
-        st.session_state["full_pitcher_game_logs_df"] = full_df
-        saved_path = save_full_pitcher_log_csv(full_df) if not full_df.empty else None
-        st.success(f"Pulled {len(full_df)} pitcher-game rows." + (f" Saved to {saved_path}" if saved_path else ""))
-    if isinstance(st.session_state.get("full_pitcher_game_logs_df"), pd.DataFrame) and not st.session_state["full_pitcher_game_logs_df"].empty:
-        _logs_df = st.session_state["full_pitcher_game_logs_df"]
-        st.dataframe(_logs_df.tail(300), use_container_width=True, hide_index=True)
-        st.download_button(
-            "⬇️ Download Full Pitcher Game Logs CSV",
-            data=_logs_df.to_csv(index=False).encode("utf-8"),
-            file_name="pitcher_game_logs_opening_to_2026-06-24.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
     st.subheader("Advanced Model Status")
     xgb_train_df = build_xgb_training_frame()
     st.write(f"XGBoost training samples available: {len(xgb_train_df)} / {XGB_MIN_GRADED_SAMPLES} needed")
@@ -27548,25 +27220,16 @@ with tab6:
             save_json(REQUEST_LOG_FILE, [])
             st.warning("Request logs cleared.")
     with col_c:
-        clear_confirm = st.text_input("Type CLEAR to enable Clear ALL Logs", key="clear_all_logs_confirm")
         if st.button("Clear ALL Logs"):
-            if clear_confirm != "CLEAR":
-                st.warning("Not cleared. Type CLEAR first. Download a FULL Backup before using this.")
-            else:
-                try:
-                    bundle, paths = write_safe_backup(reason="before_clear_all_logs")
-                    st.info(f"Safety backup created before clear: {len(paths)} copy/copies")
-                except Exception:
-                    pass
-                save_json(PICK_LOG, [])
-                save_json(RESULT_LOG, [])
-                save_json(LEARN_FILE, {})
-                save_json(CLV_FILE, {})
-                save_json(SIGNAL_TRACKING_FILE, [])
-                save_json(LONG_BACKTEST_FILE, [])
-                save_json(LINE_HISTORY_FILE, {})
-                save_json(LINEUP_CACHE_FILE, {})
-                st.error("All logs cleared after safety backup.")
+            save_json(PICK_LOG, [])
+            save_json(RESULT_LOG, [])
+            save_json(LEARN_FILE, {})
+            save_json(CLV_FILE, {})
+            save_json(SIGNAL_TRACKING_FILE, [])
+            save_json(LONG_BACKTEST_FILE, [])
+            save_json(LINE_HISTORY_FILE, {})
+            save_json(LINEUP_CACHE_FILE, {})
+            st.error("All logs cleared.")
 
 
 # =========================
