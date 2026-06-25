@@ -27054,7 +27054,7 @@ if "build_kproj_table" in globals():
             return df
 
 
-tab_kproj, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab_kproj, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab_full_logs, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
     "MONEYLINE EDGE",
@@ -27062,6 +27062,7 @@ tab_kproj, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning
     "🧠 30D LEARNING IQ",
     "🧪 LEARNING LAB",
     "CALIBRATION AUDIT",
+    "📊 FULL PITCHER LOGS",
     "ALL PLAYERS",
     "REAL PROP BOARD",
     "STATCAST",
@@ -27090,6 +27091,48 @@ with tab_learning_lab:
 
 with tab_calibration:
     render_calibration_audit_tab()
+
+with tab_full_logs:
+    st.markdown('<div class="section-title-pro">📊 Full Pitcher Game Logs</div>', unsafe_allow_html=True)
+    st.caption("Pulls official MLB StatsAPI pitcher game logs from Opening Day through 2026-06-24 and creates a CSV you can download/use to rebuild grading/history.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        full_log_start_tab = st.date_input("Start date", value=pd.to_datetime("2026-03-26").date(), key="full_pitcher_log_start_MAIN_TAB")
+    with c2:
+        full_log_end_tab = st.date_input("End date", value=pd.to_datetime("2026-06-24").date(), key="full_pitcher_log_end_MAIN_TAB")
+
+    st.warning("This can take a few minutes on Streamlit. Let it finish, then download the CSV.")
+
+    if st.button("📥 PULL OPENING DAY → 6/24/2026 PITCHER LOGS", use_container_width=True, key="pull_full_pitcher_logs_MAIN_TAB"):
+        prog = st.progress(0)
+        full_df = pull_pitcher_game_logs_by_boxscore(str(full_log_start_tab), str(full_log_end_tab), progress_slot=prog)
+        st.session_state["full_pitcher_game_logs_df"] = full_df
+        saved_path = save_full_pitcher_log_csv(full_df) if not full_df.empty else None
+        st.success(f"Pulled {len(full_df)} pitcher-game rows." + (f" Saved to {saved_path}" if saved_path else ""))
+
+    if os.path.exists(FULL_PITCHER_LOG_FILE):
+        if st.button("📂 Load Saved Pitcher Logs CSV", use_container_width=True, key="load_saved_full_pitcher_logs_MAIN_TAB"):
+            try:
+                st.session_state["full_pitcher_game_logs_df"] = pd.read_csv(FULL_PITCHER_LOG_FILE)
+                st.success(f"Loaded saved CSV: {FULL_PITCHER_LOG_FILE}")
+            except Exception as e:
+                st.error(f"Could not load saved CSV: {e}")
+
+    if isinstance(st.session_state.get("full_pitcher_game_logs_df"), pd.DataFrame) and not st.session_state["full_pitcher_game_logs_df"].empty:
+        _logs_df = st.session_state["full_pitcher_game_logs_df"]
+        st.write(f"Rows loaded: {len(_logs_df)}")
+        st.dataframe(_logs_df.tail(300), use_container_width=True, hide_index=True)
+        st.download_button(
+            "⬇️ Download Full Pitcher Game Logs CSV",
+            data=_logs_df.to_csv(index=False).encode("utf-8"),
+            file_name="pitcher_game_logs_opening_to_2026-06-24.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="download_full_pitcher_logs_MAIN_TAB",
+        )
+    else:
+        st.info("No pitcher log CSV loaded yet. Click the pull button above.")
 
 with tab2:
     st.markdown('<div class="section-title-pro">All Players</div>', unsafe_allow_html=True)
