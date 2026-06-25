@@ -12241,7 +12241,7 @@ def render_kproj_pitcher_card(p):
         <div class="mobile-info-card"><div class="small-muted">Line Audit</div><div class="kpi-value" style="font-size:16px;">{p.get('line_history_grade', '—')}</div><div class="kpi-sub">L10 {p.get('line_l10_avg', '—')} | HR {'' if p.get('line_recent_hit_rate') is None else str(round((p.get('line_recent_hit_rate') or 0)*100))+'%'}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Innings</div><div class="kpi-value" style="font-size:18px;">{p.get('projected_ip', '—')} IP</div><div class="kpi-sub">Pull: {p.get('early_pull_label', '—')} | Pitches {p.get('projected_pitches', '—')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Pitch Count</div><div class="kpi-value" style="font-size:18px;">{p.get('pitch_count_score', '—')}</div><div class="kpi-sub">{p.get('pitch_count_label', '—')} | L3 {p.get('pitch_count_avg_l3', '—')}</div></div>
-        <div class="mobile-info-card"><div class="small-muted">Opponent Team K Rank</div><div class="kpi-value" style="font-size:15px;">{okr_env_display}</div><div class="kpi-sub">Opp {okr_team_display} vs {okr_hand_display}: {okr_k_hand_display} / {okr_rank_hand_display}<br>{okr_l30_rhp_line}<br>{okr_l30_lhp_line}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Opponent Team K Rank</div><div class="kpi-value" style="font-size:15px;">{okr_env_display}</div><div class="kpi-sub">Opp {okr_team_display} vs {okr_hand_display}: {okr_k_hand_display} / {okr_rank_hand_display}<br>{okr_rhp_line}<br>{okr_lhp_line}<br>{okr_l30_rhp_line}<br>{okr_l30_lhp_line}</div></div>
         <div class="mobile-info-card"><div class="small-muted">1st Inning Layer</div><div class="kpi-value" style="font-size:15px;">{fi_label_display}</div><div class="kpi-sub">Sample {fi_sample_display} | Avg Pitches {fi_avg_p_display}<br>BF {fi_avg_bf_display} | 1st-K {fi_avg_k_display}<br>{fi_conf_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Decision Tier 3.0</div><div class="kpi-value" style="font-size:15px;">{decision_tier_display}</div><div class="kpi-sub">{decision_tier_note_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Ace / Veteran / Rookie</div><div class="kpi-value" style="font-size:15px;">{html.escape(exp_label_display)}</div><div class="kpi-sub">Score {exp_score_display} | {exp_bf_factor_display}</div></div>
@@ -12688,7 +12688,32 @@ def render_kproj_tab(board):
         seen_card_pitchers.add(nm)
         card_board.append(p)
     priority = sorted(card_board, key=lambda p: ("🔥" in str(kproj_decision(p).get("decision")), safe_float(kproj_decision(p).get("confidence"), 0) or 0, kproj_upside_projection(p)), reverse=True)
-    for p in priority[:20]:
+
+    # AUDIT 1/2 — card coverage check: every projection-board row should have one card.
+    # This is display/debug only; it does not change projections, decisions, odds, or exports.
+    try:
+        st.caption(f"Player-card coverage check: {len(priority)} cards shown for {len(df)} projection-board rows.")
+        if len(priority) != len(df):
+            st.warning(f"Card count mismatch: board rows={len(df)} but cards={len(priority)}. Check pitcher-name/team mapping.")
+    except Exception:
+        pass
+
+    # AUDIT 2/2 — Opponent Team K Rank verification panel.
+    # Shows the verified Top-5 lists from the same MLB official pull used by the card boxes.
+    try:
+        with st.expander("Opponent Team K Rank Audit — Top 5 by split", expanded=False):
+            st.caption("Pulled from MLB.com official team hitting stats backend. Rank #1 = highest team K%. This is an audit panel only.")
+            ktop = _okr_top5_test_table() if '_okr_top5_test_table' in globals() else pd.DataFrame()
+            if isinstance(ktop, pd.DataFrame) and not ktop.empty:
+                st.dataframe(ktop, use_container_width=True, hide_index=True)
+            else:
+                st.info("No verified Top-5 K rank table returned yet. If this is blank, MLB endpoint/cache did not populate.")
+    except Exception:
+        pass
+
+    # IMPORTANT: render every card, not just the top 20.
+    # If the board has 29 pitcher rows, this renders 29 pitcher cards.
+    for p in priority:
         render_kproj_pitcher_card(p)
 
 
