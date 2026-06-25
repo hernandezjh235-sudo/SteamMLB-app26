@@ -22,7 +22,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "ONE WAY PICKZ v11.17 + SPORTSGAMEODDS LIVE MARKET REFRESH + MANUAL ODDS SAVE FALLBACK"
+APP_VERSION = "ONE WAY PICKZ v11.17 VERIFIED LEARNING BUILD + ACTIVE MANAGER/RUN SUPPRESSION + STABLE PROJECTIONS + CARD + BASEBALL IQ FULL SYNC + FINAL SLATE COPY"
 # =========================
 # STABLE PROJECTION SEEDING
 # =========================
@@ -84,10 +84,6 @@ GRADED_FEATURES_FILE = os.path.join(STORAGE_DIR, "graded_feature_bank.json")
 SAVED_ODDS_FILE = os.path.join(STORAGE_DIR, "saved_manual_market_odds.json")
 SAVED_ODDS_BACKUP_FILE = os.path.join(STORAGE_DIR, "saved_manual_market_odds_backup.json")
 SAVED_ODDS_LOCAL_FILE = "saved_manual_market_odds.json"
-# Persistent before-game projection board cache. This preserves the full player-card board
-# after app restart/close and after grading. It is separate from manual odds.
-SAVED_PROJECTION_BOARD_FILE = os.path.join(STORAGE_DIR, "saved_projection_board_latest.json")
-SAVED_PROJECTION_BOARD_BACKUP_FILE = os.path.join(STORAGE_DIR, "saved_projection_board_latest_backup.json")
 
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 MLB_LIVE = "https://statsapi.mlb.com/api/v1.1"
@@ -252,13 +248,12 @@ def get_secret(key, default=""):
 
 # SharpAPI is intentionally hardcoded ONLY for the pitcher-K market/sharp odds feed.
 # Projection, BF/IP, pitch count, lineup, sabermetric, and DIPS engines do not use this key.
-ODDS_API_KEY = get_secret("ODDS_API_KEY", get_secret("THE_ODDS_API_KEY", ""))  # The Odds API live MLB pitcher-K props; market-only, never changes projections.
+ODDS_API_KEY = ""  # Disabled: old OddsAPI path is not active in get_sportsbook_k_data().
 SHARPAPI_KEY = "sk_live_UUk8eejunMDA96uM4vRAQT"
 # Optional manual market odds fallback text is assigned from the Streamlit sidebar at runtime.
 # It is used ONLY for Market/Sharp cards and never changes K projection, BF, IP, pitch count, lineups, or active UD line.
 MANUAL_MARKET_ODDS_TEXT = ""
-# Prefer SPORTSGAMEODDS_API_KEY. Also accepts ODDS_API_KEY as a fallback so old Streamlit secrets keep working.
-SPORTSGAMEODDS_API_KEY = get_secret("SPORTSGAMEODDS_API_KEY", get_secret("ODDS_API_KEY", ""))
+SPORTSGAMEODDS_API_KEY = get_secret("SPORTSGAMEODDS_API_KEY", "")
 OPTICODDS_API_KEY = get_secret("OPTICODDS_API_KEY", "")
 
 # =========================
@@ -6577,32 +6572,13 @@ def get_sportsbook_event_pitcher_k_lines(event_id, player_name):
     return source_result("Sportsbook", "FOUND", line=consensus, rows=rows, message=f"Found {len(rows)} sportsbook outcomes")
 
 def get_sportsbook_k_data(game_home, game_away, player_name):
-    """Return live sportsbook pitcher-K odds for Market/Sharp cards only.
-
-    Source priority:
-      1) SportsGameOdds live MLB pitcher-K odds
-      2) SharpAPI fallback if enabled
-      3) Manual odds fallback is merged later in make_projection()
+    """Return real sportsbook K odds from SharpAPI for market/sharp only.
 
     Projection independence rule: this source is never used to change pitcher skill,
     BF, IP, pitch count, lineups, sabermetrics, DIPS, or active Underdog line.
-    It only fills Market / No-Vig / Sharp / agreement cards and export fields.
+    It only fills Market / Sharp / agreement cards.
     """
-    sgo = get_sportsgameodds_k_data(player_name, game_home, game_away)
-    if str(sgo.get("status", "")).upper() == "FOUND" and sgo.get("rows"):
-        return sgo
-
-    sharp = get_sharpapi_mlb_pitcher_k_lines(player_name, game_home, game_away)
-    if str(sharp.get("status", "")).upper() == "FOUND" and sharp.get("rows"):
-        sharp["message"] = f"SharpAPI fallback used. SportsGameOdds: {sgo.get('status')} — {sgo.get('message')}"
-        return sharp
-
-    return source_result(
-        "SportsGameOdds",
-        "NO LIVE ODDS",
-        rows=[],
-        message=f"No live pitcher-K odds matched. SportsGameOdds: {sgo.get('status')} — {sgo.get('message')} | SharpAPI: {sharp.get('status')} — {sharp.get('message')}"
-    )
+    return get_sharpapi_mlb_pitcher_k_lines(player_name, game_home, game_away)
 
 def get_manual_market_k_data(player_name, active_line=None):
     """Manual sportsbook odds fallback for Market/Sharp cards only.
@@ -7066,98 +7042,24 @@ def get_underdog_k_data(player_name):
         message=f"Live Underdog line matched: {float(active):.1f} via {best_row.get('Matched Name')} ({best_row.get('Parser Mode')}); rejected debug rows hidden to prevent wrong-sport noise"
     )
 
-@st.cache_data(ttl=240, show_spinner=False)
-def get_sportsgameodds_k_data(player_name, game_home=None, game_away=None):
-    """SportsGameOdds live MLB pitcher-K odds.
-
-    Market-only source. It may update Market/No-Vig/CLV cards, but it must never
-    change the K projection, BF, IP, pitch count, lineup, or active Underdog line.
-    """
+@st.cache_data(ttl=600, show_spinner=False)
+def get_sportsgameodds_k_data(player_name):
     if not SPORTSGAMEODDS_API_KEY:
-        return source_result(
-            "SportsGameOdds", "DISABLED", rows=[],
-            message="Add SPORTSGAMEODDS_API_KEY in Streamlit Secrets. ODDS_API_KEY is also accepted as fallback."
-        )
-
-    # SportsGameOdds quick-start docs show /v2/events with apiKey, oddsAvailable=true, leagueID=MLB.
-    # We keep several endpoint/parameter shapes because account plans can expose different payload schemas.
-    endpoints = [
-        (f"{SPORTSGAMEODDS_BASE}/events", {
-            "apiKey": SPORTSGAMEODDS_API_KEY,
-            "oddsAvailable": "true",
-            "leagueID": "MLB",
-            "limit": 100,
-        }),
-        (f"{SPORTSGAMEODDS_BASE}/events", {
-            "apiKey": SPORTSGAMEODDS_API_KEY,
-            "leagueID": "MLB",
-            "oddIDs": "pitcher_strikeouts,player_pitcher_strikeouts,pitcher_strikeouts_alternate",
-            "limit": 100,
-        }),
-        (f"{SPORTSGAMEODDS_BASE}/odds", {
-            "apiKey": SPORTSGAMEODDS_API_KEY,
-            "leagueID": "MLB",
-            "market": "pitcher_strikeouts",
-            "limit": 100,
-        }),
-        (f"{SPORTSGAMEODDS_BASE}/props", {
-            "apiKey": SPORTSGAMEODDS_API_KEY,
-            "leagueID": "MLB",
-            "market": "pitcher_strikeouts",
-            "limit": 100,
-        }),
-    ]
-    headers = {
-        "X-Api-Key": SPORTSGAMEODDS_API_KEY,
-        "Authorization": f"Bearer {SPORTSGAMEODDS_API_KEY}",
-        "Accept": "application/json",
-    }
+        return source_result("SportsGameOdds", "DISABLED", message="Add SPORTSGAMEODDS_API_KEY to enable")
+    endpoints = [f"{SPORTSGAMEODDS_BASE}/events", f"{SPORTSGAMEODDS_BASE}/odds", f"{SPORTSGAMEODDS_BASE}/props"]
+    headers = {"X-Api-Key": SPORTSGAMEODDS_API_KEY, "Authorization": f"Bearer {SPORTSGAMEODDS_API_KEY}"}
     all_rows = []
-    tried = []
     last_msg = ""
-    for url, params in endpoints:
-        data = safe_get_json(url, params=params, headers=headers, timeout=20)
-        tried.append(url.split("/v2/")[-1])
+    for url in endpoints:
+        data = safe_get_json(url, params={"sport": "baseball", "league": "mlb", "market": "player_pitcher_strikeouts"}, headers=headers, timeout=16)
         if not data:
             last_msg = f"No JSON from {url}"
             continue
-        rows = extract_prop_rows_from_any_json(data, player_name, "SportsGameOdds")
-        # If teams are supplied, prefer rows whose raw event/team blob contains one of the game teams.
-        if rows and (game_home or game_away):
-            team_aliases = _team_alias_set(game_home) | _team_alias_set(game_away)
-            filtered = []
-            for r in rows:
-                blob = normalize_name(" ".join(str(r.get(k, "")) for k in ["Event", "Provider", "Market", "Matched Name"]))
-                if not team_aliases or any(a and a in blob for a in team_aliases):
-                    filtered.append(r)
-            rows = filtered or rows
-        all_rows.extend(rows)
-
-    # De-duplicate and require a usable price/line/side where possible.
-    dedup = {}
-    for r in all_rows:
-        if safe_float(r.get("Line")) is None:
-            continue
-        side = str(r.get("Side", "")).upper()
-        if "OVER" not in side and "UNDER" not in side:
-            # Keep row, but label unknown side so it will not be used as a paired price.
-            r["Side"] = side or "UNKNOWN"
-        key = (r.get("Provider"), r.get("Line"), r.get("Side"), r.get("Price"), r.get("Matched Name"))
-        dedup[key] = r
-    rows = list(dedup.values())
-
-    if not rows:
-        return source_result(
-            "SportsGameOdds", "NO MATCH", rows=[],
-            message=(last_msg or "No SportsGameOdds pitcher-K row matched") + f" | tried={','.join(tried)}"
-        )
-
-    lines = [safe_float(r.get("Line")) for r in rows if safe_float(r.get("Line")) is not None]
-    consensus = float(np.median(lines)) if lines else None
-    return source_result(
-        "SportsGameOdds", "FOUND", line=consensus, rows=rows,
-        message=f"Found {len(rows)} SportsGameOdds pitcher-K rows | tried={','.join(tried)}"
-    )
+        all_rows.extend(extract_prop_rows_from_any_json(data, player_name, "SportsGameOdds"))
+    if not all_rows:
+        return source_result("SportsGameOdds", "NO MATCH", message=last_msg or "No SportsGameOdds row matched")
+    lines = [safe_float(r.get("Line")) for r in all_rows if safe_float(r.get("Line")) is not None]
+    return source_result("SportsGameOdds", "FOUND", line=float(np.median(lines)), rows=all_rows, message=f"Found {len(all_rows)} SportsGameOdds rows")
 
 @st.cache_data(ttl=600, show_spinner=False)
 def get_opticodds_k_data(player_name):
@@ -8535,12 +8437,11 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     sportsbook_data = get_sportsbook_k_data(row["home_team"], row["away_team"], pitcher_name)
     pp_data = get_prizepicks_k_data(pitcher_name)
     ud_data = get_underdog_k_data(pitcher_name)
-    # Active-line backup only. Live SportsGameOdds market prices are already isolated in sportsbook_data.
-    sgo_data = get_sportsgameodds_k_data(pitcher_name, row["home_team"], row["away_team"]) if use_sgo else source_result("SportsGameOdds", "MARKET_ONLY", message="SportsGameOdds kept out of active-line selection")
+    sgo_data = get_sportsgameodds_k_data(pitcher_name) if use_sgo else source_result("SportsGameOdds", "OFF", message="Optional source turned off")
     optic_data = get_opticodds_k_data(pitcher_name) if use_optic else source_result("OpticOdds", "OFF", message="Optional source turned off")
 
-    # Keep live sportsbook odds isolated to Market/Sharp only. They should NOT set or shift the active K line.
-    # Active line still comes from Underdog/PrizePicks/optional active-line sources.
+    # Keep The Odds API isolated to Market/Sharp only. It should NOT set or shift the active K line.
+    # Active line still comes from Underdog/PrizePicks/optional sources.
     market_only_blank = source_result("Sportsbook", "MARKET_ONLY", line=None, rows=[], message="Odds API kept out of active-line selection")
     active_line, active_source, consensus = choose_active_line(market_only_blank, pp_data, ud_data, sgo_data, optic_data)
 
@@ -9007,11 +8908,6 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "odds": price,
         "price_is_real": bool(price_is_real),
         "price_source": price_source,
-        "live_odds_status": sportsbook_data.get("status"),
-        "live_odds_source": sportsbook_data.get("source", sportsbook_data.get("Source", "Sportsbook")),
-        "live_odds_message": sportsbook_data.get("message"),
-        "live_odds_line": sportsbook_data.get("line"),
-        "live_odds_rows_count": len(sportsbook_data.get("rows", []) or []),
         "market_over_odds": market_intel.get("market_over_odds") if "market_intel" in locals() else None,
         "market_under_odds": market_intel.get("market_under_odds") if "market_intel" in locals() else None,
         "market_over_implied": market_intel.get("market_over_implied") if "market_intel" in locals() else None,
@@ -9169,48 +9065,6 @@ def save_many_once(new_picks):
             added += 1
     save_json(PICK_LOG, picks[-10000:])
     return added
-
-
-def save_projection_board_snapshot(picks, dates=None, label="OFFICIAL_BEFORE_GAME_BOARD"):
-    """Persist the full projection board/card list exactly as it appeared before games.
-
-    This is intentionally separate from manual odds and grading logs. Grading can update
-    PICK_LOG/RESULT_LOG, but this file keeps the saved player-card board available
-    after app restart/close so you can reopen the app and still see the same projections.
-    """
-    clean = []
-    for p in picks or []:
-        if isinstance(p, dict):
-            q = dict(p)
-            q.setdefault("snapshot_type", label)
-            q.setdefault("official_snapshot_saved_at", now_iso())
-            clean.append(q)
-    payload = {
-        "saved_at": now_iso(),
-        "dates": list(dates or []),
-        "count": len(clean),
-        "label": label,
-        "picks": clean,
-    }
-    save_json(SAVED_PROJECTION_BOARD_FILE, payload)
-    save_json(SAVED_PROJECTION_BOARD_BACKUP_FILE, payload)
-    return len(clean)
-
-
-def load_projection_board_snapshot(dates=None):
-    """Load the latest saved projection board. Prefer matching date, but never lose it after grading."""
-    wanted = set(dates or [])
-    for path in [SAVED_PROJECTION_BOARD_FILE, SAVED_PROJECTION_BOARD_BACKUP_FILE]:
-        payload = load_json(path, {})
-        picks = payload.get("picks") if isinstance(payload, dict) else payload
-        if not isinstance(picks, list) or not picks:
-            continue
-        if wanted:
-            dated = [p for p in picks if str(p.get("date") or "") in wanted]
-            if dated:
-                return dated, payload
-        return picks, payload
-    return [], {}
 
 
 # =========================
@@ -10765,36 +10619,13 @@ with st.sidebar:
     use_weather = st.checkbox("Use live weather adjustment", value=True)
     use_umpire = st.checkbox("Use capped umpire tendency", value=True)
     use_xgboost_assist = st.checkbox("Experimental: capped XGBoost assist", value=False)
-    # SportsGameOdds is market-only by default. It refreshes current odds but does not change projection math or Underdog line.
+    # Clean manual-market build: paid/live odds APIs are disabled so they cannot fight the board/cards.
     use_sgo = False
     use_optic = False
     MANUAL_MARKET_ODDS_TEXT = ""
     st.divider()
     st.header("Manual Market Odds")
     st.caption("Refresh first. Then this build creates a pitcher/line table where you only enter Over/Under odds. Market odds never change K projection, BF/IP, pitch count, lineups, or Underdog line.")
-    st.divider()
-    st.header("SportsGameOdds Live Odds")
-    st.caption("SportsGameOdds is market-only. It can update Market / No-Vig / CLV reads, but it never changes K projection, BF, IP, pitch count, lineups, or the Underdog line.")
-    if SPORTSGAMEODDS_API_KEY:
-        st.success("SPORTSGAMEODDS_API_KEY detected")
-    else:
-        st.warning("No SPORTSGAMEODDS_API_KEY found. Add it in Streamlit Secrets. ODDS_API_KEY also works as fallback.")
-    live_test_pitcher = st.text_input("Test SportsGameOdds pitcher", value="", placeholder="Example: Tarik Skubal")
-    live_test_home = st.text_input("Test home team abbreviation", value="", placeholder="Example: DET")
-    live_test_away = st.text_input("Test away team abbreviation", value="", placeholder="Example: NYY")
-    if st.button("🧪 Test SportsGameOdds Pitcher K Pull", use_container_width=True):
-        if not live_test_pitcher.strip():
-            st.warning("Enter a pitcher name first.")
-        else:
-            test_res = get_sportsgameodds_k_data(live_test_pitcher.strip(), live_test_home.strip() or None, live_test_away.strip() or None)
-            st.write({"status": test_res.get("status"), "line": test_res.get("line"), "message": test_res.get("message"), "rows": len(test_res.get("rows", []) or [])})
-            if test_res.get("rows"):
-                cols = [c for c in ['Provider','Player','Matched Name','Line','Side','Price','Market','Event','Last Update'] if c in pd.DataFrame(test_res.get("rows", [])).columns]
-                st.dataframe(pd.DataFrame(test_res.get("rows", []))[cols].head(60), use_container_width=True)
-    if st.button("🔄 Refresh SportsGameOdds Odds Cache", use_container_width=True):
-        st.cache_data.clear()
-        st.session_state.pop("saved_manual_odds_auto_applied", None)
-        st.success("SportsGameOdds cache cleared. Click REFRESH LIVE BOARD, or use the card refresh button after the board loads.")
     if st.button("🧹 Clear Streamlit Cache + Reload Live Lines", use_container_width=True):
         st.cache_data.clear()
         st.session_state.loaded_picks = []
@@ -10802,7 +10633,7 @@ with st.sidebar:
         st.session_state.pop("manual_market_table", None)
         st.session_state.pop("saved_manual_odds_auto_applied", None)
         st.success("Cache cleared. Now click REFRESH LIVE BOARD again.")
-    st.caption("Manual odds remain the fallback if SportsGameOdds has no pitcher-K price.")
+    st.caption("SportsGameOdds and OpticOdds are removed from this build. Manual table controls the Market card only.")
 
 dates = target_dates(day_mode)
 
@@ -10861,9 +10692,8 @@ if save_btn:
         st.warning("Refresh the live board first, inspect the lines, then save the official before-game snapshot.")
     else:
         added = save_many_once(st.session_state.loaded_picks)
-        board_saved_count = save_projection_board_snapshot(st.session_state.loaded_picks, dates=dates)
         st.session_state.last_saved_count = added
-        st.success(f"Saved official before-game snapshot. Added {added} new rows. Saved projection board/card cache: {board_saved_count} players.")
+        st.success(f"Saved official before-game snapshot. Added {added} new rows.")
 
 
 # =========================
@@ -10963,57 +10793,12 @@ def _manual_market_apply_to_picks(picks, table_rows):
         out.append(p2)
     return out, updated
 
-def _sportsbook_market_apply_to_picks(picks):
-    """Refresh SportsGameOdds/Sharp market prices on existing cards only.
-
-    Does not change projection, active line, IP, BF, decision side from projection, or saved official snapshots.
-    """
-    updated = 0
-    out = []
-    for pp in picks or []:
-        p2 = dict(pp)
-        name = str(p2.get("pitcher") or p2.get("Pitcher") or "").strip()
-        if not name:
-            out.append(p2)
-            continue
-        line = safe_float(p2.get("line") if p2.get("line") is not None else p2.get("UD/Line"), None)
-        proj = safe_float(p2.get("projection") if p2.get("projection") is not None else p2.get("Line-Aware Smart Final K Projection"), None)
-        if line is None:
-            out.append(p2)
-            continue
-        live = get_sportsbook_k_data(p2.get("home_team") or p2.get("Home Team"), p2.get("away_team") or p2.get("Away Team"), name)
-        rows = live.get("rows", []) or []
-        model_side = _projection_side_from_projection_line(proj, line, p2.get("pick_side"))
-        intel = build_market_odds_intelligence(rows, line, model_side, p2.get("fair_probability"))
-        if rows and (intel.get("market_over_odds") is not None or intel.get("market_under_odds") is not None):
-            p2.update(intel)
-            p2["market_source"] = live.get("source") or live.get("Source") or "SportsGameOdds"
-            p2["live_odds_status"] = live.get("status")
-            p2["live_odds_source"] = live.get("source") or live.get("Source") or "SportsGameOdds"
-            p2["live_odds_message"] = live.get("message")
-            p2["live_odds_line"] = live.get("line")
-            p2["live_odds_rows_count"] = len(rows)
-            p2 = _manual_market_reconcile_pick(p2)
-            updated += 1
-        else:
-            p2["live_odds_status"] = live.get("status")
-            p2["live_odds_source"] = live.get("source") or live.get("Source") or "SportsGameOdds"
-            p2["live_odds_message"] = live.get("message")
-            p2["live_odds_rows_count"] = len(rows)
-        out.append(p2)
-    return out, updated
-
 
 if st.session_state.get("loaded_picks"):
     with st.sidebar:
         st.divider()
         st.header("Manual Odds Table")
         st.caption("Auto-filled from the refreshed board. Enter odds only, then press Apply. Exact pitcher + exact line are already locked.")
-        if st.button("🔄 Refresh SportsGameOdds odds on current cards", use_container_width=True):
-            st.cache_data.clear()
-            st.session_state.loaded_picks, live_count = _sportsbook_market_apply_to_picks(st.session_state.loaded_picks)
-            st.success(f"Refreshed SportsGameOdds market odds on {live_count} card(s). Manual odds remain as fallback.")
-            st.rerun()
         defaults = _manual_market_default_rows(st.session_state.loaded_picks)
         edited = st.data_editor(
             pd.DataFrame(defaults),
@@ -11074,36 +10859,11 @@ if st.session_state.get("loaded_picks"):
     board = st.session_state.loaded_picks
     board_status = "LIVE REFRESHED BOARD — NOT OFFICIAL UNLESS SAVED"
 else:
-    # First load the preserved full projection-board cache. This is the board you saved
-    # before games, and it should still show after closing/reopening the app or after grading.
-    board, _saved_board_payload = load_projection_board_snapshot(dates)
-    if board:
-        board_status = f"SAVED PROJECTION BOARD/CARDS — {len(board)} PLAYERS"
-    else:
-        # Fallback to old PICK_LOG rows if no board-cache file exists yet.
-        board = [p for p in saved if p.get("date") in dates]
-        board_status = "SAVED OFFICIAL SNAPSHOTS FROM PICK_LOG"
+    board = [p for p in saved if p.get("date") in dates]
     saved_rows_for_board = load_saved_manual_odds_rows()
     if saved_rows_for_board:
         board, _manual_saved_count = _manual_market_apply_to_picks(board, saved_rows_for_board)
-
-# Saved Projection Board protection:
-# If you saved the before-game projection board, closed the app, and reopen later,
-# this board comes from PICK_LOG. This button refreshes SportsGameOdds market odds
-# on THAT saved projection board without rebuilding/changing the saved K projections.
-if board and not st.session_state.get("loaded_picks"):
-    with st.sidebar:
-        st.divider()
-        st.header("Saved Projection Board")
-        st.caption("Saved before-game projection board/cards are loaded from the persistent board cache first, then PICK_LOG as fallback. This refresh updates live market odds only; it does not rerun or change K projections/IP/BF.")
-        if st.button("🔄 Refresh SportsGameOdds odds on saved projection board", use_container_width=True):
-            st.cache_data.clear()
-            refreshed_board, live_count = _sportsbook_market_apply_to_picks(board)
-            st.session_state.loaded_picks = refreshed_board
-            st.session_state.last_refresh_time = now_iso()
-            st.session_state.pop("saved_manual_odds_auto_applied", None)
-            st.success(f"Loaded saved projection board and refreshed SportsGameOdds odds on {live_count} card(s).")
-            st.rerun()
+    board_status = "SAVED OFFICIAL SNAPSHOTS"
 
 if hide_no_line:
     board = [p for p in board if p.get("line") is not None]
