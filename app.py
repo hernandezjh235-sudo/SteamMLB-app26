@@ -28590,21 +28590,51 @@ def _beta_dynamic_ip(row):
 
 @st.cache_data(ttl=240, show_spinner=False)
 def _beta_fetch_underdog_pitcher_market(player_name, market_kind):
-    """Small generic Underdog parser for beta market lines: OUTS and ER_ALLOWED."""
+    """Robust Underdog parser for beta pitcher markets.
+
+    Fixes the first beta issue where lines showed 0 because the parser only
+    looked for one narrow market label. This version mirrors the K parser more
+    closely and accepts Underdog JSON:API relationship layouts where the market
+    title can live on over_under, appearance, appearance_stat, option, or stat
+    objects.
+
+    Supported market_kind:
+    - OUTS = Pitching Outs / Outs Recorded
+    - ER   = Earned Runs Allowed
+    """
     import json, re
     try:
         urls = UNDERDOG_URLS
     except Exception:
         return {"status": "DISABLED", "line": None, "rows": [], "message": "UNDERDOG_URLS unavailable"}
 
-    if market_kind == "OUTS":
-        market_terms = ["pitching outs", "outs recorded", "recorded outs", "pitcher outs", "outs"]
-        bad_terms = ["strikeouts", "earned runs", "hits allowed", "walks", "fantasy", "batters faced"]
-        lo, hi = 3.5, 24.5
+    mk = str(market_kind or "").upper()
+    if mk == "OUTS":
+        market_label = "Pitching Outs"
+        market_terms = [
+            "pitching outs", "pitcher outs", "outs recorded", "recorded outs",
+            "outs", "o "
+        ]
+        bad_terms = [
+            "strikeout", "strikeouts", "earned run", "earned runs", "er allowed",
+            "hits allowed", "walks", "fantasy", "batters faced", "h+r", "rbis"
+        ]
+        lo, hi = 6.5, 24.5
     else:
-        market_terms = ["earned runs allowed", "earned run allowed", "earned runs", "er allowed"]
-        bad_terms = ["strikeouts", "outs", "hits allowed", "walks", "fantasy", "batters faced"]
+        market_label = "Earned Runs Allowed"
+        market_terms = [
+            "earned runs allowed", "earned run allowed", "earned runs", "earned run",
+            "er allowed", "ers allowed", "earned_runs_allowed", "era"
+        ]
+        bad_terms = [
+            "strikeout", "strikeouts", "outs", "hits allowed", "walks", "fantasy",
+            "batters faced", "runs allowed"  # runs allowed is not always earned runs
+        ]
         lo, hi = 0.5, 8.5
+
+    target_norm = normalize_name(player_name)
+    accepted_rows = []
+    last_msg = ""
 
     def attrs(obj):
         if not isinstance(obj, dict):
@@ -28618,25 +28648,23 @@ def _beta_fetch_underdog_pitcher_market(player_name, market_kind):
                 out[k] = v
         return out
 
-    def typ(obj, fallback=""):
-        if not isinstance(obj, dict):
-            return str(fallback or "").lower().replace("-", "_")
-        return str(obj.get("type") or fallback or obj.get("_parent_key", "")).lower().replace("-", "_")
+    def obj_type(obj, fallback=""):
+        return str(obj.get("type") or fallback or obj.get("_parent_key", "")).lower().replace("-", "_") if isinstance(obj, dict) else ""
 
-    def oid(obj):
+    def obj_id(obj):
         if not isinstance(obj, dict):
             return None
         v = obj.get("id") or attrs(obj).get("id")
         return str(v) if v not in [None, ""] else None
 
-    def collect(data):
-        out = []
+    def collect_objects(data):
+        objects = []
         def walk(x, parent_key=""):
             if isinstance(x, dict):
                 y = dict(x)
                 if parent_key and "_parent_key" not in y:
                     y["_parent_key"] = parent_key
-                out.append(y)
+                objects.append(y)
                 for k, v in x.items():
                     if isinstance(v, (dict, list)):
                         walk(v, k)
@@ -28644,26 +28672,28 @@ def _beta_fetch_underdog_pitcher_market(player_name, market_kind):
                 for item in x:
                     walk(item, parent_key)
         walk(data)
-        return out
+        return objects
 
     def build_maps(objects):
-        by_key, by_id = {}, {}
-        for o in objects:
-            i = oid(o)
-            if not i:
+        by_id_any = {}
+        by_key = {}
+        for obj in objects:
+            oid = obj_id(obj)
+            if not oid:
                 continue
-            t = typ(o)
-            for tt in {t, t.rstrip('s'), t + 's'}:
-                by_key[(tt, i)] = o
-            by_id.setdefault(i, []).append(o)
-        return by_key, by_id
+            typ = obj_type(obj)
+            by_id_any.setdefault(oid, []).append(obj)
+            for tt in {typ, typ.rstrip("s"), typ + "s"}:
+                by_key[(tt, oid)] = obj
+        return by_id_any, by_key
 
-    def rel_obj(obj, names, by_key, by_id):
+    def rel_objects(obj, rel_names, by_id_any, by_key):
+        hits = []
         if not isinstance(obj, dict):
-            return None
+            return hits
         rels = obj.get("relationships") or {}
-        for name in names:
-            keys = {name, name.replace("_", "-"), name.replace("_", ""), name.rstrip('s'), name + 's'}
+        for name in rel_names:
+            keys = {name, name.replace("_", "-"), name.replace("_", ""), name.rstrip("s"), name + "s"}
             for key in keys:
                 node = rels.get(key)
                 if node is None:
@@ -28673,22 +28703,52 @@ def _beta_fetch_underdog_pitcher_market(player_name, market_kind):
                 for item in items:
                     if not isinstance(item, dict):
                         continue
-                    ri = item.get("id")
-                    rt = str(item.get("type") or key or "").lower().replace("-", "_")
-                    if ri in [None, ""]:
+                    rid = item.get("id")
+                    rtype = str(item.get("type") or key or "").lower().replace("-", "_")
+                    if rid in [None, ""]:
                         continue
-                    for cand_t in [rt, rt.rstrip('s'), rt + 's', key, key.rstrip('s'), key + 's']:
-                        hit = by_key.get((cand_t, str(ri)))
-                        if hit is not None:
-                            return hit
-                    candidates = by_id.get(str(ri), [])
-                    if candidates:
-                        return candidates[0]
-        return None
+                    found = None
+                    for cand_t in [rtype, rtype.rstrip("s"), rtype + "s", key, key.rstrip("s"), key + "s"]:
+                        found = by_key.get((cand_t, str(rid)))
+                        if found is not None:
+                            break
+                    if found is not None:
+                        hits.append(found)
+                    else:
+                        hits.extend(by_id_any.get(str(rid), []))
+        return hits
 
-    def text_from(*objs):
+    def gather_related(seed, by_id_any, by_key):
+        related = []
+        stack = [seed]
+        seen = set()
+        rel_names = [
+            "over_under", "over_unders", "appearance", "appearances", "player", "players",
+            "appearance_stat", "appearance_stats", "stat", "stats", "option", "options",
+            "market", "markets", "game", "event", "sport", "league"
+        ]
+        while stack and len(related) < 20:
+            obj = stack.pop(0)
+            if not isinstance(obj, dict):
+                continue
+            key = (obj_type(obj), obj_id(obj), id(obj))
+            if key in seen:
+                continue
+            seen.add(key)
+            related.append(obj)
+            for nxt in rel_objects(obj, rel_names, by_id_any, by_key):
+                stack.append(nxt)
+        return related
+
+    def text_from(*objs, include_json=False):
         parts = []
-        wanted = ["title", "display_title", "name", "player_name", "full_name", "first_name", "last_name", "display_name", "stat", "stat_type", "appearance_stat", "display_stat", "label", "market", "market_name", "sport", "league", "description", "over_under_title", "scoring_type", "projection_type", "appearance_name", "position"]
+        wanted = [
+            "title", "display_title", "name", "player_name", "full_name", "first_name", "last_name",
+            "display_name", "short_name", "abbr_name", "stat", "stat_type", "appearance_stat",
+            "display_stat", "label", "market", "market_name", "sport", "league", "sport_name",
+            "league_name", "position", "description", "over_under_title", "scoring_type",
+            "projection_type", "appearance_name", "category", "type"
+        ]
         for obj in objs:
             if not isinstance(obj, dict):
                 continue
@@ -28701,20 +28761,16 @@ def _beta_fetch_underdog_pitcher_market(player_name, market_kind):
                         parts.extend(str(x) for x in v.values() if x not in [None, ""] and not isinstance(x, (dict, list)))
                     elif v not in [None, ""] and not isinstance(v, (dict, list)):
                         parts.append(str(v))
-        try:
-            for obj in objs:
-                if isinstance(obj, dict):
-                    parts.append(json.dumps(obj, default=str)[:500])
-        except Exception:
-            pass
+            if include_json:
+                try:
+                    parts.append(json.dumps(obj, default=str)[:800])
+                except Exception:
+                    pass
         return " | ".join(parts)
 
-    def active_ok(*objs):
-        blob = " ".join(str(attrs(o).get(k, "")) for o in objs if isinstance(o, dict) for k in ["status", "state", "display_status", "hidden", "active"]).lower()
-        return not any(x in blob for x in ["suspended", "removed", "hidden true", "inactive", "closed", "disabled"])
-
-    def structured_line(*objs):
-        keys = ["stat_value", "line", "over_under_line", "target_value", "line_score", "overUnderLine", "display_stat_value"]
+    def line_from_obj(*objs):
+        # Real Underdog target fields only. Do not use prices/odds.
+        keys = ["stat_value", "line_score", "over_under_line", "target_value", "display_stat_value", "line"]
         for obj in objs:
             if not isinstance(obj, dict):
                 continue
@@ -28722,65 +28778,163 @@ def _beta_fetch_underdog_pitcher_market(player_name, market_kind):
                 if not isinstance(d, dict):
                     continue
                 for k in keys:
-                    raw = d.get(k)
-                    v = _beta_num(raw, None)
+                    v = _beta_num(d.get(k), None)
                     if v is not None and lo <= v <= hi and abs(v * 2 - round(v * 2)) < 1e-9:
-                        return float(v)
-        return None
+                        return float(v), f"{k} from Underdog object"
+        # Fallback: half-line from market text, still constrained by market range.
+        blob = text_from(*objs, include_json=False)
+        for m in re.findall(r"(?<!\d)(\d{1,2}\.5)(?!\d)", blob):
+            v = _beta_num(m, None)
+            if v is not None and lo <= v <= hi:
+                return float(v), "half-line from Underdog text"
+        return None, "no valid market line"
 
-    def market_ok(txt):
-        low = str(txt or "").lower()
-        if not any(t in low for t in market_terms):
-            return False
+    def player_name_from(*objs):
+        candidates = []
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            a = attrs(obj)
+            candidates.extend([
+                a.get("display_name"), a.get("full_name"), a.get("name"), a.get("player_name"),
+                a.get("short_name"), a.get("abbreviation"), a.get("abbr_name"),
+                (str(a.get("first_name", "")).strip() + " " + str(a.get("last_name", "")).strip()).strip(),
+            ])
+        for c in candidates:
+            if c and normalize_name(c):
+                return str(c)
+        return ""
+
+    def underdog_player_score(evidence, matched=""):
+        score = max(name_score(player_name, evidence), name_score(player_name, matched))
+        t_parts = target_norm.split()
+        ev = normalize_name(evidence)
+        if len(t_parts) >= 2:
+            initial = t_parts[0][:1]
+            last = t_parts[-1]
+            if last in ev:
+                toks = ev.split()
+                for i, tok in enumerate(toks):
+                    if tok == last and i > 0 and toks[i-1][:1] == initial:
+                        score = max(score, 0.93)
+                if initial in ev:
+                    score = max(score, 0.88)
+        if target_norm and target_norm in ev:
+            score = max(score, 0.94)
+        return score
+
+    def market_ok(blob, line=None):
+        low = str(blob or "").lower()
         if any(b in low for b in bad_terms):
             return False
-        return True
+        # Outs can safely infer from 10.5+ pitcher prop lines when player matches strongly.
+        if mk == "OUTS" and line is not None and line >= 10.5:
+            if not any(x in low for x in ["strikeout", "earned", "hit", "walk", "fantasy"]):
+                return True
+        return any(t in low for t in market_terms)
 
-    rows = []
+    def active_status_ok(*objs):
+        status_blob = " ".join(
+            str(attrs(o).get(k, ""))
+            for o in objs if isinstance(o, dict)
+            for k in ["status", "state", "display_status", "over_status", "under_status", "hidden", "active"]
+        ).lower()
+        return not any(x in status_blob for x in ["suspended", "removed", "hidden true", "inactive", "closed", "disabled"])
+
     for url in urls:
         data = safe_get_json(url, timeout=18)
         if not data:
+            last_msg = f"No JSON from {url}"
             continue
-        objects = collect(data)
-        by_key, by_id = build_maps(objects)
+        objects = collect_objects(data)
+        by_id_any, by_key = build_maps(objects)
         candidates = []
-        for o in objects:
-            a = attrs(o)
-            t = typ(o)
-            if "over_under_line" in t or any(a.get(k) not in [None, ""] for k in ["stat_value", "line_score", "over_under_line", "target_value", "line"]):
-                candidates.append(o)
+        for obj in objects:
+            typ = obj_type(obj)
+            a = attrs(obj)
+            if "over_under_line" in typ or any(a.get(k) not in [None, ""] for k in ["stat_value", "line_score", "over_under_line", "target_value", "display_stat_value", "line"]):
+                candidates.append(obj)
+
         for line_obj in candidates:
-            ou_obj = rel_obj(line_obj, ["over_under", "over_unders"], by_key, by_id)
-            app_obj = rel_obj(ou_obj, ["appearance", "appearances"], by_key, by_id) or rel_obj(line_obj, ["appearance", "appearances"], by_key, by_id)
-            player_obj = rel_obj(app_obj, ["player", "players"], by_key, by_id) or rel_obj(ou_obj, ["player", "players"], by_key, by_id) or rel_obj(line_obj, ["player", "players"], by_key, by_id)
-            blob = text_from(line_obj, ou_obj, app_obj, player_obj)
-            if "mlb" not in blob.lower() and "baseball" not in blob.lower():
-                # allow if player strongly matches; Underdog sometimes omits sport text in related object
-                pass
-            if not market_ok(blob):
+            related = gather_related(line_obj, by_id_any, by_key)
+            blob = text_from(*related, include_json=False)
+            blob_json = text_from(*related, include_json=True)
+            if is_bad_sport_text(blob_json.lower()):
                 continue
-            score = max(name_score(player_name, blob), 0.0)
-            if normalize_name(player_name) in normalize_name(blob):
-                score = max(score, 0.94)
-            if score < 0.78:
+            # Keep MLB/baseball only when sport text is present; if omitted, strong player+market match is enough.
+            chosen_line, line_note = line_from_obj(*related)
+            if chosen_line is None:
                 continue
-            line = structured_line(line_obj, ou_obj, app_obj)
+            if not market_ok(blob_json, chosen_line):
+                continue
+            matched = player_name_from(*related)
+            score = underdog_player_score(blob_json, matched)
+            if score < 0.82:
+                continue
+            if not active_status_ok(*related):
+                continue
+            accepted_rows.append({
+                "Source": "Underdog", "Provider": "Underdog", "Player": player_name,
+                "Matched Name": matched or player_name,
+                "Market": market_label,
+                "Line": float(chosen_line),
+                "Match Score": round(float(score), 3),
+                "Line Evidence": line_note,
+                "Parser Mode": "relationship+recursive",
+                "Evidence": blob[:240],
+            })
+
+        # Ultra fallback for Underdog layouts that put everything inside one object blob.
+        for obj in objects:
+            try:
+                blob_json = json.dumps(obj, default=str)
+            except Exception:
+                continue
+            low = blob_json.lower()
+            if is_bad_sport_text(low):
+                continue
+            line, line_note = line_from_obj(obj)
             if line is None:
                 continue
-            if not active_ok(line_obj, ou_obj, app_obj, player_obj):
+            if not market_ok(low, line):
                 continue
-            rows.append({
+            score = underdog_player_score(blob_json)
+            if score < 0.86:
+                continue
+            if not active_status_ok(obj):
+                continue
+            accepted_rows.append({
                 "Source": "Underdog", "Provider": "Underdog", "Player": player_name,
-                "Market": "Pitching Outs" if market_kind == "OUTS" else "Earned Runs Allowed",
-                "Line": line, "Match Score": round(score, 3), "Evidence": blob[:180]
+                "Matched Name": player_name,
+                "Market": market_label,
+                "Line": float(line),
+                "Match Score": round(float(score), 3),
+                "Line Evidence": line_note,
+                "Parser Mode": "object-blob fallback",
+                "Evidence": blob_json[:240],
             })
-        if rows:
+
+        if accepted_rows:
             break
-    if not rows:
-        return {"status": "NO MATCH", "line": None, "rows": [], "message": f"No active Underdog {market_kind} line matched"}
-    # Prefer half-point lines and best match.
-    rows = sorted(rows, key=lambda r: (abs((_beta_num(r.get("Line"), 0) * 2) - round(_beta_num(r.get("Line"), 0) * 2)) < 1e-9, r.get("Match Score", 0)), reverse=True)
-    return {"status": "FOUND", "line": rows[0]["Line"], "rows": rows, "message": f"Matched {market_kind} {rows[0]['Line']}"}
+
+    if not accepted_rows:
+        return {"status": "NO MATCH", "line": None, "rows": [], "message": last_msg or f"No active Underdog {market_label} line matched"}
+
+    # Dedup and choose the best live line. Prefer stronger match, relationship rows, and half-point market lines.
+    dedup = {}
+    for r in accepted_rows:
+        key = (r.get("Matched Name"), r.get("Market"), r.get("Line"), r.get("Parser Mode"))
+        if key not in dedup or _beta_num(r.get("Match Score"), 0) > _beta_num(dedup[key].get("Match Score"), 0):
+            dedup[key] = r
+    rows = list(dedup.values())
+
+    def rank_row(r):
+        rel_bonus = 1 if "relationship" in str(r.get("Parser Mode", "")) else 0
+        half_bonus = 1 if abs(float(r.get("Line", 0)) * 2 - round(float(r.get("Line", 0)) * 2)) < 1e-9 else 0
+        return (round(_beta_num(r.get("Match Score"), 0), 2), rel_bonus, half_bonus, float(r.get("Line", 0)))
+
+    best = sorted(rows, key=rank_row, reverse=True)[0]
+    return {"status": "FOUND", "line": float(best["Line"]), "rows": sorted(rows, key=rank_row, reverse=True), "message": f"Matched Underdog {market_label} {float(best['Line']):.1f}"}
 
 
 def _beta_projection_rows(board, market_kind="OUTS"):
@@ -28840,6 +28994,90 @@ def _beta_projection_rows(board, market_kind="OUTS"):
     return pd.DataFrame(rows)
 
 
+
+
+def _beta_market_slug(market_kind):
+    return "outs" if str(market_kind).upper() == "OUTS" else "er_allowed"
+
+def _beta_market_dir():
+    d = Path("mlb_engine")
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+def _beta_save_official_board(df, market_kind):
+    """Save beta official board the same way the K tab workflow does conceptually.
+    This is separate from K learning and does not overwrite K files.
+    """
+    try:
+        slug = _beta_market_slug(market_kind)
+        clean = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        if clean.empty:
+            return False, "No rows to save."
+        clean["Saved At"] = datetime.now().isoformat(timespec="seconds")
+        clean["Market Kind"] = slug
+        path = _beta_market_dir() / f"beta_{slug}_official_board.csv"
+        hist = _beta_market_dir() / f"beta_{slug}_official_history.csv"
+        clean.to_csv(path, index=False)
+        if hist.exists():
+            old = pd.read_csv(hist)
+            out = pd.concat([old, clean], ignore_index=True)
+        else:
+            out = clean
+        out.to_csv(hist, index=False)
+        try:
+            json_path = _beta_market_dir() / f"beta_{slug}_official_board.json"
+            json_path.write_text(clean.to_json(orient="records", indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        return True, f"Saved {len(clean)} {slug} beta rows to {path}"
+    except Exception as e:
+        return False, f"Save failed: {e}"
+
+def _beta_grade_saved_board(df, market_kind):
+    """Grade beta rows only when actual result columns are present.
+    Keeps beta grading independent so it cannot corrupt K Upside learning.
+    """
+    try:
+        slug = _beta_market_slug(market_kind)
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return {"graded": 0, "message": "No beta rows to grade."}
+        actual_cols = ["Actual", "Actual Result", "Actual Outs", "Actual ER", "Result", "Final"]
+        actual_col = next((c for c in actual_cols if c in df.columns), None)
+        if actual_col is None:
+            return {"graded": 0, "message": "No final result column found yet. Save official board now; grade after finals/results are available."}
+        d = df.copy()
+        d["Actual Value"] = pd.to_numeric(d[actual_col], errors="coerce")
+        d = d[d["Actual Value"].notna()].copy()
+        if d.empty:
+            return {"graded": 0, "message": "No numeric final results found yet."}
+        def win_row(r):
+            line = _beta_num(r.get("UD Line"), None)
+            lean = str(r.get("Beta Lean", "")).upper()
+            actual = _beta_num(r.get("Actual Value"), None)
+            if line is None or actual is None or "NO LINE" in lean or lean in ["", "—"]:
+                return None
+            if "UNDER" in lean:
+                return actual < line
+            if "OVER" in lean:
+                return actual > line
+            return None
+        d["Beta Win"] = d.apply(win_row, axis=1)
+        d["Graded At"] = datetime.now().isoformat(timespec="seconds")
+        path = _beta_market_dir() / f"beta_{slug}_result_log.csv"
+        if path.exists():
+            old = pd.read_csv(path)
+            out = pd.concat([old, d], ignore_index=True)
+        else:
+            out = d
+        out.to_csv(path, index=False)
+        wins = int((d["Beta Win"] == True).sum())
+        losses = int((d["Beta Win"] == False).sum())
+        return {"graded": int(len(d)), "wins": wins, "losses": losses, "message": f"Graded {len(d)} beta {slug} rows: {wins}-{losses}"}
+    except Exception as e:
+        return {"graded": 0, "message": f"Grade failed: {e}"}
 def render_beta_pitching_outs_tab(board):
     st.markdown('<div class="section-title-pro">🎯 Pitching Outs BETA</div>', unsafe_allow_html=True)
     st.caption("Tester only. Pulls Underdog Pitching Outs lines when available. K PROJ / Upside is untouched.")
@@ -28847,6 +29085,20 @@ def render_beta_pitching_outs_tab(board):
     if df.empty:
         st.info("No beta outs rows yet. Refresh the board first.")
         return
+    s1, s2 = st.columns(2)
+    if s1.button("💾 Save Outs Official Board", key="save_beta_outs_board"):
+        ok, msg = _beta_save_official_board(df, "OUTS")
+        (st.success if ok else st.warning)(msg)
+    if s2.button("✅ Grade Saved Outs Picks", key="grade_beta_outs_board"):
+        res = _beta_grade_saved_board(df, "OUTS")
+        st.info(res.get("message"))
+    s1, s2 = st.columns(2)
+    if s1.button("💾 Save ER Official Board", key="save_beta_er_board"):
+        ok, msg = _beta_save_official_board(df, "ER")
+        (st.success if ok else st.warning)(msg)
+    if s2.button("✅ Grade Saved ER Picks", key="grade_beta_er_board"):
+        res = _beta_grade_saved_board(df, "ER")
+        st.info(res.get("message"))
     a,b,c = st.columns(3)
     a.metric("Rows", len(df))
     b.metric("UD Outs Lines", int((df["Line Status"].astype(str) == "FOUND").sum()) if "Line Status" in df.columns else 0)
