@@ -8874,6 +8874,10 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "projected_ip": innings_outcome.get("projected_ip"),
         "ip_floor": innings_outcome.get("ip_floor"),
         "ip_ceiling": innings_outcome.get("ip_ceiling"),
+        "outs_projection": innings_outcome.get("outs_projection"),
+        "outs_floor": innings_outcome.get("outs_floor"),
+        "outs_ceiling": innings_outcome.get("outs_ceiling"),
+        "beta_ip_version": innings_outcome.get("beta_ip_version"),
         "recent_ip_l3": innings_outcome.get("recent_ip_l3"),
         "recent_ip_l5": innings_outcome.get("recent_ip_l5"),
         "recent_ip_l10": innings_outcome.get("recent_ip_l10"),
@@ -10401,7 +10405,11 @@ def official_card_k_row(p):
         df = build_kproj_table([p])
         _OFFICIAL_CARD_ROW_GUARD = False
         if df is not None and not df.empty:
-            return df.iloc[0].to_dict()
+            row = df.iloc[0].to_dict()
+            # Display-only: card row is one-player, so overlay the slate-wide rank map.
+            if '_owp_overlay_full_board_pitcher_k_rank' in globals():
+                row = _owp_overlay_full_board_pitcher_k_rank(row)
+            return row
     except Exception:
         try:
             _OFFICIAL_CARD_ROW_GUARD = False
@@ -12565,6 +12573,7 @@ def render_kproj_pitcher_card(p):
         <div class="mobile-info-card"><div class="small-muted">Sharp</div><div class="kpi-value" style="font-size:18px;">{p.get('sharp_warning', 'NONE')}</div><div class="kpi-sub">{p.get('market_agreement', '')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Line Audit</div><div class="kpi-value" style="font-size:16px;">{p.get('line_history_grade', '—')}</div><div class="kpi-sub">L10 {p.get('line_l10_avg', '—')} | HR {'' if p.get('line_recent_hit_rate') is None else str(round((p.get('line_recent_hit_rate') or 0)*100))+'%'}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Innings</div><div class="kpi-value" style="font-size:18px;">{p.get('projected_ip', '—')} IP</div><div class="kpi-sub">Pull: {p.get('early_pull_label', '—')} | Pitches {p.get('projected_pitches', '—')}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Outs Projection</div><div class="kpi-value" style="font-size:18px;">{p.get('outs_projection', '—')}</div><div class="kpi-sub">Floor {p.get('outs_floor', '—')} | Ceiling {p.get('outs_ceiling', '—')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Pitch Count</div><div class="kpi-value" style="font-size:18px;">{p.get('pitch_count_score', '—')}</div><div class="kpi-sub">{p.get('pitch_count_label', '—')} | L3 {p.get('pitch_count_avg_l3', '—')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Pitcher K% Strength</div><div class="kpi-value" style="font-size:15px;">{pitcher_k_strength_display}</div><div class="kpi-sub">Pitcher K% {pk*100:.1f}% | Board Rank {pitcher_k_rank_display}<br>{pitcher_k_rank_source_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Opponent Team K Rank</div><div class="kpi-value" style="font-size:15px;">{okr_env_display}</div><div class="kpi-sub">Opp {okr_team_display} vs {okr_hand_display}: {okr_k_hand_display} / {okr_rank_hand_display}<br>{okr_overall_line}<br>{okr_overall_so_line}<br>{okr_l30_overall_line}<br>{okr_l30_so_line}<br>{okr_rhp_line}<br>{okr_lhp_line}<br>{okr_l30_rhp_line}<br>{okr_l30_lhp_line}<br>{team_k_read_display}<br>Source: {okr_official_source_line}<br>MI Nudge: {card_row.get("Matchup Intel K Nudge", "—") if isinstance(card_row, dict) else "—"} K | {card_row.get("Matchup Intel Label", "—") if isinstance(card_row, dict) else "—"}</div></div>
@@ -12971,6 +12980,9 @@ def render_kproj_tab(board):
     # slates, downloads, and pitcher-card filtering. This prevents Sale/Will-style
     # duplicate lines from showing different projections in different sections.
     df = _owp_one_final_row_per_pitcher(df)
+    # Display-only rank fix: compute Pitcher K% rank from the final visible board, not per-card one-row tables.
+    if '_owp_apply_pitcher_k_board_ranks_display_only' in globals():
+        df = _owp_apply_pitcher_k_board_ranks_display_only(df)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("K Proj Rows", len(df))
     c2.metric("Over Leans", int(df["Decision"].astype(str).str.contains("OVER", regex=False).sum()) if not df.empty else 0)
@@ -26984,6 +26996,102 @@ def _okr_pitcher_strength_label(rank, k_pct):
 
 
 
+
+
+# DISPLAY-ONLY FIX: compute Pitcher K% board ranks from the FULL visible slate, not from a one-card row.
+# This does NOT change projections, decisions, simulations, learning, or grading.
+def _owp_apply_pitcher_k_board_ranks_display_only(df):
+    """Assign slate-wide Pitcher K% board ranks after the full projection board is built.
+
+    Previously, pitcher cards could build a one-player table for display syncing; if rank was
+    calculated on that one-row table, every card could show Board Rank #1. This function ranks
+    the full displayed dataframe only, stores the rank map in session_state, and leaves all model
+    projection columns untouched.
+    """
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+        d = df.copy()
+        if "Pitcher" not in d.columns:
+            return d
+        if "Pitcher K%" not in d.columns:
+            d["Pitcher K% Board Rank"] = "—"
+            d["Pitcher K% Strength Label"] = "PITCHER K% UNKNOWN"
+            d["Pitcher K% Rank Source"] = "Full visible projection board | unavailable"
+            return d
+
+        vals = []
+        for idx, row in d.iterrows():
+            try:
+                v = safe_float(row.get("Pitcher K%"), None)
+            except Exception:
+                v = None
+            if v is None:
+                continue
+            # App stores K% as decimal in most places; display/export uses percent.
+            if abs(float(v)) <= 1:
+                v = float(v) * 100.0
+            vals.append((idx, float(v)))
+
+        # Stable competition ranking: ties get same rank, next rank skips accordingly.
+        ranked = sorted(vals, key=lambda x: (-x[1], str(d.loc[x[0]].get("Pitcher", ""))))
+        rank_map = {}
+        last_val = None
+        last_rank = 0
+        for pos, (idx, v) in enumerate(ranked, start=1):
+            if last_val is None or abs(v - last_val) > 1e-9:
+                last_rank = pos
+                last_val = v
+            rank_map[idx] = last_rank
+
+        d["Pitcher K% Board Rank"] = [rank_map.get(idx, "—") for idx in d.index]
+        d["Pitcher K% Strength Label"] = [
+            _okr_pitcher_strength_label(rank_map.get(idx, None), safe_float(d.loc[idx].get("Pitcher K%"), None))
+            for idx in d.index
+        ]
+        d["Pitcher K% Rank Source"] = "Full visible projection board | rank #1 = highest Pitcher K%"
+
+        # Store lookup for the mobile player cards, which rebuild a one-row table for card sync.
+        card_map = {}
+        for idx, row in d.iterrows():
+            nm = str(row.get("Pitcher") or "").strip()
+            if not nm:
+                continue
+            key = nm.lower()
+            card_map[key] = {
+                "rank": rank_map.get(idx, "—"),
+                "label": row.get("Pitcher K% Strength Label", "—"),
+                "source": "Full visible projection board | rank #1 = highest Pitcher K%",
+            }
+        try:
+            st.session_state["_owp_pitcher_k_full_board_rank_map"] = card_map
+        except Exception:
+            pass
+        return d
+    except Exception:
+        return df
+
+
+def _owp_overlay_full_board_pitcher_k_rank(card_row):
+    """Overlay the full-board rank onto a one-player card row; display-only."""
+    try:
+        if not isinstance(card_row, dict):
+            return card_row
+        nm = str(card_row.get("Pitcher") or card_row.get("pitcher") or "").strip().lower()
+        if not nm:
+            return card_row
+        rank_map = st.session_state.get("_owp_pitcher_k_full_board_rank_map", {})
+        info = rank_map.get(nm)
+        if not info:
+            return card_row
+        out = dict(card_row)
+        out["Pitcher K% Board Rank"] = info.get("rank", "—")
+        out["Pitcher K% Strength Label"] = info.get("label", out.get("Pitcher K% Strength Label", "—"))
+        out["Pitcher K% Rank Source"] = info.get("source", "Full visible projection board | rank #1 = highest Pitcher K%")
+        return out
+    except Exception:
+        return card_row
+
 def _okr_mi_blended_k_pct(rec, hand):
     """Verified MLB team K% blend for small projection nudge.
 
@@ -28355,6 +28463,236 @@ def render_moneyline_edge_tab(board, dates=None):
 
 # Keep the existing Moneyline UI, but its data now comes from ML_30_UPGRADE_VERSION.
 
+
+
+
+
+# ============================================================
+# BETA TESTER IP + OUTS ENGINE 1.0
+# Purpose: test improved starter volume / projected innings / outs.
+# Scope: separate beta file only. K skill, K%, opponent K%, and K formula are not rewritten.
+# Changes only the volume inputs that feed opportunity (BF/IP) and adds Outs projections.
+# ============================================================
+BETA_TESTER_IP_OUTS_VERSION = "BETA_TESTER_IP_OUTS_1_0_2026_06_30"
+
+def _bt_float(x, default=None):
+    try:
+        if x is None or x == "" or x == "—":
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+def _bt_mean(vals):
+    vals = [_bt_float(v, None) for v in (vals or [])]
+    vals = [v for v in vals if v is not None]
+    return float(np.mean(vals)) if vals else None
+
+def _bt_weighted(vals, weights):
+    pairs = [(v, w) for v, w in zip(vals, weights) if v is not None]
+    if not pairs:
+        return None
+    den = sum(w for _, w in pairs)
+    return sum(v*w for v, w in pairs) / den if den else None
+
+def _bt_recent_arrays(recent_rows):
+    rows = list(recent_rows or [])[:10]
+    return {
+        "ip": [_bt_float(r.get("IP_float", r.get("IP")), None) for r in rows],
+        "bf": [_bt_float(r.get("BF"), None) for r in rows],
+        "pitches": [_bt_float(r.get("Pitches"), None) for r in rows],
+        "er": [_bt_float(r.get("ER"), None) for r in rows],
+        "h": [_bt_float(r.get("H"), None) for r in rows],
+        "bb": [_bt_float(r.get("BB"), None) for r in rows],
+        "ks": [_bt_float(r.get("Ks"), None) for r in rows],
+    }
+
+def _bt_bf_per_ip(recent_rows):
+    vals = []
+    for r in list(recent_rows or [])[:8]:
+        ip = _bt_float(r.get("IP_float", r.get("IP")), None)
+        bf = _bt_float(r.get("BF"), None)
+        if ip and ip > 0 and bf and bf > 0:
+            vals.append(bf / ip)
+    return float(clamp(np.mean(vals), 3.65, 5.20)) if vals else 4.25
+
+def _bt_ppb(recent_rows, fallback=3.9):
+    vals = []
+    for r in list(recent_rows or [])[:8]:
+        p = _bt_float(r.get("Pitches"), None)
+        bf = _bt_float(r.get("BF"), None)
+        if p and p > 0 and bf and bf > 0:
+            vals.append(p / bf)
+    return float(clamp(np.mean(vals), 3.25, 4.65)) if vals else float(fallback or 3.9)
+
+_prev_beta_ip_build_leash_model = build_leash_model
+
+def build_leash_model(recent_rows):
+    """BETA: improved opportunity model for BF/IP/Outs. No K-rate formula changes."""
+    base = _prev_beta_ip_build_leash_model(recent_rows)
+    rows = list(recent_rows or [])
+    if not rows:
+        base["beta_ip_version"] = BETA_TESTER_IP_OUTS_VERSION
+        base["outs_projection"] = round((_bt_float(base.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF) / 4.25 * 3.0, 1)
+        return base
+
+    arr = _bt_recent_arrays(rows)
+    l3_ip = _bt_mean(arr["ip"][:3]); l5_ip = _bt_mean(arr["ip"][:5]); l10_ip = _bt_mean(arr["ip"][:10])
+    l3_bf = _bt_mean(arr["bf"][:3]); l5_bf = _bt_mean(arr["bf"][:5]); l10_bf = _bt_mean(arr["bf"][:10])
+    l3_pc = _bt_mean(arr["pitches"][:3]); l5_pc = _bt_mean(arr["pitches"][:5]); l10_pc = _bt_mean(arr["pitches"][:10])
+    l5_er = _bt_mean(arr["er"][:5]); l5_h = _bt_mean(arr["h"][:5]); l5_bb = _bt_mean(arr["bb"][:5])
+
+    bf_per_ip = _bt_bf_per_ip(rows)
+    ppb = _bt_ppb(rows, _bt_float(base.get("ppb"), 3.9))
+
+    # IP anchor: more weight to recent durable workload, but still respects current BF model.
+    ip_recent = _bt_weighted([l3_ip, l5_ip, l10_ip], [0.45, 0.35, 0.20])
+    bf_recent = _bt_weighted([l3_bf, l5_bf, l10_bf], [0.45, 0.35, 0.20])
+    base_bf = _bt_float(base.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
+    base_ip = base_bf / bf_per_ip
+
+    pitch_ip = None
+    pc_anchor = _bt_weighted([l3_pc, l5_pc, l10_pc], [0.45, 0.35, 0.20])
+    if pc_anchor is not None and ppb > 0 and bf_per_ip > 0:
+        pitch_ip = pc_anchor / (ppb * bf_per_ip)
+
+    ip_blend = _bt_weighted([ip_recent, base_ip, pitch_ip], [0.48, 0.32, 0.20])
+    if ip_blend is None:
+        ip_blend = base_ip
+
+    notes = []
+    starter_like = not (l5_ip is not None and l5_ip < 3.0 and (l5_bf or 99) < 14)
+    if not starter_like:
+        notes.append("bulk/opener volume detected")
+
+    # Durable starter protection: avoids Joe Ryan-type 4.3 IP reads when L5/Pitch Count says 5.5-6 IP.
+    durable = starter_like and ((l5_ip is not None and l5_ip >= 5.5) or (l5_pc is not None and l5_pc >= 88))
+    full_leash = starter_like and ((l5_ip is not None and l5_ip >= 5.8) or (l3_pc is not None and l3_pc >= 92))
+    if durable and ip_blend < 5.15:
+        old = ip_blend
+        ip_blend = max(ip_blend, 5.15)
+        notes.append(f"durable starter floor {old:.2f}->5.15 IP")
+    if full_leash and ip_blend < 5.45:
+        old = ip_blend
+        ip_blend = max(ip_blend, 5.45)
+        notes.append(f"full-leash floor {old:.2f}->5.45 IP")
+
+    # Efficiency / traffic adjustment: protects against high ER/H/BB early-pull risk without overreacting.
+    traffic = 0.0
+    if l5_er is not None and l5_er >= 3.0: traffic += 0.18
+    if l5_h is not None and l5_ip and l5_ip > 0 and (l5_h / l5_ip) >= 1.15: traffic += 0.16
+    if l5_bb is not None and l5_ip and l5_ip > 0 and (l5_bb / l5_ip) >= 0.42: traffic += 0.14
+    if ppb >= 4.18: traffic += 0.20
+    elif ppb <= 3.75: traffic -= 0.12
+    if durable:
+        traffic *= 0.65
+    ip_blend -= traffic
+    if abs(traffic) >= 0.05:
+        notes.append(f"traffic/efficiency adj {-traffic:+.2f} IP")
+
+    # Keep beta conservative: this is volume calibration, not an automatic over booster.
+    low_cap = 2.2 if not starter_like else 3.65
+    high_cap = 7.35
+    ip_proj = float(clamp(ip_blend, low_cap, high_cap))
+    beta_bf = float(clamp(ip_proj * bf_per_ip, 10 if not starter_like else 15, 31))
+
+    # Do not let beta swing BF too violently vs current production model.
+    max_add = 3.50 if durable else 2.25
+    max_cut = 2.75 if starter_like else 5.00
+    beta_bf = float(clamp(beta_bf, base_bf - max_cut, base_bf + max_add))
+
+    base.update({
+        "expected_bf": beta_bf,
+        "ppb": float(ppb),
+        "recent_ip": float(l3_ip or l5_ip or base.get("recent_ip") or 5.3),
+        "leash_risk": "BETA_FULL_LEASH" if full_leash else ("BETA_DURABLE" if durable else base.get("leash_risk", "NORMAL")),
+        "beta_ip_version": BETA_TESTER_IP_OUTS_VERSION,
+        "beta_ip_projection": round(ip_proj, 2),
+        "outs_projection": round(ip_proj * 3.0, 1),
+        "bf_per_ip_beta": round(bf_per_ip, 2),
+        "pitch_count_anchor_beta": round(pc_anchor, 1) if pc_anchor is not None else None,
+        "source": f"{base.get('source','')}; BETA IP/Outs: {', '.join(notes) if notes else 'neutral'}",
+    })
+    return base
+
+_prev_beta_ip_build_innings_outcome_module = build_innings_outcome_module
+
+def build_innings_outcome_module(recent_rows, expected_bf, ppb=None, pitch_count_profile=None, manager_hook_status=None, game_script_risk=None):
+    """BETA: projects IP and Outs from recent IP/BF/pitch-count durability."""
+    base = _prev_beta_ip_build_innings_outcome_module(recent_rows, expected_bf, ppb, pitch_count_profile, manager_hook_status, game_script_risk)
+    rows = list(recent_rows or [])
+    exp_bf = _bt_float(expected_bf, DEFAULT_BF) or DEFAULT_BF
+    bf_per_ip = _bt_bf_per_ip(rows)
+    ppb2 = _bt_float(ppb, _bt_ppb(rows, 3.9)) or 3.9
+    arr = _bt_recent_arrays(rows)
+    l3_ip = _bt_mean(arr["ip"][:3]); l5_ip = _bt_mean(arr["ip"][:5]); l10_ip = _bt_mean(arr["ip"][:10])
+    l3_pc = _bt_mean(arr["pitches"][:3]); l5_pc = _bt_mean(arr["pitches"][:5])
+    ip_from_bf = exp_bf / bf_per_ip
+    ip_recent = _bt_weighted([l3_ip, l5_ip, l10_ip], [0.45, 0.35, 0.20])
+    pitch_ip = None
+    pc_anchor = _bt_weighted([l3_pc, l5_pc], [0.55, 0.45])
+    if pc_anchor is not None:
+        pitch_ip = pc_anchor / max(1e-6, (ppb2 * bf_per_ip))
+    ip_proj = _bt_weighted([ip_from_bf, ip_recent, pitch_ip], [0.40, 0.42, 0.18]) or _bt_float(base.get("projected_ip"), ip_from_bf)
+
+    pc_label = str((pitch_count_profile or {}).get("label") or "").upper()
+    hook = str(manager_hook_status or "").upper()
+    durable = (l5_ip is not None and l5_ip >= 5.5) or (l5_pc is not None and l5_pc >= 88)
+    full_leash = (l5_ip is not None and l5_ip >= 5.8) or (l3_pc is not None and l3_pc >= 92)
+    notes = []
+    if durable and ip_proj < 5.10:
+        old = ip_proj; ip_proj = max(ip_proj, 5.10); notes.append(f"durable floor {old:.2f}->5.10")
+    if full_leash and pc_label not in ["SHORT_LEASH"] and hook != "STRICT_HOOK" and ip_proj < 5.40:
+        old = ip_proj; ip_proj = max(ip_proj, 5.40); notes.append(f"full-leash floor {old:.2f}->5.40")
+    if hook == "STRICT_HOOK":
+        ip_proj -= 0.25; notes.append("strict hook -0.25 IP")
+    if pc_label in ["SHORT_LEASH"]:
+        ip_proj -= 0.30; notes.append("short leash -0.30 IP")
+    elif pc_label in ["ELITE_VOLUME", "FULL_LEASH"]:
+        ip_proj += 0.10; notes.append("pitch-count support +0.10 IP")
+
+    ip_proj = float(clamp(ip_proj, 2.1, 7.5))
+    risk = _bt_float(base.get("early_pull_risk_score"), 50) or 50
+    if durable:
+        risk = max(10, risk - 10)
+    if hook == "STRICT_HOOK" or pc_label == "SHORT_LEASH":
+        risk = min(95, risk + 8)
+    low = float(clamp(ip_proj - (0.85 if risk < 62 else 1.10), 1.3, 8.0))
+    high = float(clamp(ip_proj + (0.85 if risk < 62 else 0.60), 2.0, 8.2))
+    projected_pitches = None
+    if ppb2 is not None:
+        projected_pitches = float(clamp(exp_bf * ppb2, 45, 115))
+    label = "BETA_FULL_INNINGS" if risk <= 38 else ("BETA_EARLY_PULL_MONITOR" if risk >= 62 else "BETA_NORMAL_INNINGS")
+    base.update({
+        "projected_ip": round(ip_proj, 2),
+        "ip_floor": round(low, 2),
+        "ip_ceiling": round(high, 2),
+        "outs_projection": round(ip_proj * 3.0, 1),
+        "outs_floor": round(low * 3.0, 1),
+        "outs_ceiling": round(high * 3.0, 1),
+        "projected_pitches": round(projected_pitches, 0) if projected_pitches is not None else base.get("projected_pitches"),
+        "early_pull_risk_score": int(round(clamp(risk, 5, 95))),
+        "early_pull_label": label,
+        "beta_ip_version": BETA_TESTER_IP_OUTS_VERSION,
+        "note": f"BETA IP/Outs {label}: IP {ip_proj:.2f}, Outs {ip_proj*3.0:.1f}; " + ("; ".join(notes) if notes else "neutral volume blend"),
+    })
+    return base
+
+# Add Outs projection columns to Pitcher Fantasy board without pulling fantasy/outs lines.
+_prev_beta_ip_build_pitcher_fs_board = globals().get("build_pitcher_fs_board", None)
+if callable(_prev_beta_ip_build_pitcher_fs_board):
+    def build_pitcher_fs_board(board=None):
+        df = _prev_beta_ip_build_pitcher_fs_board(board)
+        try:
+            if hasattr(df, "columns") and not df.empty:
+                ip_col = "IP Projection" if "IP Projection" in df.columns else None
+                if ip_col:
+                    df["Outs Projection"] = pd.to_numeric(df[ip_col], errors="coerce") * 3.0
+                    df["Outs Projection"] = df["Outs Projection"].round(1)
+                df["IP/Outs Beta"] = BETA_TESTER_IP_OUTS_VERSION
+        except Exception:
+            pass
+        return df
 
 
 tab_kproj, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
