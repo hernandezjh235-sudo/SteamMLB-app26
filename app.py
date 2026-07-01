@@ -28612,8 +28612,8 @@ def _beta_fetch_underdog_pitcher_market(player_name, market_kind):
     if mk == "OUTS":
         market_label = "Pitching Outs"
         market_terms = [
-            "pitching outs", "pitcher outs", "outs recorded", "recorded outs",
-            "outs", "o "
+            # Keep this strict so we do not accidentally grab alternate/other outs-like props.
+            "pitching outs", "pitcher outs", "outs recorded", "recorded outs"
         ]
         bad_terms = [
             "strikeout", "strikeouts", "earned run", "earned runs", "er allowed",
@@ -28770,6 +28770,9 @@ def _beta_fetch_underdog_pitcher_market(player_name, market_kind):
 
     def line_from_obj(*objs):
         # Real Underdog target fields only. Do not use prices/odds.
+        # Priority matters. Underdog's main board line is usually stat_value/line_score.
+        # Generic `line` is often used by alternate rows, so it is accepted but deprioritized
+        # later when choosing the final matched line.
         keys = ["stat_value", "line_score", "over_under_line", "target_value", "display_stat_value", "line"]
         for obj in objs:
             if not isinstance(obj, dict):
@@ -28920,21 +28923,46 @@ def _beta_fetch_underdog_pitcher_market(player_name, market_kind):
     if not accepted_rows:
         return {"status": "NO MATCH", "line": None, "rows": [], "message": last_msg or f"No active Underdog {market_label} line matched"}
 
-    # Dedup and choose the best live line. Prefer stronger match, relationship rows, and half-point market lines.
+    # Dedup and choose the best live line.
+    # IMPORTANT: do NOT prefer the highest line. The first beta did that and grabbed
+    # alt Pitching Outs lines like 19.5 when the main board was 17.5.
     dedup = {}
     for r in accepted_rows:
-        key = (r.get("Matched Name"), r.get("Market"), r.get("Line"), r.get("Parser Mode"))
+        key = (r.get("Matched Name"), r.get("Market"), r.get("Line"), r.get("Parser Mode"), r.get("Line Evidence"))
         if key not in dedup or _beta_num(r.get("Match Score"), 0) > _beta_num(dedup[key].get("Match Score"), 0):
             dedup[key] = r
     rows = list(dedup.values())
 
-    def rank_row(r):
-        rel_bonus = 1 if "relationship" in str(r.get("Parser Mode", "")) else 0
-        half_bonus = 1 if abs(float(r.get("Line", 0)) * 2 - round(float(r.get("Line", 0)) * 2)) < 1e-9 else 0
-        return (round(_beta_num(r.get("Match Score"), 0), 2), rel_bonus, half_bonus, float(r.get("Line", 0)))
+    def evidence_priority(r):
+        note = str(r.get("Line Evidence", "")).lower()
+        # Main board fields first; generic `line` and text fallback usually indicate alt rows.
+        if "stat_value" in note or "line_score" in note:
+            return 5
+        if "over_under_line" in note or "target_value" in note or "display_stat_value" in note:
+            return 4
+        if "half-line" in note:
+            return 1
+        if " line " in (" " + note + " "):
+            return 0
+        return 2
 
-    best = sorted(rows, key=rank_row, reverse=True)[0]
-    return {"status": "FOUND", "line": float(best["Line"]), "rows": sorted(rows, key=rank_row, reverse=True), "message": f"Matched Underdog {market_label} {float(best['Line']):.1f}"}
+    def parser_priority(r):
+        mode = str(r.get("Parser Mode", "")).lower()
+        if "relationship" in mode:
+            return 3
+        if "object-blob" in mode:
+            return 1
+        return 2
+
+    def rank_row(r):
+        half_bonus = 1 if abs(float(r.get("Line", 0)) * 2 - round(float(r.get("Line", 0)) * 2)) < 1e-9 else 0
+        # No line-value sorting here on purpose.
+        return (round(_beta_num(r.get("Match Score"), 0), 3), evidence_priority(r), parser_priority(r), half_bonus)
+
+    sorted_rows = sorted(rows, key=rank_row, reverse=True)
+    best = sorted_rows[0]
+    debug_lines = ", ".join([f"{float(r.get('Line', 0)):.1f}({str(r.get('Line Evidence',''))[:18]})" for r in sorted_rows[:5]])
+    return {"status": "FOUND", "line": float(best["Line"]), "rows": sorted_rows, "message": f"Matched Underdog {market_label} {float(best['Line']):.1f}", "debug_lines": debug_lines}
 
 
 def _beta_projection_rows(board, market_kind="OUTS"):
@@ -28986,6 +29014,7 @@ def _beta_projection_rows(board, market_kind="OUTS"):
                 "IP Delta": ip_info["Beta IP Delta"],
                 "IP Confidence": ip_info["Beta IP Confidence"],
                 "Line Status": line_info.get("status"),
+                "Line Match Debug": line_info.get("debug_lines") or line_info.get("message"),
                 "Version": BETA_IP_OUTS_ER_VERSION,
                 "IP Debug": ip_info["Beta IP Note"],
             })
@@ -29103,7 +29132,7 @@ def render_beta_pitching_outs_tab(board):
     a.metric("Rows", len(df))
     b.metric("UD Outs Lines", int((df["Line Status"].astype(str) == "FOUND").sum()) if "Line Status" in df.columns else 0)
     c.metric("Avg IP Δ", round(pd.to_numeric(df.get("IP Delta"), errors="coerce").mean(), 2) if "IP Delta" in df.columns else 0)
-    cols = [c for c in ["Pitcher","Matchup","UD Line","Beta Projection","Beta Lean","Beta Edge","Beta Hit %","Original IP","Beta IP","Beta Outs","IP Confidence","Line Status","K PROJ (unchanged)"] if c in df.columns]
+    cols = [c for c in ["Pitcher","Matchup","UD Line","Beta Projection","Beta Lean","Beta Edge","Beta Hit %","Original IP","Beta IP","Beta Outs","IP Confidence","Line Status","Line Match Debug","K PROJ (unchanged)"] if c in df.columns]
     st.dataframe(df[cols], use_container_width=True, hide_index=True)
     with st.expander("IP Engine Debug", expanded=False):
         st.dataframe(df, use_container_width=True, hide_index=True)
@@ -29120,7 +29149,7 @@ def render_beta_er_allowed_tab(board):
     a.metric("Rows", len(df))
     b.metric("UD ER Lines", int((df["Line Status"].astype(str) == "FOUND").sum()) if "Line Status" in df.columns else 0)
     c.metric("Avg ER Proj", round(pd.to_numeric(df.get("Beta Projection"), errors="coerce").mean(), 2) if "Beta Projection" in df.columns else 0)
-    cols = [c for c in ["Pitcher","Matchup","UD Line","Beta Projection","Beta Lean","Beta Edge","Beta Hit %","Original IP","Beta IP","Line Status","K PROJ (unchanged)"] if c in df.columns]
+    cols = [c for c in ["Pitcher","Matchup","UD Line","Beta Projection","Beta Lean","Beta Edge","Beta Hit %","Original IP","Beta IP","Line Status","Line Match Debug","K PROJ (unchanged)"] if c in df.columns]
     st.dataframe(df[cols], use_container_width=True, hide_index=True)
     with st.expander("ER / IP Debug", expanded=False):
         st.dataframe(df, use_container_width=True, hide_index=True)
