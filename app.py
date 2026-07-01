@@ -21,6 +21,7 @@ import pandas as pd
 import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
+from pathlib import Path
 
 APP_VERSION = "ONE WAY PICKZ v11.17 VERIFIED LEARNING BUILD + ACTIVE MANAGER/RUN SUPPRESSION + STABLE PROJECTIONS + CARD + BASEBALL IQ FULL SYNC + FINAL SLATE COPY"
 # =========================
@@ -28624,11 +28625,12 @@ def _beta_fetch_underdog_pitcher_market(player_name, market_kind):
         market_label = "Earned Runs Allowed"
         market_terms = [
             "earned runs allowed", "earned run allowed", "earned runs", "earned run",
-            "er allowed", "ers allowed", "earned_runs_allowed", "era"
+            "pitcher earned runs", "pitcher earned runs allowed",
+            "er allowed", "ers allowed", "er", "earned_runs_allowed", "earned-run", "era"
         ]
         bad_terms = [
             "strikeout", "strikeouts", "outs", "hits allowed", "walks", "fantasy",
-            "batters faced", "runs allowed"  # runs allowed is not always earned runs
+            "batters faced"
         ]
         lo, hi = 0.5, 8.5
 
@@ -29145,6 +29147,13 @@ def render_beta_er_allowed_tab(board):
     if df.empty:
         st.info("No beta ER rows yet. Refresh the board first.")
         return
+    s1, s2 = st.columns(2)
+    if s1.button("💾 Save ER Official Board", key="save_beta_er_board_tab"):
+        ok, msg = _beta_save_official_board(df, "ER")
+        (st.success if ok else st.warning)(msg)
+    if s2.button("✅ Grade Saved ER Picks", key="grade_beta_er_board_tab"):
+        res = _beta_grade_saved_board(df, "ER")
+        st.info(res.get("message"))
     a,b,c = st.columns(3)
     a.metric("Rows", len(df))
     b.metric("UD ER Lines", int((df["Line Status"].astype(str) == "FOUND").sum()) if "Line Status" in df.columns else 0)
