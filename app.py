@@ -28526,13 +28526,136 @@ def _beta_get_original_ip(row):
     ], 5.0), 5.0)
 
 
+
+def _beta_recent_outs_profile(row):
+    """Beta-only workload profile from recent starts.
+
+    This reads existing MLB game logs when a pitcher_id is available. It does NOT
+    write back to the production K board and does NOT change K projections.
+    """
+    recent = []
+    try:
+        raw = None
+        if isinstance(row, dict):
+            raw = row.get("recent_rows") or row.get("Recent Rows") or row.get("recent_logs")
+        if isinstance(raw, list) and raw:
+            recent = raw[:10]
+    except Exception:
+        recent = []
+
+    if not recent:
+        try:
+            pid = _beta_first(row, ["pitcher_id", "Pitcher ID", "player_id", "Player ID", "id"], None)
+            if pid not in (None, "", "—"):
+                recent = get_recent_logs(pid, n=10) or []
+        except Exception:
+            recent = []
+
+    outs, ips, pitches, bfs, ers, hits, walks, runs = [], [], [], [], [], [], [], []
+    for r in recent[:10]:
+        try:
+            ip = _beta_num(r.get("IP_float"), None)
+            if ip is None:
+                ip = baseball_ip_to_float(r.get("IP") or r.get("inningsPitched"))
+            if ip is not None:
+                ips.append(float(ip))
+                outs.append(int(round(float(ip) * 3)))
+            pc = _beta_num(r.get("Pitches") or r.get("numberOfPitches") or r.get("pitchesThrown") or r.get("pitchCount"), None)
+            if pc is not None:
+                pitches.append(float(pc))
+            bf = _beta_num(r.get("BF") or r.get("battersFaced"), None)
+            if bf is not None:
+                bfs.append(float(bf))
+            er = _beta_num(r.get("ER") or r.get("earnedRuns"), None)
+            if er is not None:
+                ers.append(float(er))
+            h = _beta_num(r.get("H") or r.get("hits"), None)
+            if h is not None:
+                hits.append(float(h))
+            bb = _beta_num(r.get("BB") or r.get("baseOnBalls") or r.get("walks"), None)
+            if bb is not None:
+                walks.append(float(bb))
+            rr = _beta_num(r.get("R") or r.get("runs"), None)
+            if rr is not None:
+                runs.append(float(rr))
+        except Exception:
+            continue
+
+    def avg(vals, n=None):
+        vals = vals[:n] if n else vals
+        return None if not vals else float(np.mean(vals))
+    def med(vals, n=None):
+        vals = vals[:n] if n else vals
+        return None if not vals else float(np.median(vals))
+    def rate(vals, fn, n=None):
+        vals = vals[:n] if n else vals
+        return None if not vals else float(sum(1 for x in vals if fn(x)) / len(vals))
+
+    out = {
+        "sample": len(outs),
+        "outs_l3": avg(outs, 3),
+        "outs_l5": avg(outs, 5),
+        "outs_l10": avg(outs, 10),
+        "outs_med_l10": med(outs, 10),
+        "ip_l3": avg(ips, 3),
+        "ip_l5": avg(ips, 5),
+        "ip_l10": avg(ips, 10),
+        "pitch_l3": avg(pitches, 3),
+        "pitch_l5": avg(pitches, 5),
+        "pitch_l10": avg(pitches, 10),
+        "bf_l3": avg(bfs, 3),
+        "bf_l5": avg(bfs, 5),
+        "bf_l10": avg(bfs, 10),
+        "er_l5": avg(ers, 5),
+        "h_l5": avg(hits, 5),
+        "bb_l5": avg(walks, 5),
+        "r_l5": avg(runs, 5),
+        "qs_rate_l10": None,
+        "hook_rate_l10": rate(outs, lambda x: x < 15, 10),
+        "deep_rate_l10": rate(outs, lambda x: x >= 18, 10),
+        "six_plus_rate_l10": rate(outs, lambda x: x >= 18, 10),
+        "over_18_rate_l10": rate(outs, lambda x: x >= 19, 10),
+    }
+    if ips and ers:
+        n = min(len(ips), len(ers), 10)
+        if n > 0:
+            out["qs_rate_l10"] = float(sum(1 for i in range(n) if ips[i] >= 6.0 and ers[i] <= 3) / n)
+    try:
+        ppi_vals = [p / max(ip, 0.1) for p, ip in zip(pitches, ips) if p and ip]
+        out["pitches_per_ip_l5"] = avg(ppi_vals, 5)
+    except Exception:
+        out["pitches_per_ip_l5"] = None
+    try:
+        ppbf_vals = [p / max(bf, 1.0) for p, bf in zip(pitches, bfs) if p and bf]
+        out["pitches_per_bf_l5"] = avg(ppbf_vals, 5)
+    except Exception:
+        out["pitches_per_bf_l5"] = None
+    return out
+
+
 def _beta_dynamic_ip(row):
-    """Tester-only IP model. Does not write back to row or change K projections."""
+    """Tester-only IP/Outs model v2. Does not write back or change K projections.
+
+    Adds explicit workload layers:
+    - pitch-count trend
+    - recent outs distribution
+    - BF trend
+    - manager/recent hook timing
+    - pitch efficiency
+    - opponent patience/contact proxy
+    - QS/deep-start stability
+    """
     base_ip = _beta_get_original_ip(row)
+    base_outs = base_ip * 3.0
     exp_bf = _beta_num(_beta_first(row, ["Exp BF", "Expected BF", "Projected BF", "BF", "expected_bf"], base_ip * 4.25), base_ip * 4.25)
+    rp = _beta_recent_outs_profile(row)
+
     pitch_l3 = _beta_num(_beta_first(row, [
         "Pitch Count Avg L3", "pitch_count_avg_l3", "Pitch Count L3", "L3 Pitch Count", "Pitch Count", "Projected Pitch Count"
-    ], 84.0), 84.0)
+    ], rp.get("pitch_l3") or 84.0), rp.get("pitch_l3") or 84.0)
+    pitch_l5 = _beta_num(rp.get("pitch_l5"), pitch_l3)
+    pitch_l10 = _beta_num(rp.get("pitch_l10"), pitch_l5)
+
     role = _beta_num(_beta_first(row, ["Role Score", "role_score"], 70.0), 70.0)
     starter = _beta_num(_beta_first(row, ["Starter Score", "starter_score"], 80.0), 80.0)
     early_exit = _beta_num(_beta_first(row, ["Early Exit Risk", "Exit Risk Tax", "early_exit_risk"], 45.0), 45.0)
@@ -28546,46 +28669,118 @@ def _beta_dynamic_ip(row):
     hr9 = _beta_num(_beta_first(row, ["Run Damage HR9", "HR/9", "Home Runs Per 9"], 1.1), 1.1)
     era = _beta_num(_beta_first(row, ["ERA", "Pitcher ERA", "Season ERA", "era"], 4.20), 4.20)
 
-    beta_ip = base_ip
-    beta_ip += _beta_cap((pitch_l3 - 84.0) / 30.0, -0.35, 0.45)
-    beta_ip += _beta_cap((exp_bf - (base_ip * 4.25)) / 9.0, -0.25, 0.35)
-    beta_ip += _beta_cap((role - 70.0) / 120.0, -0.20, 0.22)
-    beta_ip += _beta_cap((starter - 80.0) / 120.0, -0.18, 0.18)
-    beta_ip += _beta_cap((leash - 50.0) / 150.0, -0.18, 0.22)
-    beta_ip += _beta_cap((vol_score - 50.0) / 125.0, -0.20, 0.22)
-    beta_ip += _beta_cap((pitch_eff - 50.0) / 130.0, -0.18, 0.18)
-    beta_ip -= _beta_cap((early_exit - 45.0) / 85.0, -0.15, 0.38)
-    beta_ip -= _beta_cap((h9 - 8.7) / 18.0, -0.12, 0.28)
-    beta_ip -= _beta_cap((bb9 - 3.0) / 10.0, -0.10, 0.25)
-    beta_ip -= _beta_cap((hr9 - 1.1) / 7.0, -0.08, 0.22)
-    beta_ip -= _beta_cap((era - 4.20) / 14.0, -0.10, 0.25)
+    # Opponent patience/contact proxies. These mainly influence early-pull probability.
+    opp_bb = _beta_num(_beta_first(row, ["Opp BB%", "Opponent BB%", "Team BB%", "opp_bb_pct"], 0.085), 0.085)
+    if opp_bb > 1:  # allow 8.5 style percentages
+        opp_bb = opp_bb / 100.0
+    opp_obp = _beta_num(_beta_first(row, ["Opp OBP", "Opponent OBP", "opp_obp"], 0.318), 0.318)
+    opp_avg = _beta_num(_beta_first(row, ["Opp AVG", "Opponent AVG", "opp_avg"], 0.245), 0.245)
+    opp_ppa = _beta_num(_beta_first(row, ["Opp PPA", "Opponent Pitches Per PA", "opp_ppa"], 3.90), 3.90)
+
+    # Distribution anchor: recent real outs matter, but base app IP still anchors the beta.
+    outs_l3 = _beta_num(rp.get("outs_l3"), None)
+    outs_l5 = _beta_num(rp.get("outs_l5"), None)
+    outs_med = _beta_num(rp.get("outs_med_l10"), None)
+    if rp.get("sample", 0) >= 3 and outs_l5 is not None:
+        anchor_outs = (base_outs * 0.40) + (outs_l5 * 0.34) + ((_beta_num(outs_l3, outs_l5)) * 0.16) + ((_beta_num(outs_med, outs_l5)) * 0.10)
+        beta_ip = anchor_outs / 3.0
+    else:
+        beta_ip = base_ip
+
+    # Workload / opportunity layers.
+    beta_ip += _beta_cap((pitch_l3 - 84.0) / 34.0, -0.35, 0.42)
+    beta_ip += _beta_cap((pitch_l3 - pitch_l10) / 42.0, -0.18, 0.22)  # pitch-count trend
+    beta_ip += _beta_cap((exp_bf - (base_ip * 4.25)) / 10.0, -0.22, 0.32)
+    if rp.get("bf_l5") is not None:
+        beta_ip += _beta_cap((_beta_num(rp.get("bf_l5"), exp_bf) - exp_bf) / 18.0, -0.15, 0.20)
+    beta_ip += _beta_cap((role - 70.0) / 135.0, -0.18, 0.20)
+    beta_ip += _beta_cap((starter - 80.0) / 135.0, -0.16, 0.16)
+    beta_ip += _beta_cap((leash - 50.0) / 160.0, -0.16, 0.20)
+    beta_ip += _beta_cap((vol_score - 50.0) / 140.0, -0.18, 0.20)
+    beta_ip += _beta_cap((pitch_eff - 50.0) / 145.0, -0.16, 0.16)
+
+    # Efficiency: high pitches per inning/BF lowers ability to clear outs.
+    ppi = _beta_num(rp.get("pitches_per_ip_l5"), None)
+    ppbf = _beta_num(rp.get("pitches_per_bf_l5"), None)
+    if ppi is not None:
+        beta_ip -= _beta_cap((ppi - 16.5) / 20.0, -0.15, 0.28)
+    if ppbf is not None:
+        beta_ip -= _beta_cap((ppbf - 3.85) / 5.0, -0.08, 0.16)
+
+    # Recent hook timing and deep-start stability.
+    hook_rate = _beta_num(rp.get("hook_rate_l10"), 0.25)
+    deep_rate = _beta_num(rp.get("deep_rate_l10"), 0.45)
+    qs_rate = _beta_num(rp.get("qs_rate_l10"), 0.35)
+    beta_ip -= _beta_cap((hook_rate - 0.25) * 0.75, -0.10, 0.32)
+    beta_ip += _beta_cap((deep_rate - 0.45) * 0.42, -0.12, 0.24)
+    beta_ip += _beta_cap((qs_rate - 0.35) * 0.26, -0.08, 0.16)
+
+    # Run/damage and opponent patience layers.
+    beta_ip -= _beta_cap((early_exit - 45.0) / 92.0, -0.12, 0.34)
+    beta_ip -= _beta_cap((h9 - 8.7) / 22.0, -0.10, 0.24)
+    beta_ip -= _beta_cap((bb9 - 3.0) / 13.0, -0.08, 0.22)
+    beta_ip -= _beta_cap((hr9 - 1.1) / 8.5, -0.06, 0.18)
+    beta_ip -= _beta_cap((era - 4.20) / 18.0, -0.08, 0.20)
+    beta_ip -= _beta_cap((opp_bb - 0.085) * 2.5, -0.06, 0.12)
+    beta_ip -= _beta_cap((opp_obp - 0.318) * 1.25, -0.06, 0.13)
+    beta_ip -= _beta_cap((opp_avg - 0.245) * 0.85, -0.05, 0.10)
+    beta_ip -= _beta_cap((opp_ppa - 3.90) * 0.12, -0.05, 0.10)
+
+    # Bullpen context when available: tired bullpen can lengthen leash, fresh pen can shorten it.
+    bp = str(_beta_first(row, ["bullpen_status", "Bullpen Status", "bullpen_note", "Bullpen"], "")).upper()
+    if any(x in bp for x in ["TIRED", "TAXED", "HEAVY", "FATIGUE"]):
+        beta_ip += 0.10
+    elif any(x in bp for x in ["FRESH", "RESTED"]):
+        beta_ip -= 0.06
 
     # Durable starter protection: don't crush good-volume starters too far.
-    if pitch_l3 >= 92 and starter >= 78 and early_exit <= 55:
-        beta_ip = max(beta_ip, base_ip - 0.12)
-    if pitch_l3 >= 96 and starter >= 82 and role >= 70:
-        beta_ip += 0.10
+    if pitch_l3 >= 92 and starter >= 78 and early_exit <= 55 and hook_rate <= 0.35:
+        beta_ip = max(beta_ip, base_ip - 0.10)
+    if pitch_l3 >= 96 and starter >= 82 and role >= 70 and deep_rate >= 0.50:
+        beta_ip += 0.08
+    if rp.get("sample", 0) >= 5 and _beta_num(rp.get("outs_l5"), 0) >= 18.0 and hook_rate <= 0.30:
+        beta_ip = max(beta_ip, (_beta_num(rp.get("outs_l5"), base_outs) / 3.0) - 0.28)
 
     # Hard early-pull cap for openers / low-role arms.
-    role_label = str(_beta_first(row, ["Leash Label", "Volume Safety Label", "Pull", "Role Label"], "")).upper()
-    if any(x in role_label for x in ["OPENER", "BULK", "RELIEF", "EARLY_PULL_HIGH"]):
+    role_label = str(_beta_first(row, ["Leash Label", "Volume Safety Label", "Pull", "Role Label", "manager_hook_status"], "")).upper()
+    if any(x in role_label for x in ["OPENER", "BULK", "RELIEF", "EARLY_PULL_HIGH", "STRICT_HOOK"]):
         beta_ip = min(beta_ip, base_ip + 0.10)
 
     beta_ip = round(_beta_cap(beta_ip, 1.0, 7.4), 2)
     outs = round(beta_ip * 3.0, 1)
+
     conf = 50
-    conf += _beta_cap((starter - 75) * 0.25, -8, 8)
-    conf += _beta_cap((pitch_l3 - 84) * 0.45, -8, 10)
-    conf -= _beta_cap((early_exit - 45) * 0.30, -5, 12)
-    conf -= _beta_cap((bb9 - 3.0) * 2.0, -3, 8)
-    conf = round(_beta_cap(conf, 20, 88), 0)
+    conf += _beta_cap((starter - 75) * 0.22, -7, 8)
+    conf += _beta_cap((pitch_l3 - 84) * 0.38, -8, 9)
+    conf += _beta_cap((deep_rate - 0.45) * 18, -5, 8)
+    conf -= _beta_cap((hook_rate - 0.25) * 20, -4, 10)
+    conf -= _beta_cap((early_exit - 45) * 0.25, -4, 10)
+    conf -= _beta_cap((bb9 - 3.0) * 1.4, -3, 6)
+    if rp.get("sample", 0) >= 5:
+        conf += 5
+    conf = round(_beta_cap(conf, 20, 90), 0)
+
+    note_parts = [
+        f"PC L3 {pitch_l3:.1f}/L5 {pitch_l5:.1f}",
+        f"Outs L5 {(_beta_num(rp.get('outs_l5'), 0) or 0):.1f}",
+        f"Deep {deep_rate:.0%}",
+        f"Hook {hook_rate:.0%}",
+        f"P/IP {ppi:.1f}" if ppi is not None else "P/IP —",
+        f"Opp BB {opp_bb*100:.1f}%",
+    ]
     return {
         "Original IP": round(base_ip, 2),
         "Beta IP": beta_ip,
         "Beta Outs": outs,
         "Beta IP Delta": round(beta_ip - base_ip, 2),
         "Beta IP Confidence": conf,
-        "Beta IP Note": f"PC L3 {pitch_l3:.1f} | BF {exp_bf:.1f} | EarlyExit {early_exit:.0f} | H9 {h9:.1f} BB9 {bb9:.1f} HR9 {hr9:.1f}",
+        "Pitch Count Trend": round(float(pitch_l3 - pitch_l10), 1) if pitch_l10 is not None else None,
+        "Recent Outs L5": None if rp.get("outs_l5") is None else round(float(rp.get("outs_l5")), 1),
+        "Recent Outs Median": None if rp.get("outs_med_l10") is None else round(float(rp.get("outs_med_l10")), 1),
+        "Recent Hook Rate": None if rp.get("hook_rate_l10") is None else round(float(rp.get("hook_rate_l10")) * 100, 1),
+        "Deep Start Rate": None if rp.get("deep_rate_l10") is None else round(float(rp.get("deep_rate_l10")) * 100, 1),
+        "Pitch Efficiency P/IP": None if ppi is None else round(float(ppi), 1),
+        "Beta IP Note": " | ".join(note_parts),
     }
 
 
@@ -29127,7 +29322,7 @@ def render_beta_pitching_outs_tab(board):
     a.metric("Rows", len(df))
     b.metric("UD Outs Lines", int((df["Line Status"].astype(str) == "FOUND").sum()) if "Line Status" in df.columns else 0)
     c.metric("Avg IP Δ", round(pd.to_numeric(df.get("IP Delta"), errors="coerce").mean(), 2) if "IP Delta" in df.columns else 0)
-    cols = [c for c in ["Pitcher","Matchup","UD Line","Beta Projection","Beta Lean","Beta Edge","Beta Hit %","Original IP","Beta IP","Beta Outs","IP Confidence","Line Status","Line Match Debug","K PROJ (unchanged)"] if c in df.columns]
+    cols = [c for c in ["Pitcher","Matchup","UD Line","Beta Projection","Beta Lean","Beta Edge","Beta Hit %","Original IP","Beta IP","Beta Outs","IP Confidence","Recent Outs L5","Recent Outs Median","Pitch Count Trend","Pitch Efficiency P/IP","Recent Hook Rate","Deep Start Rate","Line Status","Line Match Debug","K PROJ (unchanged)"] if c in df.columns]
     st.dataframe(df[cols], use_container_width=True, hide_index=True)
     with st.expander("IP Engine Debug", expanded=False):
         st.dataframe(df, use_container_width=True, hide_index=True)
